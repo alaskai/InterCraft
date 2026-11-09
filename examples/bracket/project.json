@@ -1,0 +1,40 @@
+{
+  "name": "Rod bracket demo",
+  "units": "mm",
+  "parts": [
+    {
+      "name": "RodBracket",
+      "kind": "design",
+      "features": [
+        {
+          "id": "f010",
+          "label": "Base block",
+          "prompt": "Start with a 40 x 30 x 20 block.",
+          "file": "RodBracket/010_base.py",
+          "params": { "width": 40, "depth": 30, "height": 20 }
+        },
+        {
+          "id": "f020",
+          "label": "Rod bore",
+          "prompt": "Add an 8.2 mm bore through the block for the rod.",
+          "file": "RodBracket/020_bore.py",
+          "params": { "bore_d": 8.2 }
+        },
+        {
+          "id": "f030",
+          "label": "Clamp slit",
+          "prompt": "Make it a split clamp with a 1 mm slit.",
+          "file": "RodBracket/030_slit.py",
+          "params": { "slit_w": 1.0, "past_centre": 2.0 }
+        },
+        {
+          "id": "f040",
+          "label": "Edge fillets",
+          "prompt": "Round the vertical edges.",
+          "file": "RodBracket/040_fillet.py",
+          "params": { "radius": 3 }
+        }
+      ]
+    }
+  ]
+}

@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .env
 .cache/
+# Working projects and exported parts
+/projects/
+exports/
+*.tmp

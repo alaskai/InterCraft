@@ -95,7 +95,8 @@ def run_feature(prev_shape, feature):
     return shape
 
 
-def rebuild(req):
+def rebuild(req, emit=True):
+    """Build the feature chain. Returns (final shape, error text)."""
     rid = req["id"]
     part = req["part"]
     cache_dir = req["cache_dir"]
@@ -128,15 +129,36 @@ def rebuild(req):
             volume = report["volume"]
             event.update(ok=True, cached=cached, mesh=mesh_path, report=report)
         except Exception:
-            event.update(ok=False, error=traceback.format_exc(limit=4))
+            error = traceback.format_exc(limit=4)
+            event.update(ok=False, error=error)
             event["ms"] = (time.perf_counter() - start) * 1000
-            send(event)
-            break
+            if emit:
+                send(event)
+                send({"id": rid, "event": "done", "part": part})
+            return None, f"{feature['id']} failed: {error}"
         event["ms"] = (time.perf_counter() - start) * 1000
-        send(event)
+        if emit:
+            send(event)
         prev_hash = key
 
-    send({"id": rid, "event": "done", "part": part})
+    if emit:
+        send({"id": rid, "event": "done", "part": part})
+    return shape, None
+
+
+def export(req):
+    shape, error = rebuild(req, emit=False)
+    if shape is None:
+        raise ValueError(error or "the part has no features to export")
+    path = req["path"]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if req["format"] == "step":
+        build123d.export_step(shape, path)
+    elif req["format"] == "stl":
+        build123d.export_stl(shape, path, tolerance=0.01, angular_tolerance=0.1)
+    else:
+        raise ValueError(f"unknown export format {req['format']}")
+    send({"id": req["id"], "event": "exported", "path": path})
 
 
 def main():
@@ -149,6 +171,8 @@ def main():
             req = json.loads(line)
             if req.get("cmd") == "rebuild":
                 rebuild(req)
+            elif req.get("cmd") == "export":
+                export(req)
             else:
                 send({"id": req.get("id"), "event": "error", "error": f"unknown cmd {req.get('cmd')}"})
         except Exception:

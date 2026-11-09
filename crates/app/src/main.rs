@@ -35,7 +35,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 760.0])
+            .with_inner_size([1100.0, 680.0])
+            .with_maximized(true)
             .with_title("InterCraft"),
         ..Default::default()
     };
@@ -232,6 +233,8 @@ impl State {
                     self.results.retain(|(p, _), e| p != &part || !e.stale);
                 }
                 GeoEvent::Error { error } => self.worker_status = format!("Worker error: {error}"),
+                // Exports are only requested by the MCP server, never by the app.
+                GeoEvent::Exported { .. } => {}
                 GeoEvent::Exited => {
                     self.worker_status = "Geometry worker stopped".to_owned();
                     self.building.clear();

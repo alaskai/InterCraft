@@ -66,21 +66,28 @@ To see the live update, leave the app open and change a value in `examples/brack
 
 ## Driving it from an LLM
 
-There are two ways in. Both use the same tools, so the model behaves the same either way.
+There are three ways in. All use the same tools, so the model behaves the same either way.
 
 | Route | Who it suits | Billing |
 |---|---|---|
-| Built-in chat panel | Anyone with an API key | Your API account |
-| MCP server | People who already use an agent app that supports MCP (Claude Code, Codex CLI, Gemini CLI, Cursor) | Whatever that app uses, including subscriptions |
+| Chat panel with an API key | Anyone with an Anthropic API key | Your API account |
+| Chat panel through Claude Code | Claude Pro or Max subscribers with Claude Code installed | Your subscription |
+| MCP server from an agent app | People who work in Claude Code, Codex CLI, Gemini CLI or Cursor | Whatever that app uses |
 
 ### Built-in chat
 
 1. Open the Chat tab and expand the settings at the top.
-2. Paste an Anthropic API key and press Save. It is stored in the system credential store (Windows Credential Manager, macOS Keychain or Secret Service on Linux), never in a file. If `ANTHROPIC_API_KEY` is set, that is used instead.
-3. Pick a model and effort. Claude Opus 5.5 at high effort is the default.
-4. Describe the part. Enter sends, Shift+Enter starts a new line, Stop ends the reply.
+2. Choose what to use:
+   - **Anthropic API key.** Paste a key and press Save. It is stored in the system credential store (Windows Credential Manager, macOS Keychain or Secret Service on Linux), never in a file. If `ANTHROPIC_API_KEY` is set, that is used instead. Pick a model and effort (Claude Opus 5.5 at high effort is the default).
+   - **Claude Code (your subscription).** Needs Claude Code installed and signed in (run `claude` once in a terminal). InterCraft starts your own Claude Code in the background and shows its replies here. Pick a model or keep your Claude Code default.
+3. Describe the part. Enter sends, Shift+Enter starts a new line, Stop ends the reply.
 
-While it works you see its short notes between steps, each tool call with its result (green for built, red for failed), and the viewer follows the part being edited. The last request's size and how much came from the prompt cache show next to the buttons.
+While it works you see its short notes between steps, each tool call with its result (green for built, red for failed), and the viewer follows the part being edited. The size of the last request and how much came from the prompt cache show under the buttons.
+
+The Claude Code session is locked down: no built-in tools (no shell or file editing), no other MCP servers, and only the InterCraft tools allowed. It runs in the project folder with your personal hooks and settings left out. InterCraft never reads your Claude login; the unmodified `claude` program signs in by itself. The conversation is a normal Claude Code session, so `claude --resume` can pick it up in a terminal.
+
+> [!note]
+> Anthropic does not allow third-party apps to offer claude.ai login or to route requests through someone else's subscription. Here each person runs their own Claude Code with their own sign-in, which the docs allow, but check Anthropic's current terms before publishing InterCraft.
 
 Each message also tells the model which part you have selected, so "make the bore bigger" refers to the part you are looking at.
 

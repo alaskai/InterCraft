@@ -8,3 +8,5 @@ __pycache__/
 /projects/
 exports/
 *.tmp
+# Machine-specific Cargo settings (for example a target dir outside OneDrive)
+.cargo/config.toml

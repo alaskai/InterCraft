@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "intercraft": {
-      "command": "cargo",
-      "args": ["run", "-q", "-p", "intercraft-mcp", "--", "projects/demo"]
+      "command": "python",
+      "args": ["dev/mcp_launcher.py"]
     }
   }
 }

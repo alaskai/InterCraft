@@ -27,13 +27,24 @@ pub const ANTHROPIC_MODELS: &[(&str, &str)] = &[
     ("claude-fable-5-2", "Claude Fable 5.2"),
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnthropicSettings {
     pub api_key: String,
     pub model: String,
     /// low, medium, high, xhigh or max.
     pub effort: String,
     pub system: String,
+}
+
+// Written by hand so the key never ends up in a log or error message.
+impl std::fmt::Debug for AnthropicSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicSettings")
+            .field("api_key", &if self.api_key.is_empty() { "<none>" } else { "<redacted>" })
+            .field("model", &self.model)
+            .field("effort", &self.effort)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Request features that differ between models.
@@ -182,6 +193,7 @@ impl AnthropicChat {
         let response = self.open_stream(body, cancel)?;
         let mut sse = SseReader::new(BufReader::new(response.into_body().into_reader()));
         let mut turn = Turn::default();
+        let mut finished = false;
         let mut partial_json: HashMap<usize, String> = HashMap::new();
 
         while let Some((event, data)) = sse.next_event().context("reading the reply stream")? {
@@ -255,13 +267,20 @@ impl AnthropicChat {
                     }
                     turn.add_usage(&data["usage"]);
                 }
-                "message_stop" => break,
+                "message_stop" => {
+                    finished = true;
+                    break;
+                }
                 "error" => {
                     let message = data["error"]["message"].as_str().unwrap_or("unknown error");
                     bail!("the API reported an error mid-reply: {message}");
                 }
                 _ => {}
             }
+        }
+        if !finished {
+            // A dropped connection looks like a normal end of stream. Never keep half a reply.
+            bail!("the connection closed before the reply finished. Try sending again");
         }
         on_event(ChatEvent::Usage(turn.usage));
         Ok(turn)
@@ -298,13 +317,13 @@ impl ChatSession for AnthropicChat {
                 }
                 // The server paused a long turn. Sending the history again resumes it.
                 "pause_turn" => {
-                    self.messages.push(json!({ "role": "assistant", "content": echo_content(&content) }));
+                    self.push_assistant_content(echo_content(&content));
                     continue;
                 }
                 _ => {}
             }
 
-            self.messages.push(json!({ "role": "assistant", "content": echo_content(&content) }));
+            self.push_assistant_content(echo_content(&content));
             let calls = tool_calls(&content);
 
             if turn.stop_reason == "tool_use" && !calls.is_empty() {
@@ -348,6 +367,20 @@ impl ChatSession for AnthropicChat {
 }
 
 impl AnthropicChat {
+    /// A reply resumed after `pause_turn` continues the same assistant turn, so its
+    /// blocks join the paused message instead of starting a second assistant message.
+    fn push_assistant_content(&mut self, mut blocks: Vec<Value>) {
+        if let Some(last) = self.messages.last_mut() {
+            if last["role"] == "assistant" {
+                if let Some(content) = last["content"].as_array_mut() {
+                    content.append(&mut blocks);
+                    return;
+                }
+            }
+        }
+        self.messages.push(json!({ "role": "assistant", "content": blocks }));
+    }
+
     /// Adds to the trailing user message if there is one, so roles keep alternating
     /// (for example after Stop left tool results as the last message).
     fn push_user_content(&mut self, mut blocks: Vec<Value>) {
@@ -497,8 +530,26 @@ fn tool_error(id: &str, message: &str) -> Value {
 }
 
 /// INTERCRAFT_ANTHROPIC_URL points the client at a local mock server for testing.
+/// Only a server on this machine is accepted, so the variable can't be used to send
+/// the API key somewhere else.
 fn api_url() -> String {
-    std::env::var("INTERCRAFT_ANTHROPIC_URL").unwrap_or_else(|_| API_URL.to_owned())
+    match std::env::var("INTERCRAFT_ANTHROPIC_URL") {
+        Ok(url) if is_local_url(&url) => url,
+        _ => API_URL.to_owned(),
+    }
+}
+
+fn is_local_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h); // ignore any user:pass@
+    let host = host.strip_prefix('[').and_then(|h| h.split_once(']')).map_or_else(
+        || host.split(':').next().unwrap_or_default(),
+        |(h, _)| h,
+    );
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 fn api_error(status: u16, body: &str) -> anyhow::Error {
@@ -539,6 +590,31 @@ mod tests {
     fn echo_keeps_everything_without_fallback() {
         let content = vec![json!({"type": "thinking"}), json!({"type": "tool_use", "id": "t1"})];
         assert_eq!(echo_content(&content).len(), 2);
+    }
+
+    #[test]
+    fn test_url_override_only_accepts_this_machine() {
+        assert!(is_local_url("http://127.0.0.1:8765/v1/messages"));
+        assert!(is_local_url("http://localhost/v1/messages"));
+        assert!(is_local_url("http://[::1]:9000/v1/messages"));
+        assert!(!is_local_url("https://evil.example.com/v1/messages"));
+        assert!(!is_local_url("http://127.0.0.1.evil.com/v1/messages"));
+        assert!(!is_local_url("http://localhost@evil.com/v1/messages"));
+        assert!(!is_local_url("http://evil.com/?h=127.0.0.1"));
+        assert!(!is_local_url("file:///C:/x"));
+    }
+
+    #[test]
+    fn debug_output_hides_the_key() {
+        let settings = AnthropicSettings {
+            api_key: "sk-ant-secret".into(),
+            model: "m".into(),
+            effort: "high".into(),
+            system: String::new(),
+        };
+        let text = format!("{settings:?}");
+        assert!(!text.contains("secret"), "{text}");
+        assert!(text.contains("<redacted>"));
     }
 
     #[test]

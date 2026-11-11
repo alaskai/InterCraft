@@ -60,11 +60,16 @@ pub struct ClaudeCodeChat {
 
 /// `claude --version`, or None when Claude Code isn't installed or isn't on PATH.
 pub fn claude_code_version() -> Option<String> {
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(claude_program());
     cmd.arg("--version").stdin(Stdio::null()).stderr(Stdio::null());
     hide_console(&mut cmd);
     let output = cmd.output().ok()?;
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// INTERCRAFT_CLAUDE_BIN swaps in another program, used by the tests for a fake Claude Code.
+fn claude_program() -> std::ffi::OsString {
+    std::env::var_os("INTERCRAFT_CLAUDE_BIN").unwrap_or_else(|| "claude".into())
 }
 
 fn hide_console(cmd: &mut Command) {
@@ -107,7 +112,7 @@ impl ClaudeCodeChat {
                     "intercraft": { "command": self.settings.mcp_command, "args": self.settings.mcp_args }
                 }
             });
-            let mut cmd = Command::new("claude");
+            let mut cmd = Command::new(claude_program());
             cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json"])
                 .args(["--verbose", "--include-partial-messages"])
                 .arg("--mcp-config")
@@ -125,6 +130,9 @@ impl ClaudeCodeChat {
             if let Some(id) = &self.session_id {
                 cmd.arg("--resume").arg(id);
             }
+            // "Your subscription" means it: without these, an API key in the environment
+            // would quietly switch Claude Code to billing that key instead.
+            cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
             cmd.current_dir(&self.settings.project_dir)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())

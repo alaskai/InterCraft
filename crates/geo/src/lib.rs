@@ -5,7 +5,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -69,17 +70,74 @@ pub trait GeometryBackend {
     fn try_recv(&mut self) -> Option<GeoEvent>;
 }
 
+/// A single build step that runs longer than this is treated as stuck (usually an
+/// endless loop in a snippet) and the worker is restarted. 60 s, or
+/// INTERCRAFT_BUILD_TIMEOUT seconds (the tests use a short one).
+pub fn build_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let secs = std::env::var("INTERCRAFT_BUILD_TIMEOUT").ok().and_then(|v| v.parse().ok());
+        Duration::from_secs(secs.unwrap_or(60).max(1))
+    })
+}
+
+/// Per-process memory cap, so a runaway snippet can't swallow the whole machine.
+#[cfg(windows)]
+const MEMORY_LIMIT: usize = 4 << 30;
+
+/// Loading OpenCascade takes a few seconds, more on a cold disk. Not a build step.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+
+type Wake = Arc<dyn Fn() + Send + Sync>;
+
 pub struct PythonWorker {
     child: Child,
     stdin: ChildStdin,
     events: Receiver<GeoEvent>,
     cache_dir: PathBuf,
     next_id: u64,
+    wake: Wake,
+    /// Requests sent but not finished yet.
+    in_flight: u32,
+    /// When the worker last showed progress (a request sent while idle, or any event).
+    last_progress: Instant,
+    /// The worker has finished loading and said so.
+    ready: bool,
+    #[cfg(windows)]
+    _job: Option<job::Job>,
 }
 
 impl PythonWorker {
     /// `wake` is called from the reader thread whenever an event arrives.
-    pub fn spawn(wake: impl Fn() + Send + 'static) -> Result<Self> {
+    pub fn spawn(wake: impl Fn() + Send + Sync + 'static) -> Result<Self> {
+        Self::start(Arc::new(wake))
+    }
+
+    /// Kill the worker and start a fresh one. Used when a build is stuck.
+    pub fn restart(&mut self) -> Result<()> {
+        let fresh = Self::start(self.wake.clone())?;
+        *self = fresh; // dropping the old one kills it
+        Ok(())
+    }
+
+    /// True when a build has gone longer than `build_timeout()` without any progress.
+    pub fn stuck(&self) -> bool {
+        self.in_flight > 0 && self.last_progress.elapsed() > self.current_timeout()
+    }
+
+    /// Whether the OS memory cap is in force (Windows job object). False elsewhere.
+    pub fn memory_capped(&self) -> bool {
+        #[cfg(windows)]
+        return self._job.is_some();
+        #[cfg(not(windows))]
+        false
+    }
+
+    fn current_timeout(&self) -> Duration {
+        if self.ready { build_timeout() } else { STARTUP_TIMEOUT }
+    }
+
+    fn start(wake: Wake) -> Result<Self> {
         let python = find_python();
         let script = find_worker_script();
         if !script.exists() {
@@ -101,11 +159,15 @@ impl PythonWorker {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("starting worker with {}", python.display()))?;
+        #[cfg(windows)]
+        let job = job::Job::limit(&child, MEMORY_LIMIT);
         let stdin = child.stdin.take().context("worker stdin")?;
         let stdout = child.stdout.take().context("worker stdout")?;
 
         let (tx, events) = channel();
+        let reader_wake = wake.clone();
         std::thread::spawn(move || {
+            let wake = reader_wake;
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let event = serde_json::from_str::<GeoEvent>(&line).unwrap_or_else(|e| {
@@ -121,12 +183,32 @@ impl PythonWorker {
         });
 
         let cache_dir = std::env::temp_dir().join("intercraft-cache");
-        Ok(Self { child, stdin, events, cache_dir, next_id: 1 })
+        Ok(Self {
+            child,
+            stdin,
+            events,
+            cache_dir,
+            next_id: 1,
+            wake,
+            in_flight: 0,
+            last_progress: Instant::now(),
+            ready: false,
+            #[cfg(windows)]
+            _job: job,
+        })
+    }
+
+    /// Bookkeeping for the stuck check, applied to every event.
+    fn track(&mut self, event: &GeoEvent) {
+        self.last_progress = Instant::now();
+        if matches!(event, GeoEvent::Ready { .. }) {
+            self.ready = true;
+        }
+        if matches!(event, GeoEvent::Done { .. } | GeoEvent::Exported { .. } | GeoEvent::Error { .. }) {
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
     }
 }
-
-/// Long enough for a slow first start or a heavy part, short enough to notice a hung snippet.
-const BLOCKING_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
@@ -139,15 +221,25 @@ impl PythonWorker {
         msg["id"] = self.next_id.into();
         msg["cache_dir"] = serde_json::json!(self.cache_dir);
         self.next_id += 1;
+        if self.in_flight == 0 {
+            self.last_progress = Instant::now();
+        }
+        self.in_flight += 1;
         writeln!(self.stdin, "{msg}").context("writing to worker")?;
         self.stdin.flush().context("flushing worker stdin")
     }
 
     fn recv_blocking(&mut self) -> Result<GeoEvent> {
-        match self.events.recv_timeout(BLOCKING_TIMEOUT) {
-            Ok(GeoEvent::Exited) => bail!("the geometry worker stopped"),
-            Ok(event) => Ok(event),
-            Err(_) => bail!("the geometry worker did not answer in time"),
+        match self.events.recv_timeout(self.current_timeout()) {
+            Ok(GeoEvent::Exited) => bail!("the geometry worker stopped (it may have run out of memory)"),
+            Ok(event) => {
+                self.track(&event);
+                Ok(event)
+            }
+            Err(_) => bail!(
+                "a build step ran for over {} s and was stopped. An endless loop in a snippet is the usual cause",
+                build_timeout().as_secs()
+            ),
         }
     }
 
@@ -165,6 +257,11 @@ impl PythonWorker {
         }
     }
 
+    /// Start an export without waiting. The result arrives as `GeoEvent::Exported` or `Error`.
+    pub fn request_export(&mut self, req: RebuildRequest, format: ExportFormat, path: &Path) -> Result<()> {
+        self.send(export_message(req, format, path))
+    }
+
     /// Build the part and write it to `path`. STEP stays exact, STL is tessellated.
     pub fn export_blocking(
         &mut self,
@@ -172,16 +269,7 @@ impl PythonWorker {
         format: ExportFormat,
         path: &Path,
     ) -> Result<PathBuf> {
-        self.send(serde_json::json!({
-            "cmd": "export",
-            "part": req.part,
-            "features": req.features,
-            "path": path,
-            "format": match format {
-                ExportFormat::Step => "step",
-                ExportFormat::Stl => "stl",
-            },
-        }))?;
+        self.send(export_message(req, format, path))?;
         loop {
             match self.recv_blocking()? {
                 GeoEvent::Exported { path } => return Ok(path),
@@ -190,6 +278,19 @@ impl PythonWorker {
             }
         }
     }
+}
+
+fn export_message(req: RebuildRequest, format: ExportFormat, path: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "cmd": "export",
+        "part": req.part,
+        "features": req.features,
+        "path": path,
+        "format": match format {
+            ExportFormat::Step => "step",
+            ExportFormat::Stl => "stl",
+        },
+    })
 }
 
 impl GeometryBackend for PythonWorker {
@@ -202,7 +303,9 @@ impl GeometryBackend for PythonWorker {
     }
 
     fn try_recv(&mut self) -> Option<GeoEvent> {
-        self.events.try_recv().ok()
+        let event = self.events.try_recv().ok()?;
+        self.track(&event);
+        Some(event)
     }
 }
 
@@ -273,5 +376,61 @@ impl Mesh {
             }
             (lo, hi)
         }))
+    }
+}
+
+#[cfg(windows)]
+mod job {
+    // Windows job object: caps the worker's memory and kills it when the app exits.
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+
+    pub struct Job(HANDLE);
+
+    // The handle is only used to close the job, from whichever thread drops it.
+    unsafe impl Send for Job {}
+
+    impl Job {
+        /// None if the job can't be set up; the worker still runs, just without the cap.
+        pub fn limit(child: &Child, memory_limit: usize) -> Option<Self> {
+            // SAFETY: plain Win32 calls on a handle we own; the struct is zeroed then filled.
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if handle.is_null() {
+                    return None;
+                }
+                let job = Job(handle);
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags =
+                    JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                info.ProcessMemoryLimit = memory_limit;
+                let ok = SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if ok == 0 || AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) == 0 {
+                    return None;
+                }
+                Some(job)
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closing the handle we created. With KILL_ON_JOB_CLOSE this ends the worker.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
     }
 }

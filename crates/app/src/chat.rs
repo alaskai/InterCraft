@@ -273,7 +273,11 @@ impl ChatPanel {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if self.messages.is_empty() {
-                    ui.weak("Ask for a part, for example: \"Make a 60 x 40 x 5 mm plate with four M4 holes 6 mm in from the corners.\"");
+                    if self.api_key.is_empty() {
+                        subscription_help(ui);
+                    } else {
+                        ui.weak("Ask for a part, for example: \"Make a 60 x 40 x 5 mm plate with four M4 holes 6 mm in from the corners.\"");
+                    }
                 }
                 for message in &self.messages {
                     message_ui(ui, message);
@@ -359,6 +363,43 @@ impl ChatPanel {
             self.settings_open = false;
         }
     }
+}
+
+/// Shown when there's no API key: subscription users can drive InterCraft from Claude Code.
+fn subscription_help(ui: &mut egui::Ui) {
+    // Registers the server for every folder, using the launcher that ships with this checkout.
+    let launcher = std::path::absolute(concat!(env!("CARGO_MANIFEST_DIR"), "/../../dev/mcp_launcher.py"))
+        .unwrap_or_default();
+    let command = format!(
+        "claude mcp add --scope user intercraft -- python \"{}\"",
+        launcher.display()
+    );
+
+    egui::Frame::new()
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(6.0)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            // Stay inside the panel and wrap, however narrow it is.
+            ui.set_max_width(ui.available_width());
+            ui.strong("Using a Claude Pro or Max subscription?");
+            ui.label(concat!(
+                "The chat here needs an API key, but Claude Code can use your subscription. ",
+                "It edits the project open in this window and you watch each change land."
+            ));
+            ui.add_space(4.0);
+            ui.label("1. Copy this command and run it once in a terminal. It registers InterCraft with Claude Code.");
+            if ui.button("Copy command").on_hover_text(&command).clicked() {
+                ui.ctx().copy_text(command.clone());
+            }
+            ui.label("2. Run claude in any folder and check /mcp shows intercraft.");
+            ui.label("3. Ask for a part, for example \"make a 60 x 40 x 5 mm plate with four M4 holes\".");
+            ui.add_space(4.0);
+            ui.weak(concat!(
+                "Other agent apps that support MCP (Codex CLI, Gemini CLI, Cursor) work the same way. ",
+                "Or add an API key in the settings above to chat here."
+            ));
+        });
 }
 
 fn message_ui(ui: &mut egui::Ui, message: &Message) {

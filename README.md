@@ -29,6 +29,13 @@ py -3.11 -m venv "$env:LOCALAPPDATA\InterCraft\venv"
 
 Set `INTERCRAFT_PYTHON` if you want to use a different interpreter.
 
+If the repo sits in a synced folder (OneDrive, Dropbox), keep Cargo's build output outside it with a local `.cargo/config.toml` (not tracked by Git):
+
+```toml
+[build]
+target-dir = "C:/Users/<you>/AppData/Local/InterCraft/target"
+```
+
 ## Run
 
 ```powershell
@@ -79,13 +86,17 @@ Each message also tells the model which part you have selected, so "make the bor
 
 To test the chat without an API key or any cost, run the mock server in `dev/mock_anthropic.py` and point the app at it with `INTERCRAFT_ANTHROPIC_URL`. The script's header explains how.
 
-### MCP server
+### MCP server (Claude Code and other agent apps)
 
-`intercraft-mcp` is an MCP server (stdio) that edits a project folder. The app watches the same folder, so each tool call shows up in the viewport as it happens.
+This is the route for a Claude Pro or Max subscription, since subscriptions work in Claude Code but not as API keys. `intercraft-mcp` edits whichever project the viewer has open, so there is nothing to configure per project.
 
-1. Open the viewer on the working project: `cargo run -- projects\demo`
-2. Start Claude Code in this repo. It reads `.mcp.json` and offers the `intercraft` server, which uses the same `projects/demo` folder.
-3. Ask for a part, for example "make a 60 x 40 x 5 plate with four M4 holes".
+1. Start the viewer on a project: `cargo run -- projects\demo` (a new folder is fine, the first edit creates it).
+2. Connect Claude Code:
+   - Inside this repo, `.mcp.json` already lists the `intercraft` server. Run `claude` here and approve it.
+   - To use it from any folder, register it once: `claude mcp add --scope user intercraft -- python "<repo>/dev/mcp_launcher.py"`. The chat panel has a button that copies this command with the right path.
+3. Check `/mcp` shows `intercraft` as connected, then ask for a part, for example "make a 60 x 40 x 5 plate with four M4 holes".
+
+`dev/mcp_launcher.py` builds the server and runs a copy of it, so a running server never blocks the next build. Pass a folder to pin the server to one project instead of following the viewer.
 
 | Tool | What it does |
 |---|---|
@@ -99,7 +110,7 @@ To test the chat without an API key or any cost, run the mock server in `dev/moc
 
 Every edit returns a build report (volume, volume change, size, errors), so the LLM can check its own work with numbers. A feature that fails to build stays saved and shows red in the app until it is fixed.
 
-For any other MCP client, run `intercraft-mcp <project folder>` as a stdio server.
+Other MCP clients (Codex CLI, Gemini CLI, Cursor) use the same command: `python <repo>/dev/mcp_launcher.py` as a stdio server.
 
 ## How a project is stored
 

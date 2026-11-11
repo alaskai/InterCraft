@@ -503,20 +503,32 @@ fn run_tools(
         }
 
         on_event(ChatEvent::ToolStarted { id: id.clone(), name: name.clone(), input: input.clone() });
-        let (ok, output) = match tools.call(name, input) {
+        let (ok, mut output) = match tools.call(name, input) {
             Ok(value) => (true, value),
             Err(e) => (false, Value::String(format!("{e:#}"))),
         };
+        // A picture goes to the model as an image block. The chat panel only says there was one.
+        let image = output.as_object_mut().and_then(|o| o.remove(crate::IMAGE_KEY));
+        if image.is_some() {
+            output["image"] = "sent to the model".into();
+        }
         on_event(ChatEvent::ToolFinished { id: id.clone(), ok, output: output.clone() });
 
         let text = match &output {
             Value::String(s) => s.clone(),
             other => serde_json::to_string_pretty(other).unwrap_or_default(),
         };
+        let content = match image {
+            Some(Value::String(data)) => json!([
+                { "type": "text", "text": text },
+                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": data } },
+            ]),
+            _ => Value::String(text),
+        };
         let mut result = Map::new();
         result.insert("type".into(), "tool_result".into());
         result.insert("tool_use_id".into(), id.clone().into());
-        result.insert("content".into(), text.into());
+        result.insert("content".into(), content);
         if !ok {
             result.insert("is_error".into(), true.into());
         }
@@ -569,6 +581,31 @@ fn api_error(status: u16, body: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Camera;
+    impl ToolExecutor for Camera {
+        fn definitions(&self) -> Vec<crate::ToolDef> {
+            Vec::new()
+        }
+        fn call(&mut self, _name: &str, _input: &Value) -> anyhow::Result<Value> {
+            Ok(json!({ "view": "iso", crate::IMAGE_KEY: "QUJD" }))
+        }
+    }
+
+    #[test]
+    fn a_picture_reaches_the_model_as_an_image_block() {
+        let calls = vec![("t1".to_owned(), "view_model".to_owned(), json!({}))];
+        let mut shown = Vec::new();
+        let results = run_tools(&calls, &HashMap::new(), &mut Camera, &mut |e| shown.push(e), &AtomicBool::new(false));
+        let content = results[0]["content"].as_array().expect("text and image blocks");
+        assert_eq!(content[0]["type"], "text");
+        assert!(!content[0]["text"].as_str().unwrap().contains("QUJD"), "no base64 in the text");
+        assert_eq!(content[1]["source"], json!({ "type": "base64", "media_type": "image/png", "data": "QUJD" }));
+        // The chat panel hears that a picture was sent, not the picture itself.
+        let ChatEvent::ToolFinished { output, .. } = shown.last().unwrap() else { panic!("no finish event") };
+        assert!(!output.to_string().contains("QUJD"));
+        assert_eq!(output["image"], "sent to the model");
+    }
 
     #[test]
     fn echo_drops_pre_fallback_internals() {

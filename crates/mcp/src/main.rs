@@ -77,10 +77,15 @@ fn handle(server: &mut ToolHost, msg: &Value, chat_panel: bool) -> Option<Value>
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             // Tool failures go back as a result the model can read, not a protocol error.
             match server.call(name, &args) {
-                Ok(value) => json!({
-                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }],
-                    "isError": false,
-                }),
+                Ok(mut value) => {
+                    // A picture goes back as a real image, not as base64 inside the text.
+                    let image = value.as_object_mut().and_then(|o| o.remove(intercraft_tools::IMAGE_KEY));
+                    let mut content = vec![json!({ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() })];
+                    if let Some(Value::String(data)) = image {
+                        content.push(json!({ "type": "image", "data": data, "mimeType": "image/png" }));
+                    }
+                    json!({ "content": content, "isError": false })
+                }
                 Err(e) => json!({
                     "content": [{ "type": "text", "text": format!("{e:#}") }],
                     "isError": true,

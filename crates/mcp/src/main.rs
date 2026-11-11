@@ -13,10 +13,17 @@ use serde_json::{json, Value};
 
 fn main() -> Result<()> {
     // A folder argument pins the server to one project. Without one it follows the viewer.
-    let mut server = match std::env::args().nth(1).or_else(|| std::env::var("INTERCRAFT_PROJECT").ok()) {
+    // --chat-panel means the client is InterCraft's own chat, which can show ask_user questions.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let chat_panel = args.iter().any(|a| a == "--chat-panel");
+    let folder = args.iter().find(|a| !a.starts_with("--")).cloned();
+    let mut server = match folder.or_else(|| std::env::var("INTERCRAFT_PROJECT").ok()) {
         Some(dir) => ToolHost::new(PathBuf::from(dir)),
         None => ToolHost::follow_viewer(),
     };
+    if chat_panel {
+        server = server.with_ask_user();
+    }
     server.warm_up();
 
     let mut stdin = std::io::stdin().lock();
@@ -34,7 +41,7 @@ fn main() -> Result<()> {
             continue;
         }
         let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle(&mut server, &msg),
+            Ok(msg) => handle(&mut server, &msg, chat_panel),
             Err(e) => Some(error_reply(Value::Null, -32700, &format!("parse error: {e}"))),
         };
         if let Some(reply) = reply {
@@ -46,7 +53,7 @@ fn main() -> Result<()> {
 }
 
 /// Returns None for notifications, which must not be answered.
-fn handle(server: &mut ToolHost, msg: &Value) -> Option<Value> {
+fn handle(server: &mut ToolHost, msg: &Value, chat_panel: bool) -> Option<Value> {
     let method = msg.get("method")?.as_str()?;
     let id = msg.get("id").cloned()?;
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -60,7 +67,11 @@ fn handle(server: &mut ToolHost, msg: &Value) -> Option<Value> {
             "instructions": GUIDE,
         }),
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": intercraft_tools::definitions() }),
+        "tools/list" => json!({ "tools": if chat_panel {
+            intercraft_tools::chat_panel_definitions()
+        } else {
+            intercraft_tools::definitions()
+        } }),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));

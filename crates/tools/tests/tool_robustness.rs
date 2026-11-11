@@ -185,3 +185,30 @@ fn two_agents_editing_at_once_lose_nothing() {
     assert_eq!(parts, 32, "edits were lost: {parts} parts instead of 32");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn ask_user_is_checked_and_only_offered_to_the_chat_panel() {
+    let (mut plain, dir) = project("ask");
+    let good = json!({ "question": "Which side?", "options": [{ "label": "Left" }, { "label": "Right" }] });
+    assert!(plain.call("ask_user", &good).is_err(), "a plain MCP client got ask_user");
+    let mut chat = ToolHost::new(dir.clone()).with_ask_user();
+    assert_eq!(chat.call("ask_user", &good).unwrap()["shown"], true);
+    let bad = [
+        json!({ "question": "Pick", "options": [{ "label": "Only one" }] }),
+        json!({ "question": "Pick", "options": [{ "label": "A" }, { "label": "a" }] }),
+        json!({ "question": "", "options": [{ "label": "A" }, { "label": "B" }] }),
+        json!({ "question": "Pick", "options": [{ "label": "" }, { "label": "B" }] }),
+        json!({ "question": "Pick", "options": "A, B" }),
+        json!({ "question": "Pick", "options": [{ "label": "A" }, { "label": "B" }, { "label": "C" }, { "label": "D" }, { "label": "E" }] }),
+        json!({ "question": "Q".repeat(301), "options": [{ "label": "A" }, { "label": "B" }] }),
+        json!({ "question": "Pick", "options": [{ "label": "A" }, { "label": "B" }], "multi_select": "yes" }),
+    ];
+    for args in bad {
+        assert!(chat.call("ask_user", &args).is_err(), "accepted {args}");
+    }
+    let names: Vec<String> = intercraft_tools::chat_panel_definitions().as_array().unwrap().iter()
+        .map(|t| t["name"].as_str().unwrap().to_owned()).collect();
+    assert!(names.contains(&"ask_user".to_owned()));
+    assert!(!intercraft_tools::definitions().to_string().contains("ask_user"));
+    let _ = std::fs::remove_dir_all(dir);
+}

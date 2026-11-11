@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,7 @@ pub enum GeoEvent {
     Ready { build123d: String },
     Feature(FeatureResult),
     Done { part: String },
+    Exported { path: PathBuf },
     Error { error: String },
     /// The worker process ended. Not sent by the worker itself.
     #[serde(skip)]
@@ -123,19 +125,80 @@ impl PythonWorker {
     }
 }
 
+/// Long enough for a slow first start or a heavy part, short enough to notice a hung snippet.
+const BLOCKING_TIMEOUT: Duration = Duration::from_secs(180);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Step,
+    Stl,
+}
+
+impl PythonWorker {
+    fn send(&mut self, mut msg: serde_json::Value) -> Result<()> {
+        msg["id"] = self.next_id.into();
+        msg["cache_dir"] = serde_json::json!(self.cache_dir);
+        self.next_id += 1;
+        writeln!(self.stdin, "{msg}").context("writing to worker")?;
+        self.stdin.flush().context("flushing worker stdin")
+    }
+
+    fn recv_blocking(&mut self) -> Result<GeoEvent> {
+        match self.events.recv_timeout(BLOCKING_TIMEOUT) {
+            Ok(GeoEvent::Exited) => bail!("the geometry worker stopped"),
+            Ok(event) => Ok(event),
+            Err(_) => bail!("the geometry worker did not answer in time"),
+        }
+    }
+
+    /// Rebuild and wait for every feature result. For callers without a UI loop.
+    pub fn build_blocking(&mut self, req: RebuildRequest) -> Result<Vec<FeatureResult>> {
+        self.rebuild(req)?;
+        let mut results = Vec::new();
+        loop {
+            match self.recv_blocking()? {
+                GeoEvent::Feature(result) => results.push(result),
+                GeoEvent::Done { .. } => return Ok(results),
+                GeoEvent::Error { error } => bail!(error),
+                _ => {}
+            }
+        }
+    }
+
+    /// Build the part and write it to `path`. STEP stays exact, STL is tessellated.
+    pub fn export_blocking(
+        &mut self,
+        req: RebuildRequest,
+        format: ExportFormat,
+        path: &Path,
+    ) -> Result<PathBuf> {
+        self.send(serde_json::json!({
+            "cmd": "export",
+            "part": req.part,
+            "features": req.features,
+            "path": path,
+            "format": match format {
+                ExportFormat::Step => "step",
+                ExportFormat::Stl => "stl",
+            },
+        }))?;
+        loop {
+            match self.recv_blocking()? {
+                GeoEvent::Exported { path } => return Ok(path),
+                GeoEvent::Error { error } => bail!(error),
+                _ => {}
+            }
+        }
+    }
+}
+
 impl GeometryBackend for PythonWorker {
     fn rebuild(&mut self, req: RebuildRequest) -> Result<()> {
-        let msg = serde_json::json!({
-            "id": self.next_id,
+        self.send(serde_json::json!({
             "cmd": "rebuild",
             "part": req.part,
             "features": req.features,
-            "cache_dir": self.cache_dir,
-        });
-        self.next_id += 1;
-        writeln!(self.stdin, "{msg}").context("writing to worker")?;
-        self.stdin.flush().context("flushing worker stdin")?;
-        Ok(())
+        }))
     }
 
     fn try_recv(&mut self) -> Option<GeoEvent> {

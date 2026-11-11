@@ -3,7 +3,7 @@
 A desktop tool for watching an LLM build a parametric CAD model, one feature at a time. It is not a CAD package. The model is a list of small build123d snippets, and the app rebuilds and redraws the part every time one of them changes.
 
 > [!note]
-> Status: milestone 1. The viewer, hierarchy, inspector and timeline work from files on disk. The LLM connection, chat and sketch panels are not built yet.
+> Status: milestone 2. The viewer works from files on disk, and an LLM can edit the model through the MCP server. The built-in chat and sketch panels are not built yet.
 
 ## Requirements
 
@@ -38,6 +38,14 @@ The geometry worker takes about ten seconds to start the first time, because it 
 
 To see the live update, leave the app open and change a value in `examples/bracket/project.json` (for example `bore_d`) or edit one of the snippets. The part rebuilds when you save.
 
+### Panels
+
+| Panel | What it shows |
+|---|---|
+| Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it. |
+| Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. |
+| Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). |
+
 ### Viewport controls
 
 | Action | Input |
@@ -46,6 +54,28 @@ To see the live update, leave the app open and change a value in `examples/brack
 | Pan | Right or middle drag |
 | Zoom | Scroll |
 | Fit to view | Double click |
+
+## Driving it from an LLM
+
+`intercraft-mcp` is an MCP server (stdio) that edits a project folder. The app watches the same folder, so each tool call shows up in the viewport as it happens.
+
+1. Open the viewer on the working project: `cargo run -- projects\demo`
+2. Start Claude Code in this repo. It reads `.mcp.json` and offers the `intercraft` server, which uses the same `projects/demo` folder.
+3. Ask for a part, for example "make a 60 x 40 x 5 plate with four M4 holes".
+
+| Tool | What it does |
+|---|---|
+| `get_project` | Returns every part, feature, snippet and the current build numbers |
+| `add_part` | Creates an empty design part |
+| `add_feature` | Adds one modelling step and builds it |
+| `edit_feature` | Changes a feature's code, label or parameters |
+| `set_param` | Changes one dimension |
+| `delete_feature` | Removes a feature |
+| `export_part` | Writes STEP and STL to the project's `exports` folder |
+
+Every edit returns a build report (volume, volume change, size, errors), so the LLM can check its own work with numbers. A feature that fails to build stays saved and shows red in the app until it is fixed.
+
+For any other MCP client, run `intercraft-mcp <project folder>` as a stdio server.
 
 ## How a project is stored
 
@@ -79,6 +109,8 @@ flowchart LR
     G -- JSON lines --> W[worker.py: build123d]
     W -- mesh file + report --> G
     G -- events --> A
+    L[LLM client] -- MCP tools --> M[mcp: intercraft-mcp]
+    M -- writes --> F
 ```
 
 </div>
@@ -88,6 +120,7 @@ flowchart LR
 | `crates/core` | Project model and loading |
 | `crates/geo` | `GeometryBackend` trait and the Python worker client |
 | `crates/app` | Window, docked panels and the 3D viewport |
+| `crates/mcp` | MCP server with the editing tools |
 | `worker` | Runs the snippets, caches each step, writes meshes and reports |
 
 The worker caches the shape after every feature. Changing one feature only rebuilds from that feature onwards.
@@ -98,7 +131,7 @@ The worker caches the shape after every feature. Changing one feature only rebui
 ## Roadmap
 
 1. Viewer with live rebuild from files (done)
-2. Tool API and MCP server so an LLM can drive it
+2. Tool API and MCP server so an LLM can drive it (done)
 3. Chat panel and prompt-linked timeline editing
 4. Sketch panel
 5. Fit checks, section view, before and after overlay

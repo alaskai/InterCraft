@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "intercraft": {
+      "command": "cargo",
+      "args": ["run", "-q", "-p", "intercraft-mcp", "--", "projects/demo"]
+    }
+  }
+}

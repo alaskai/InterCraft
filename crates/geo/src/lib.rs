@@ -39,6 +39,9 @@ pub const IMPORT_STEP_ID: &str = "import";
 pub struct RebuildRequest {
     pub part: String,
     pub features: Vec<FeatureInput>,
+    /// Where the part sits in the assembly: x, y, z in mm, then rotation about
+    /// X, Y and Z in degrees. Every step is shown, measured and exported there.
+    pub placement: Option<[f64; 6]>,
 }
 
 /// Numbers reported after every feature. All lengths in mm.
@@ -76,6 +79,7 @@ pub enum GeoEvent {
     Exported { path: PathBuf },
     Measured { id: u64, data: serde_json::Value },
     Inspected { id: u64, data: serde_json::Value },
+    Fitted { id: u64, data: serde_json::Value },
     Error {
         #[serde(default)]
         id: Option<u64>,
@@ -233,6 +237,7 @@ impl PythonWorker {
                 | GeoEvent::Exported { .. }
                 | GeoEvent::Measured { .. }
                 | GeoEvent::Inspected { .. }
+                | GeoEvent::Fitted { .. }
                 | GeoEvent::Error { .. }
         ) {
             self.in_flight = self.in_flight.saturating_sub(1);
@@ -309,10 +314,30 @@ impl PythonWorker {
         self.wait_for(id)
     }
 
+    /// Check every pair of built shapes for overlap and clearance, without waiting.
+    /// `parts` are (name, mesh key). The answer arrives as `GeoEvent::Fitted`.
+    pub fn request_fit(&mut self, parts: &[(String, String)]) -> Result<u64> {
+        let id = self.next_id;
+        let parts: Vec<_> = parts.iter().map(|(name, mesh)| serde_json::json!({ "name": name, "mesh": mesh })).collect();
+        self.send(serde_json::json!({ "cmd": "fit", "parts": parts }))?;
+        Ok(id)
+    }
+
+    pub fn fit_blocking(&mut self, parts: &[(String, String)]) -> Result<serde_json::Value> {
+        let id = self.request_fit(parts)?;
+        self.wait_for(id)
+    }
+
     fn wait_for(&mut self, id: u64) -> Result<serde_json::Value> {
         loop {
             match self.recv_blocking()? {
-                GeoEvent::Measured { id: got, data } | GeoEvent::Inspected { id: got, data } if got == id => return Ok(data),
+                GeoEvent::Measured { id: got, data }
+                | GeoEvent::Inspected { id: got, data }
+                | GeoEvent::Fitted { id: got, data }
+                    if got == id =>
+                {
+                    return Ok(data)
+                }
                 GeoEvent::Error { id: Some(got), error } if got == id => bail!(error),
                 _ => {}
             }
@@ -347,6 +372,7 @@ fn export_message(req: RebuildRequest, format: ExportFormat, path: &Path) -> ser
         "cmd": "export",
         "part": req.part,
         "features": req.features,
+        "placement": req.placement,
         "path": path,
         "format": match format {
             ExportFormat::Step => "step",
@@ -361,6 +387,7 @@ impl GeometryBackend for PythonWorker {
             "cmd": "rebuild",
             "part": req.part,
             "features": req.features,
+            "placement": req.placement,
         }))
     }
 

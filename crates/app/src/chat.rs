@@ -9,19 +9,33 @@ use std::sync::Arc;
 
 use eframe::egui;
 use intercraft_llm::{
-    AnthropicChat, AnthropicSettings, Cancelled, ChatEvent, ChatSession, ToolDef, ToolExecutor,
-    Usage, ANTHROPIC_MODELS,
+    claude_code_version, AnthropicChat, AnthropicSettings, Cancelled, ChatEvent, ChatSession,
+    ClaudeCodeChat, ClaudeCodeSettings, ToolDef, ToolExecutor, Usage, ANTHROPIC_MODELS,
+    CLAUDE_CODE_MODELS,
 };
 use intercraft_tools::ToolHost;
 use serde_json::Value;
 
-use crate::settings::{self, KeySource, Settings, EFFORTS};
+use crate::settings::{self, KeySource, Provider, Settings, EFFORTS};
 
 enum Command {
     Send(String),
     Reset,
-    Settings(AnthropicSettings),
+    Configure(Config),
 }
+
+/// Everything the worker needs to talk to either provider.
+#[derive(Clone)]
+struct Config {
+    provider: Provider,
+    anthropic: AnthropicSettings,
+    claude_code: ClaudeCodeSettings,
+}
+
+/// Said to the model in Claude Code sessions, on top of the MCP server's own guide.
+const CLAUDE_CODE_PROMPT: &str = "You are running inside the InterCraft desktop app's chat panel. \
+The user watches the 3D viewer update after each tool call. Only the InterCraft tools are available. \
+Keep replies short and give measured numbers from the build reports.";
 
 enum Reply {
     Event(ChatEvent),
@@ -58,6 +72,8 @@ pub struct ChatPanel {
     key_input: String,
     settings_open: bool,
     settings_error: Option<String>,
+    /// Result of `claude --version`, checked when Claude Code is chosen.
+    claude_code: Option<Option<String>>,
 
     worker: Option<(Sender<Command>, Receiver<Reply>)>,
     cancel: Arc<AtomicBool>,
@@ -71,14 +87,17 @@ pub struct ChatPanel {
 impl ChatPanel {
     pub fn new(ctx: egui::Context, project_dir: PathBuf) -> Self {
         let (api_key, key_source) = settings::load_api_key();
-        Self {
+        let settings = Settings::load();
+        let claude_code = (settings.provider == Provider::ClaudeCode).then(claude_code_version);
+        let mut panel = Self {
             project_dir,
-            settings: Settings::load(),
-            settings_open: key_source == KeySource::Missing,
+            settings,
+            settings_open: false,
             api_key,
             key_source,
             key_input: String::new(),
             settings_error: None,
+            claude_code,
             worker: None,
             cancel: Arc::new(AtomicBool::new(false)),
             busy: false,
@@ -86,15 +105,42 @@ impl ChatPanel {
             input: String::new(),
             usage: Usage::default(),
             ctx,
+        };
+        // Open the settings straight away when the chosen provider isn't usable yet.
+        panel.settings_open = !panel.ready();
+        panel
+    }
+
+    /// Whether the chosen provider can take a message right now.
+    fn ready(&self) -> bool {
+        match self.settings.provider {
+            Provider::Anthropic => !self.api_key.is_empty(),
+            Provider::ClaudeCode => matches!(self.claude_code, Some(Some(_))),
         }
     }
 
-    fn llm_settings(&self) -> AnthropicSettings {
-        AnthropicSettings {
-            api_key: self.api_key.clone(),
-            model: self.settings.model.clone(),
-            effort: self.settings.effort.clone(),
-            system: intercraft_tools::GUIDE.to_owned(),
+    fn config(&self) -> Config {
+        // The Claude Code session starts its own InterCraft MCP server, pinned to this project.
+        let launcher = std::path::absolute(concat!(env!("CARGO_MANIFEST_DIR"), "/../../dev/mcp_launcher.py"))
+            .unwrap_or_default();
+        Config {
+            provider: self.settings.provider,
+            anthropic: AnthropicSettings {
+                api_key: self.api_key.clone(),
+                model: self.settings.model.clone(),
+                effort: self.settings.effort.clone(),
+                system: intercraft_tools::GUIDE.to_owned(),
+            },
+            claude_code: ClaudeCodeSettings {
+                project_dir: self.project_dir.clone(),
+                mcp_command: "python".to_owned(),
+                mcp_args: vec![
+                    launcher.to_string_lossy().into_owned(),
+                    self.project_dir.to_string_lossy().into_owned(),
+                ],
+                model: self.settings.claude_code_model.clone(),
+                extra_prompt: CLAUDE_CODE_PROMPT.to_owned(),
+            },
         }
     }
 
@@ -104,9 +150,9 @@ impl ChatPanel {
             let (reply_tx, reply_rx) = channel();
             let ctx = self.ctx.clone();
             let cancel = self.cancel.clone();
-            let settings = self.llm_settings();
+            let config = self.config();
             let dir = self.project_dir.clone();
-            std::thread::spawn(move || run_worker(dir, settings, cmd_rx, reply_tx, cancel, ctx));
+            std::thread::spawn(move || run_worker(dir, config, cmd_rx, reply_tx, cancel, ctx));
             self.worker = Some((cmd_tx, reply_rx));
         }
         &self.worker.as_ref().expect("worker was just started").0
@@ -117,8 +163,8 @@ impl ChatPanel {
             self.settings_error = Some(format!("Couldn't save settings: {e:#}"));
         }
         if self.worker.is_some() {
-            let settings = self.llm_settings();
-            let _ = self.worker().send(Command::Settings(settings));
+            let config = self.config();
+            let _ = self.worker().send(Command::Configure(config));
         }
     }
 
@@ -167,7 +213,14 @@ impl ChatPanel {
 
     fn apply_event(&mut self, event: ChatEvent) -> Option<String> {
         if let ChatEvent::ReplyStarted { model } = &event {
-            self.messages.push(Message::Assistant { model: model.clone(), items: Vec::new() });
+            match self.messages.last_mut() {
+                Some(Message::Assistant { model: current, .. }) => {
+                    if current.is_empty() {
+                        *current = model.clone();
+                    }
+                }
+                _ => self.messages.push(Message::Assistant { model: model.clone(), items: Vec::new() }),
+            }
             return None;
         }
         if let ChatEvent::Done = event {
@@ -242,7 +295,7 @@ impl ChatPanel {
                         self.cancel.store(true, Ordering::Relaxed);
                     }
                 } else {
-                    let can_send = !self.input.trim().is_empty() && !self.api_key.is_empty();
+                    let can_send = !self.input.trim().is_empty() && self.ready();
                     if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() || (enter && can_send) {
                         self.send(context.clone());
                     }
@@ -254,17 +307,15 @@ impl ChatPanel {
                         let _ = self.worker().send(Command::Reset);
                     }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.usage.input_tokens + self.usage.cache_read_tokens > 0 {
-                        ui.weak(format!(
-                            "context {}k · cached {}k",
-                            (self.usage.input_tokens + self.usage.cache_read_tokens + self.usage.cache_write_tokens) / 1000,
-                            self.usage.cache_read_tokens / 1000
-                        ))
-                        .on_hover_text("Size of the last request and how much of it came from the prompt cache.");
-                    }
-                });
             });
+            if self.usage.input_tokens + self.usage.cache_read_tokens > 0 {
+                ui.weak(format!(
+                    "Last request: {}k tokens, {}k from cache",
+                    (self.usage.input_tokens + self.usage.cache_read_tokens + self.usage.cache_write_tokens) / 1000,
+                    self.usage.cache_read_tokens / 1000
+                ))
+                .on_hover_text("Size of the last request and how much of it came from the prompt cache.");
+            }
             ui.add_space(4.0);
         });
 
@@ -273,7 +324,7 @@ impl ChatPanel {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 if self.messages.is_empty() {
-                    if self.api_key.is_empty() {
+                    if self.settings.provider == Provider::Anthropic && !self.ready() {
                         subscription_help(ui);
                     } else {
                         ui.weak("Ask for a part, for example: \"Make a 60 x 40 x 5 mm plate with four M4 holes 6 mm in from the corners.\"");
@@ -291,13 +342,74 @@ impl ChatPanel {
             .iter()
             .find(|(id, _)| *id == self.settings.model)
             .map_or(self.settings.model.clone(), |(_, name)| (*name).to_owned());
-        let header = format!("{model_name} · effort {}", self.settings.effort);
+        let header = match self.settings.provider {
+            Provider::Anthropic => format!("{model_name} · effort {}", self.settings.effort),
+            Provider::ClaudeCode => match self.settings.claude_code_model.as_str() {
+                "" => "Claude Code · default model".to_owned(),
+                _ => format!("Claude Code · {}", claude_code_model_name(&self.settings.claude_code_model)),
+            },
+        };
         let response = egui::CollapsingHeader::new(header)
             .id_salt("chat_settings")
             .open(self.settings_open.then_some(true))
             .show(ui, |ui| {
                 let mut changed = false;
                 egui::Grid::new("chat_settings_grid").num_columns(2).show(ui, |ui| {
+                    ui.label("Use");
+                    let before = self.settings.provider;
+                    egui::ComboBox::from_id_salt("provider")
+                        .selected_text(provider_name(self.settings.provider))
+                        .show_ui(ui, |ui| {
+                            for provider in [Provider::Anthropic, Provider::ClaudeCode] {
+                                ui.selectable_value(&mut self.settings.provider, provider, provider_name(provider));
+                            }
+                        });
+                    ui.end_row();
+                    if self.settings.provider != before {
+                        changed = true;
+                        if self.settings.provider == Provider::ClaudeCode {
+                            self.claude_code = Some(claude_code_version());
+                        }
+                        self.messages.push(Message::Notice(format!(
+                            "Now using {}. It starts its own conversation and doesn't see the messages above.",
+                            provider_name(self.settings.provider)
+                        )));
+                    }
+
+                    if self.settings.provider == Provider::ClaudeCode {
+                        ui.label("Model");
+                        egui::ComboBox::from_id_salt("cc_model")
+                            .selected_text(claude_code_model_name(&self.settings.claude_code_model))
+                            .show_ui(ui, |ui| {
+                                for (alias, name) in CLAUDE_CODE_MODELS {
+                                    changed |= ui
+                                        .selectable_value(&mut self.settings.claude_code_model, (*alias).to_owned(), *name)
+                                        .changed();
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Status");
+                        ui.vertical(|ui| {
+                            match &self.claude_code {
+                                Some(Some(version)) => {
+                                    ui.weak(format!("Found {version}. Uses your own Claude sign-in."));
+                                }
+                                _ => {
+                                    ui.colored_label(
+                                        ui.visuals().error_fg_color,
+                                        "Claude Code wasn't found. Install it, run claude once in a terminal to sign in, then check again.",
+                                    );
+                                    if ui.button("Check again").clicked() {
+                                        self.claude_code = Some(claude_code_version());
+                                    }
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        return;
+                    }
+
                     ui.label("Model");
                     egui::ComboBox::from_id_salt("model").selected_text(model_name.as_str()).show_ui(ui, |ui| {
                         for (id, name) in ANTHROPIC_MODELS {
@@ -358,11 +470,25 @@ impl ChatPanel {
                     self.push_settings();
                 }
             });
-        // Opened automatically when no key is set; after that the user decides.
-        if response.header_response.clicked() || self.key_source != KeySource::Missing {
+        // Opened automatically while the provider isn't usable; after that the user decides.
+        if response.header_response.clicked() || self.ready() {
             self.settings_open = false;
         }
     }
+}
+
+fn provider_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Anthropic => "Anthropic API key",
+        Provider::ClaudeCode => "Claude Code (your subscription)",
+    }
+}
+
+fn claude_code_model_name(alias: &str) -> &'static str {
+    CLAUDE_CODE_MODELS
+        .iter()
+        .find(|(a, _)| *a == alias)
+        .map_or("Your Claude Code default", |(_, name)| name)
 }
 
 /// Shown when there's no API key: subscription users can drive InterCraft from Claude Code.
@@ -384,10 +510,11 @@ fn subscription_help(ui: &mut egui::Ui) {
             ui.set_max_width(ui.available_width());
             ui.strong("Using a Claude Pro or Max subscription?");
             ui.label(concat!(
-                "The chat here needs an API key, but Claude Code can use your subscription. ",
-                "It edits the project open in this window and you watch each change land."
+                "Set \"Use\" in the settings above to Claude Code. It runs your own Claude Code ",
+                "in the background with your sign-in, and you chat here as normal."
             ));
             ui.add_space(4.0);
+            ui.label("Or work from a Claude Code terminal instead:");
             ui.label("1. Copy this command and run it once in a terminal. It registers InterCraft with Claude Code.");
             if ui.button("Copy command").on_hover_text(&command).clicked() {
                 ui.ctx().copy_text(command.clone());
@@ -463,7 +590,10 @@ fn tool_ui(ui: &mut egui::Ui, call: &ToolCall) {
                     ui.painter().circle_filled(rect.center(), 4.0, color);
                 }
                 ui.monospace(&call.name);
-                ui.weak(call_summary(&call.input));
+                let summary = call_summary(&call.input);
+                if !summary.is_empty() {
+                    ui.weak(summary);
+                }
                 ui.label(egui::RichText::new(outcome).color(color).small());
             });
         })
@@ -534,16 +664,21 @@ impl ToolExecutor for HostTools {
 
 fn run_worker(
     dir: PathBuf,
-    settings: AnthropicSettings,
+    config: Config,
     commands: Receiver<Command>,
     replies: Sender<Reply>,
     cancel: Arc<AtomicBool>,
     ctx: egui::Context,
 ) {
+    // Claude Code runs the tools itself, so only the API route needs a warm tool host.
     let mut host = ToolHost::new(dir);
-    host.warm_up();
+    if config.provider == Provider::Anthropic {
+        host.warm_up();
+    }
     let mut tools = HostTools(host);
-    let mut chat = AnthropicChat::new(settings);
+    let mut provider = config.provider;
+    let mut anthropic = AnthropicChat::new(config.anthropic);
+    let mut claude_code = ClaudeCodeChat::new(config.claude_code);
 
     for command in commands {
         match command {
@@ -551,6 +686,10 @@ fn run_worker(
                 let mut on_event = |event| {
                     let _ = replies.send(Reply::Event(event));
                     ctx.request_repaint();
+                };
+                let chat: &mut dyn ChatSession = match provider {
+                    Provider::Anthropic => &mut anthropic,
+                    Provider::ClaudeCode => &mut claude_code,
                 };
                 let reply = match chat.send(&text, &mut tools, &mut on_event, &cancel) {
                     Ok(()) => None,
@@ -562,8 +701,15 @@ fn run_worker(
                 }
                 ctx.request_repaint();
             }
-            Command::Reset => chat.reset(),
-            Command::Settings(settings) => chat.update_settings(settings),
+            Command::Reset => {
+                anthropic.reset();
+                claude_code.reset();
+            }
+            Command::Configure(config) => {
+                provider = config.provider;
+                anthropic.update_settings(config.anthropic);
+                claude_code.update_settings(config.claude_code);
+            }
         }
     }
 }

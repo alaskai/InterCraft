@@ -14,7 +14,8 @@ use wgpu::util::DeviceExt;
 
 // Plain Unorm: the shader writes display-space colours and egui shows them as they are.
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+// The stencil half fills the cut face of a section (see `render`).
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 const SAMPLES: u32 = 4;
 const EDGE_COLOR: [f32; 3] = [0.05, 0.06, 0.08];
 
@@ -27,6 +28,10 @@ struct Globals {
     view_proj: mat4x4<f32>,
     light_a: vec4<f32>,
     light_b: vec4<f32>,
+    // Section plane: everything with dot(p, clip.xyz) > clip.w is cut away.
+    clip: vec4<f32>,
+    // x > 0.5 when the section plane is on.
+    flags: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 
@@ -34,7 +39,12 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) color: vec3<f32>,
+    @location(2) world: vec3<f32>,
 };
+
+fn cut_away(world: vec3<f32>) -> bool {
+    return globals.flags.x > 0.5 && dot(world, globals.clip.xyz) > globals.clip.w;
+}
 
 @vertex
 fn vs_main(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>) -> VsOut {
@@ -42,11 +52,13 @@ fn vs_main(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @locatio
     out.pos = globals.view_proj * vec4<f32>(pos, 1.0);
     out.normal = normal;
     out.color = color;
+    out.world = pos;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    if (cut_away(in.world)) { discard; }
     var n = normalize(in.normal);
     if (!front) { n = -n; }
     let key = max(dot(n, globals.light_a.xyz), 0.0);
@@ -55,8 +67,23 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     return vec4<f32>(in.color * shade, 1.0);
 }
 
+// Writes nothing: only counts faces in the stencil buffer.
+@fragment
+fn fs_mark(in: VsOut) -> @location(0) vec4<f32> {
+    if (cut_away(in.world)) { discard; }
+    return vec4<f32>(0.0);
+}
+
+// The filled cut face of a section, hatched like a drawing.
+@fragment
+fn fs_cap(in: VsOut) -> @location(0) vec4<f32> {
+    let stripe = step(0.5, fract((in.world.x + in.world.y + in.world.z) * 0.7));
+    return vec4<f32>(in.color * (0.84 + 0.16 * stripe), 1.0);
+}
+
 @fragment
 fn fs_line(in: VsOut) -> @location(0) vec4<f32> {
+    if (cut_away(in.world)) { discard; }
     return vec4<f32>(in.color, 1.0);
 }
 "#;
@@ -100,6 +127,32 @@ struct Globals {
     view_proj: [[f32; 4]; 4],
     light_a: [f32; 4],
     light_b: [f32; 4],
+    clip: [f32; 4],
+    flags: [f32; 4],
+}
+
+/// A plane across one axis that cuts the model open.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Section {
+    /// 0, 1 or 2 for X, Y or Z.
+    pub axis: usize,
+    /// Where the plane sits along that axis, in mm.
+    pub offset: f32,
+    /// Cut away the other side.
+    pub flip: bool,
+}
+
+impl Section {
+    /// Plane as (normal, w): points with dot(p, normal) > w are cut away.
+    fn plane(&self) -> (Vec3, f32) {
+        let sign = if self.flip { -1.0 } else { 1.0 };
+        (Vec3::AXES[self.axis] * sign, self.offset * sign)
+    }
+
+    fn cuts(&self, p: Vec3) -> bool {
+        let (normal, w) = self.plane();
+        p.dot(normal) > w
+    }
 }
 
 struct GpuMesh {
@@ -109,6 +162,7 @@ struct GpuMesh {
     edges: Option<wgpu::Buffer>,
     edge_vertex_count: u32,
     bounds: (Vec3, Vec3),
+    color: [f32; 3],
     visible: bool,
     /// CPU copy for picking and highlighting.
     cpu: Arc<Mesh>,
@@ -116,6 +170,8 @@ struct GpuMesh {
 
 struct Targets {
     size: [u32; 2],
+    /// The finished image, kept so a snapshot can be read back from it.
+    resolve: wgpu::Texture,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     resolve_view: wgpu::TextureView,
@@ -153,6 +209,71 @@ impl Frame {
     }
 }
 
+/// Which parts a render includes.
+#[derive(Clone, Copy)]
+enum Show<'a> {
+    /// What the user has left visible.
+    Visible,
+    All,
+    Only(&'a str),
+}
+
+/// Everything one render needs: a camera, the parts to draw and an optional section.
+struct Scene<'a> {
+    target: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    aspect: f32,
+    background: f64,
+    section: Option<Section>,
+    show: Show<'a>,
+    /// Draw the fit check's clash volumes.
+    overlays: bool,
+}
+
+/// A picture of the model for an LLM to look at (the `view_model` tool).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Shot {
+    /// Camera direction as (yaw, pitch) in radians. None uses the user's own view,
+    /// with their hidden parts and section.
+    pub direction: Option<(f32, f32)>,
+    /// Show just this part.
+    pub only: Option<String>,
+    pub section: Option<Section>,
+}
+
+/// Side of a snapshot in pixels. A multiple of 64, so rows need no padding to read back.
+pub const SHOT_SIZE: u32 = 768;
+
+fn orbit(yaw: f32, pitch: f32) -> Vec3 {
+    Vec3::new(pitch.cos() * yaw.cos(), pitch.cos() * yaw.sin(), pitch.sin())
+}
+
+fn make_targets(device: &wgpu::Device, size: [u32; 2], resolve_usage: wgpu::TextureUsages) -> Targets {
+    let make = |label, format, sample_count, usage| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        })
+    };
+    let attach = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    let resolve = make("viewport colour", COLOR_FORMAT, 1, attach | resolve_usage);
+    Targets {
+        size,
+        msaa_view: make("viewport msaa", COLOR_FORMAT, SAMPLES, attach).create_view(&Default::default()),
+        depth_view: make("viewport depth", DEPTH_FORMAT, SAMPLES, attach).create_view(&Default::default()),
+        resolve_view: resolve.create_view(&Default::default()),
+        resolve,
+    }
+}
+
 /// What the cursor is over, snapped to the nearest corner or edge when close enough.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
@@ -180,12 +301,18 @@ pub struct Viewport {
     rs: egui_wgpu::RenderState,
     pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    mark_pipeline: wgpu::RenderPipeline,
+    cap_pipeline: wgpu::RenderPipeline,
+    overlay_pipeline: wgpu::RenderPipeline,
+    /// Clash volumes from a fit check, drawn in red through everything else.
+    overlays: Vec<(wgpu::Buffer, wgpu::Buffer, u32)>,
     globals: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     targets: Option<Targets>,
     texture_id: Option<egui::TextureId>,
     meshes: BTreeMap<String, GpuMesh>,
     pub show_edges: bool,
+    pub section: Option<Section>,
     frame: Option<Frame>,
 
     // Orbit camera
@@ -226,9 +353,19 @@ impl Viewport {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3],
         })];
-        let make = |label, topology, fragment, bias| {
+        struct Kind {
+            label: &'static str,
+            topology: wgpu::PrimitiveTopology,
+            fragment: &'static str,
+            bias: wgpu::DepthBiasState,
+            depth_write: bool,
+            depth_compare: wgpu::CompareFunction,
+            stencil: wgpu::StencilState,
+            color_writes: wgpu::ColorWrites,
+        }
+        let make = |kind: Kind| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
+                label: Some(kind.label),
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
@@ -237,30 +374,84 @@ impl Viewport {
                     buffers: &vertex_layout,
                 },
                 // No culling, so a part with flipped faces still shows up.
-                primitive: wgpu::PrimitiveState { topology, ..Default::default() },
+                primitive: wgpu::PrimitiveState { topology: kind.topology, ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: Default::default(),
-                    bias,
+                    depth_write_enabled: Some(kind.depth_write),
+                    depth_compare: Some(kind.depth_compare),
+                    stencil: kind.stencil,
+                    bias: kind.bias,
                 }),
                 multisample: wgpu::MultisampleState { count: SAMPLES, ..Default::default() },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some(fragment),
+                    entry_point: Some(kind.fragment),
                     compilation_options: Default::default(),
-                    targets: &[Some(COLOR_FORMAT.into())],
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: COLOR_FORMAT,
+                        blend: None,
+                        write_mask: kind.color_writes,
+                    })],
                 }),
                 multiview_mask: None,
                 cache: None,
             })
         };
+        let plain = |label, topology, fragment, bias| Kind {
+            label,
+            topology,
+            fragment,
+            bias,
+            depth_write: true,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: Default::default(),
+            color_writes: wgpu::ColorWrites::ALL,
+        };
         // Faces are pushed slightly back so the edges drawn on them always win.
         let face_bias = wgpu::DepthBiasState { constant: 2, slope_scale: 1.5, clamp: 0.0 };
-        let pipeline = make("intercraft faces", wgpu::PrimitiveTopology::TriangleList, "fs_main", face_bias);
+        let triangles = wgpu::PrimitiveTopology::TriangleList;
+        let pipeline = make(plain("intercraft faces", triangles, "fs_main", face_bias));
         let line_pipeline =
-            make("intercraft edges", wgpu::PrimitiveTopology::LineList, "fs_line", wgpu::DepthBiasState::default());
+            make(plain("intercraft edges", wgpu::PrimitiveTopology::LineList, "fs_line", Default::default()));
+
+        // Section caps. Counting back faces up and front faces down along each pixel
+        // leaves a non-zero stencil exactly where the section plane is inside a solid.
+        let count = |pass_op| wgpu::StencilFaceState {
+            compare: wgpu::CompareFunction::Always,
+            fail_op: wgpu::StencilOperation::Keep,
+            depth_fail_op: wgpu::StencilOperation::Keep,
+            pass_op,
+        };
+        let mark_pipeline = make(Kind {
+            depth_write: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState {
+                front: count(wgpu::StencilOperation::DecrementWrap),
+                back: count(wgpu::StencilOperation::IncrementWrap),
+                read_mask: 0xff,
+                write_mask: 0xff,
+            },
+            color_writes: wgpu::ColorWrites::empty(),
+            ..plain("intercraft section count", triangles, "fs_mark", Default::default())
+        });
+        // The cap is drawn where the count is non-zero and clears it for the next part.
+        let fill = wgpu::StencilFaceState {
+            compare: wgpu::CompareFunction::NotEqual,
+            fail_op: wgpu::StencilOperation::Zero,
+            depth_fail_op: wgpu::StencilOperation::Zero,
+            pass_op: wgpu::StencilOperation::Zero,
+        };
+        let cap_pipeline = make(Kind {
+            stencil: wgpu::StencilState { front: fill, back: fill, read_mask: 0xff, write_mask: 0xff },
+            ..plain("intercraft section cap", triangles, "fs_cap", Default::default())
+        });
+
+        // Drawn last and never hidden, so a clash deep inside two parts still shows.
+        let overlay_pipeline = make(Kind {
+            depth_write: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            ..plain("intercraft overlays", triangles, "fs_line", Default::default())
+        });
 
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("intercraft globals"),
@@ -278,12 +469,17 @@ impl Viewport {
             rs,
             pipeline,
             line_pipeline,
+            mark_pipeline,
+            cap_pipeline,
+            overlay_pipeline,
+            overlays: Vec::new(),
             globals,
             bind_group,
             targets: None,
             texture_id: None,
             meshes: BTreeMap::new(),
             show_edges: true,
+            section: None,
             frame: None,
             target: Vec3::ZERO,
             yaw: -0.9,
@@ -337,6 +533,7 @@ impl Viewport {
                 edges,
                 edge_vertex_count: edge_vertices.len() as u32,
                 bounds: (lo.into(), hi.into()),
+                color,
                 visible,
                 cpu: Arc::new(mesh),
             },
@@ -344,6 +541,29 @@ impl Viewport {
         if first {
             self.fit();
         }
+    }
+
+    /// Replace the clash volumes shown in red.
+    pub fn set_overlays(&mut self, meshes: &[Mesh]) {
+        let device = &self.rs.device;
+        self.overlays = meshes
+            .iter()
+            .map(|mesh| {
+                let vertices: Vec<Vertex> = mesh
+                    .positions
+                    .iter()
+                    .map(|&pos| Vertex { pos, normal: [0.0; 3], color: [0.95, 0.16, 0.14] })
+                    .collect();
+                let buffer = |contents: &[u8], usage| {
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("overlay"), contents, usage })
+                };
+                (
+                    buffer(bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX),
+                    buffer(bytemuck::cast_slice(&mesh.indices), wgpu::BufferUsages::INDEX),
+                    mesh.indices.len() as u32,
+                )
+            })
+            .collect();
     }
 
     pub fn retain_meshes(&mut self, keep: impl Fn(&str) -> bool) {
@@ -356,15 +576,43 @@ impl Viewport {
         }
     }
 
+    fn shown<'a>(&'a self, show: Show<'a>) -> impl Iterator<Item = &'a GpuMesh> {
+        let wanted = move |name: &str, mesh: &GpuMesh| match show {
+            Show::Visible => mesh.visible,
+            Show::All => true,
+            Show::Only(only) => name == only,
+        };
+        self.meshes.iter().filter(move |(name, mesh)| wanted(name, mesh)).map(|(_, mesh)| mesh)
+    }
+
+    fn bounds_of(&self, show: Show) -> Option<(Vec3, Vec3)> {
+        self.shown(show).map(|m| m.bounds).reduce(|(lo, hi), (a, b)| (lo.min(a), hi.max(b)))
+    }
+
+    /// Box around everything that is visible, as (min, max).
+    pub fn visible_bounds(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.bounds_of(Show::Visible).map(|(lo, hi)| (lo.to_array(), hi.to_array()))
+    }
+
+    /// A section through the middle of what's visible, cutting away the half
+    /// nearest the camera so the cut face is the one you see.
+    pub fn section_across(&self, axis: usize) -> Option<Section> {
+        let (lo, hi) = self.visible_bounds()?;
+        let flip = self.eye_offset()[axis] < 0.0;
+        Some(Section { axis, offset: (lo[axis] + hi[axis]) * 0.5, flip })
+    }
+
+    /// Turn the section plane on or off.
+    pub fn toggle_section(&mut self) {
+        self.section = match self.section {
+            None => self.section_across(1),
+            Some(_) => None,
+        };
+    }
+
     /// Frame everything that is visible.
     pub fn fit(&mut self) {
-        let mut bounds: Option<(Vec3, Vec3)> = None;
-        for mesh in self.meshes.values().filter(|m| m.visible) {
-            bounds = Some(match bounds {
-                None => mesh.bounds,
-                Some((lo, hi)) => (lo.min(mesh.bounds.0), hi.max(mesh.bounds.1)),
-            });
-        }
+        let bounds = self.visible_bounds().map(|(lo, hi)| (Vec3::from(lo), Vec3::from(hi)));
         if let Some((lo, hi)) = bounds {
             self.target = (lo + hi) * 0.5;
             self.distance = ((hi - lo).length() * 1.4).max(1.0);
@@ -372,11 +620,7 @@ impl Viewport {
     }
 
     fn eye_offset(&self) -> Vec3 {
-        Vec3::new(
-            self.pitch.cos() * self.yaw.cos(),
-            self.pitch.cos() * self.yaw.sin(),
-            self.pitch.sin(),
-        ) * self.distance
+        orbit(self.yaw, self.pitch) * self.distance
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> ViewportInput {
@@ -434,27 +678,7 @@ impl Viewport {
             return;
         }
         let device = &self.rs.device;
-        let make = |label, format, sample_count, usage| {
-            device
-                .create_texture(&wgpu::TextureDescriptor {
-                    label: Some(label),
-                    size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage,
-                    view_formats: &[],
-                })
-                .create_view(&Default::default())
-        };
-        let attach = wgpu::TextureUsages::RENDER_ATTACHMENT;
-        let targets = Targets {
-            size,
-            msaa_view: make("viewport msaa", COLOR_FORMAT, SAMPLES, attach),
-            depth_view: make("viewport depth", DEPTH_FORMAT, SAMPLES, attach),
-            resolve_view: make("viewport colour", COLOR_FORMAT, 1, attach | wgpu::TextureUsages::TEXTURE_BINDING),
-        };
+        let targets = make_targets(device, size, wgpu::TextureUsages::TEXTURE_BINDING);
 
         let mut renderer = self.rs.renderer.write();
         match self.texture_id {
@@ -472,15 +696,101 @@ impl Viewport {
 
     fn render(&mut self, rect: egui::Rect, dark: bool) {
         let Some(targets) = &self.targets else { return };
-
-        let offset = self.eye_offset();
-        let eye = self.target + offset;
-        let view = look_at(eye, self.target, Vec3::Z);
-        let near = (self.distance * 0.01).max(0.01);
-        let far = self.distance * 20.0 + 1000.0;
-        let proj = perspective(45f32.to_radians(), rect.width() / rect.height(), near, far);
-        let view_proj = proj * view;
+        let scene = Scene {
+            target: self.target,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            distance: self.distance,
+            aspect: rect.width() / rect.height(),
+            background: if dark { 0.11 } else { 0.86 },
+            section: self.section,
+            show: Show::Visible,
+            overlays: true,
+        };
+        let view_proj = self.draw(targets, &scene);
         self.frame = Some(Frame { view_proj, inverse: view_proj.inverse(), rect });
+    }
+
+    /// Render the model to an image of SHOT_SIZE x SHOT_SIZE pixels, as RGBA bytes.
+    /// The user's own view is left exactly as it was.
+    pub fn snapshot(&self, shot: &Shot) -> anyhow::Result<Vec<u8>> {
+        let show = match (&shot.only, shot.direction) {
+            (Some(name), _) => Show::Only(name),
+            (None, Some(_)) => Show::All,
+            (None, None) => Show::Visible,
+        };
+        let Some((lo, hi)) = self.bounds_of(show) else {
+            anyhow::bail!("there is nothing to look at yet: no part has been built");
+        };
+        let scene = match shot.direction {
+            // A standard view, framed on what it shows.
+            Some((yaw, pitch)) => Scene {
+                target: (lo + hi) * 0.5,
+                yaw,
+                pitch,
+                distance: ((hi - lo).length() * 1.4).max(1.0),
+                aspect: 1.0,
+                background: 0.11,
+                section: shot.section,
+                show,
+                overlays: false,
+            },
+            None => Scene {
+                target: self.target,
+                yaw: self.yaw,
+                pitch: self.pitch,
+                distance: self.distance,
+                aspect: 1.0,
+                background: 0.11,
+                section: shot.section.or(self.section),
+                show,
+                overlays: true,
+            },
+        };
+
+        let device = &self.rs.device;
+        let targets = make_targets(device, [SHOT_SIZE; 2], wgpu::TextureUsages::COPY_SRC);
+        self.draw(&targets, &scene);
+
+        let row = SHOT_SIZE * 4;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("intercraft snapshot"),
+            size: u64::from(row * SHOT_SIZE),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            targets.resolve.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(SHOT_SIZE) },
+            },
+            wgpu::Extent3d { width: SHOT_SIZE, height: SHOT_SIZE, depth_or_array_layers: 1 },
+        );
+        self.rs.queue.submit([encoder.finish()]);
+
+        let (done, mapped) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let _ = done.send(result);
+        });
+        let wait = wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) };
+        device.poll(wait).map_err(|e| anyhow::anyhow!("waiting for the picture: {e}"))?;
+        mapped.recv()??;
+        let pixels = buffer.slice(..).get_mapped_range()?.to_vec();
+        buffer.unmap();
+        Ok(pixels)
+    }
+
+    /// Draw a scene into `targets`. Returns the view-projection matrix it used.
+    fn draw(&self, targets: &Targets, scene: &Scene) -> Mat4 {
+        let offset = orbit(scene.yaw, scene.pitch) * scene.distance;
+        let eye = scene.target + offset;
+        let view = look_at(eye, scene.target, Vec3::Z);
+        let near = (scene.distance * 0.01).max(0.01);
+        let far = scene.distance * 20.0 + 1000.0;
+        let proj = perspective(45f32.to_radians(), scene.aspect, near, far);
+        let view_proj = proj * view;
 
         // Lights follow the camera so the part never goes dark while orbiting.
         let back = offset.normalize();
@@ -493,10 +803,14 @@ impl Viewport {
             view_proj: view_proj.to_cols_array_2d(),
             light_a: light_a.extend(0.0).to_array(),
             light_b: light_b.extend(0.0).to_array(),
+            clip: scene.section.map_or([0.0; 4], |s| s.plane().0.extend(s.plane().1).to_array()),
+            flags: [if scene.section.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         self.rs.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
 
-        let bg = if dark { 0.11 } else { 0.86 };
+        let caps = scene.section.and_then(|section| self.cap_quads(section, scene.show));
+
+        let bg = scene.background;
         let mut encoder = self.rs.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -513,7 +827,7 @@ impl Viewport {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &targets.depth_view,
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
-                    stencil_ops: None,
+                    stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0), store: wgpu::StoreOp::Discard }),
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
@@ -521,22 +835,74 @@ impl Viewport {
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_pipeline(&self.pipeline);
-            for mesh in self.meshes.values().filter(|m| m.visible) {
+            for mesh in self.shown(scene.show) {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
+            if let Some(caps) = &caps {
+                pass.set_stencil_reference(0);
+                for (i, mesh) in self.shown(scene.show).enumerate() {
+                    pass.set_pipeline(&self.mark_pipeline);
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    pass.set_pipeline(&self.cap_pipeline);
+                    pass.set_vertex_buffer(0, caps.slice(..));
+                    let first = i as u32 * 6;
+                    pass.draw(first..first + 6, 0..1);
+                }
+            }
             if self.show_edges {
                 pass.set_pipeline(&self.line_pipeline);
-                for mesh in self.meshes.values().filter(|m| m.visible) {
+                for mesh in self.shown(scene.show) {
                     if let Some(edges) = &mesh.edges {
                         pass.set_vertex_buffer(0, edges.slice(..));
                         pass.draw(0..mesh.edge_vertex_count, 0..1);
                     }
                 }
             }
+            if scene.overlays {
+                pass.set_pipeline(&self.overlay_pipeline);
+                for (vertices, indices, count) in &self.overlays {
+                    pass.set_vertex_buffer(0, vertices.slice(..));
+                    pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+            }
         }
         self.rs.queue.submit([encoder.finish()]);
+        view_proj
+    }
+
+    /// One quad per drawn part, lying on the section plane and big enough to cover
+    /// the whole model, in the part's cut colour.
+    fn cap_quads(&self, section: Section, show: Show) -> Option<wgpu::Buffer> {
+        let (lo, hi) = self.bounds_of(show)?;
+        let centre = (lo + hi) * 0.5;
+        let reach = (hi - lo).length().max(1.0);
+        let (u, v) = (Vec3::AXES[(section.axis + 1) % 3] * reach, Vec3::AXES[(section.axis + 2) % 3] * reach);
+        let mut origin = centre;
+        origin[section.axis] = section.offset;
+        let corners = [origin - u - v, origin + u - v, origin + u + v, origin - u + v];
+        let normal = section.plane().0.to_array();
+
+        let mut vertices = Vec::new();
+        for mesh in self.shown(show) {
+            // The part's colour, lightened towards a paper tone so the cut stands out.
+            let color = Vec3::from(mesh.color).lerp(Vec3::new(0.93, 0.82, 0.60), 0.62).to_array();
+            for i in [0, 1, 2, 0, 2, 3] {
+                vertices.push(Vertex { pos: corners[i].to_array(), normal, color });
+            }
+        }
+        if vertices.is_empty() {
+            return None;
+        }
+        Some(self.rs.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("intercraft section caps"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        }))
     }
 
     /// Small XYZ triad in the corner so the frame is always visible.
@@ -571,6 +937,7 @@ impl Viewport {
         }
         let (origin, dir) = frame.ray(cursor);
         let visible = || self.meshes.iter().filter(|(_, m)| m.visible);
+        let cut = |p: Vec3| self.section.is_some_and(|s| s.cuts(p));
 
         // Nearest surface along the ray, used both as a fallback pick and to hide
         // corners and edges that sit behind other geometry.
@@ -580,7 +947,7 @@ impl Viewport {
             for tri in mesh.cpu.indices.chunks_exact(3) {
                 let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| Vec3::from(p[i as usize]));
                 if let Some(t) = ray_triangle(origin, dir, a, b, c) {
-                    if surface.is_none_or(|(best, _)| t < best) {
+                    if surface.is_none_or(|(best, _)| t < best) && !cut(origin + dir * t) {
                         surface = Some((t, name));
                     }
                 }
@@ -599,7 +966,7 @@ impl Viewport {
                 let p = Vec3::from(corner);
                 let Some(s) = to_screen(p) else { continue };
                 let d = s.distance(cursor_v);
-                if d < CORNER_SNAP && in_view(p) && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                if d < CORNER_SNAP && in_view(p) && !cut(p) && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
                     best = Some((d, Hit { part: name.clone(), target: Target::Corner(i), pos: corner }));
                 }
             }
@@ -621,7 +988,7 @@ impl Viewport {
                     };
                     let d = (s0 + seg * t).distance(cursor_v);
                     let p = p0.lerp(p1, t);
-                    if d < EDGE_SNAP && in_view(p) && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    if d < EDGE_SNAP && in_view(p) && !cut(p) && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
                         best = Some((d, Hit { part: name.clone(), target: Target::Edge(i), pos: p.to_array() }));
                     }
                 }

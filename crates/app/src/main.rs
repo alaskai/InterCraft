@@ -1,8 +1,9 @@
 // InterCraft: watch an LLM (or you) edit a parametric model, one feature at a time.
-// eframe/egui 0.36.2 (wgpu 30), egui_dock 0.21.1, egui_commonmark 0.25, rfd 0.18, glam 0.34, bytemuck 1
+// eframe/egui 0.36.2 (wgpu 30), egui_dock 0.21.1, egui_commonmark 0.25, rfd 0.18, glam 0.34, bytemuck 1, png 0.18
 // Worker: Python 3.11, build123d 0.13.0, numpy 2.4.6
 
 mod chat;
+mod fit;
 mod measure;
 mod menus;
 mod params;
@@ -110,10 +111,14 @@ struct State {
     history: HistoryInfo,
     /// A parameter being dragged in the Inspector, previewed but not saved yet.
     param_drag: Option<params::ParamDrag>,
+    /// The Rename part window: the part, the name typed so far, and any error.
+    rename: Option<(String, String, Option<String>)>,
 
     viewport: Viewport,
     chat: chat::ChatPanel,
     measure: measure::MeasureTool,
+    /// The fit check panel, while it is open.
+    fit: Option<fit::FitCheck>,
 
     exports_pending: usize,
     exported: Vec<String>,
@@ -155,9 +160,11 @@ impl App {
             hidden: HashSet::new(),
             history: HistoryInfo::default(),
             param_drag: None,
+            rename: None,
             viewport: Viewport::new(render_state),
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
             measure: measure::MeasureTool::default(),
+            fit: None,
             exports_pending: 0,
             exported: Vec::new(),
             shown_name: None,
@@ -212,6 +219,9 @@ impl eframe::App for App {
         self.state.send_preview();
         self.state.fix_selection();
         self.state.sync_meshes();
+        // Both of these need the meshes of the latest build, so they come after the sync.
+        self.state.run_fit();
+        self.state.serve_views();
         // The project name can also change on disk, so check it after each reload.
         if std::mem::take(&mut self.title_dirty) || self.state.project_renamed() {
             self.update_title(ctx);
@@ -373,11 +383,91 @@ impl State {
 
     /// Save a parameter edited in the Inspector. One edit, one undo step.
     pub(crate) fn commit_param(&mut self, edit: params::ParamCommit) {
-        let params::ParamCommit { part, feature, name, value } = edit;
-        let shown = value.to_string();
-        match self.edit_project(|p| p.set_param(&part, &feature, &name, value).and_then(|()| p.save())) {
+        let params::ParamCommit { part, field, value } = edit;
+        let shown = value.as_f64().map_or_else(|| value.to_string(), measure::mm);
+        let name = field.label();
+        let result = self.edit_project(|p| {
+            match &field {
+                params::Field::Param { feature, name } => p.set_param(&part, feature, name, value)?,
+                params::Field::Position(axis) | params::Field::Rotation(axis) => {
+                    let current = p.part(&part)?;
+                    let (mut position, mut rotation) = (current.position, current.rotation);
+                    let number = value.as_f64().unwrap_or(0.0);
+                    match field {
+                        params::Field::Position(_) => position[*axis] = number,
+                        _ => rotation[*axis] = number,
+                    }
+                    p.set_placement(&part, position, rotation)?;
+                }
+            }
+            p.save()
+        });
+        match result {
             Ok(()) => self.worker_status = format!("Set {name} = {shown}. Ctrl+Z undoes it."),
             Err(e) => self.worker_status = format!("Couldn't change {name}: {e:#}"),
+        }
+    }
+
+    fn rename_part(&mut self, old: &str, new: &str) -> anyhow::Result<()> {
+        self.edit_project(|p| p.rename_part(old, new).and_then(|()| p.save()))?;
+        if self.hidden.remove(old) {
+            self.hidden.insert(new.to_owned());
+        }
+        if self.selected_part.as_deref() == Some(old) {
+            self.selected_part = Some(new.to_owned());
+        }
+        self.worker_status = format!("Renamed '{old}' to '{new}'");
+        Ok(())
+    }
+
+    pub(crate) fn duplicate_part(&mut self, name: &str) {
+        let result = self.edit_project(|p| {
+            let copy = p.duplicate_part(name, None)?;
+            p.save()?;
+            Ok(copy)
+        });
+        match result {
+            Ok(copy) => {
+                self.worker_status = format!("Copied '{name}' as '{copy}'. Move it with Placement in the Inspector.");
+                self.selected_part = Some(copy);
+                self.selected_step = None;
+            }
+            Err(e) => self.worker_status = format!("Couldn't copy '{name}': {e:#}"),
+        }
+    }
+
+    /// The small window for typing a part's new name.
+    fn rename_window(&mut self, ctx: &egui::Context) {
+        let Some((part, mut name, mut error)) = self.rename.take() else { return };
+        let mut open = true;
+        let mut done = false;
+        egui::Window::new("Rename part")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let field = ui.add(egui::TextEdit::singleline(&mut name).hint_text("Letters, digits, _ and -"));
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if let Some(error) = &error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Rename").clicked() || enter {
+                    if name.trim() == part {
+                        done = true;
+                    } else {
+                        match self.rename_part(&part, name.trim()) {
+                            Ok(()) => done = true,
+                            Err(e) => error = Some(capitalise(&format!("{e:#}"))),
+                        }
+                    }
+                }
+            });
+        if open && !done {
+            self.rename = Some((part, name, error));
         }
     }
 
@@ -392,8 +482,9 @@ impl State {
         let (Some(loaded), Some(worker)) = (&self.project, &mut self.worker) else { return };
         let Ok(part) = loaded.part(&drag.part) else { return };
         let mut part = part.clone();
-        let Some(feature) = part.features.iter_mut().find(|f| f.id == drag.feature) else { return };
-        feature.params.insert(drag.name.clone(), drag.json());
+        if !drag.apply(&mut part) {
+            return;
+        }
         if worker.rebuild(intercraft_tools::request_for(&loaded.dir, &part)).is_ok() {
             for ((name, _), entry) in self.results.iter_mut() {
                 if *name == part.name {
@@ -434,6 +525,9 @@ impl State {
             if ui.input(|i| i.key_pressed(egui::Key::E)) {
                 self.viewport.show_edges = !self.viewport.show_edges;
             }
+            if ui.input(|i| i.key_pressed(egui::Key::S)) {
+                self.viewport.toggle_section();
+            }
             if ui.input(|i| i.key_pressed(egui::Key::H)) {
                 if let Some(name) = self.selected_part.clone() {
                     let hidden = self.hidden.contains(&name);
@@ -449,7 +543,7 @@ impl State {
             }
         }
 
-        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(420.0, 30.0));
+        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(620.0, 30.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
             egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -462,6 +556,13 @@ impl State {
                     if ui.selectable_label(self.viewport.show_edges, "Edges").on_hover_text("Show edges (E)").clicked() {
                         self.viewport.show_edges = !self.viewport.show_edges;
                     }
+                    if ui.selectable_label(self.fit.is_some(), "Fit check").on_hover_text("Find clashes and gaps between parts").clicked() {
+                        self.toggle_fit();
+                    }
+                    let cutting = self.viewport.section.is_some();
+                    if ui.selectable_label(cutting, "Section").on_hover_text("Cut the model open (S)").clicked() {
+                        self.viewport.toggle_section();
+                    }
                     if !self.hidden.is_empty() {
                         let text = format!("Show all ({} hidden)", self.hidden.len());
                         if ui.button(text).clicked() {
@@ -471,6 +572,9 @@ impl State {
                 });
             });
         });
+
+        self.section_panel(ui, rect);
+        self.fit_panel(ui, rect);
 
         if !self.measure.active {
             return;
@@ -525,6 +629,138 @@ impl State {
         });
     }
 
+    /// Draw the pictures a model has asked for with the `view_model` tool. Requests
+    /// arrive as files, so an MCP server in another process can ask too.
+    fn serve_views(&mut self) {
+        let Some(loaded) = &self.project else { return };
+        let Some(request) = intercraft_tools::view_requests(&loaded.dir).into_iter().next() else { return };
+        // The picture must show the model's latest edit, so wait until it is built.
+        let settled = self.building.is_empty() && self.param_drag.is_none() && loaded.latest_mtime() == self.last_mtime;
+        if !settled && request.age < Duration::from_secs(10) {
+            return;
+        }
+        match self.take_view(&request) {
+            Ok(png) => intercraft_tools::answer_view(&loaded.dir, &request.id, Ok(&png)),
+            Err(e) => intercraft_tools::answer_view(&loaded.dir, &request.id, Err(&format!("{e:#}"))),
+        }
+    }
+
+    fn take_view(&self, request: &intercraft_tools::ViewRequest) -> anyhow::Result<Vec<u8>> {
+        let degrees = |yaw: f32, pitch: f32| Some((yaw.to_radians(), pitch.to_radians()));
+        let direction = match request.view.as_str() {
+            "iso" => degrees(-50.0, 28.0),
+            "front" => degrees(-90.0, 0.0),
+            "back" => degrees(90.0, 0.0),
+            "right" => degrees(0.0, 0.0),
+            "left" => degrees(180.0, 0.0),
+            "top" => degrees(-90.0, 88.8),
+            "bottom" => degrees(-90.0, -88.8),
+            _ => None,
+        };
+        let section = request.section.map(|(axis, offset, flip)| viewport::Section { axis, offset: offset as f32, flip });
+        let shot = viewport::Shot { direction, only: request.part.clone(), section };
+        let pixels = self.viewport.snapshot(&shot)?;
+
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, viewport::SHOT_SIZE, viewport::SHOT_SIZE);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(&pixels)?;
+        writer.finish()?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn toggle_fit(&mut self) {
+        self.fit = match self.fit {
+            None => Some(fit::FitCheck::default()),
+            Some(_) => None,
+        };
+        self.viewport.set_overlays(&[]);
+    }
+
+    /// Send the fit check once everything it needs has been built.
+    fn run_fit(&mut self) {
+        let Some(fit) = &mut self.fit else { return };
+        if !fit.wants_run() || !self.building.is_empty() || self.param_drag.is_some() {
+            return;
+        }
+        // What is on screen: visible parts, at the step being shown.
+        let mut parts: Vec<(String, String)> = self
+            .shown
+            .iter()
+            .filter(|(name, _)| !self.hidden.contains(*name))
+            .filter_map(|(name, path)| Some((name.clone(), Mesh::key_of(path)?)))
+            .collect();
+        parts.sort();
+        if parts.len() < 2 {
+            fit.result(Err("A fit check needs at least two visible parts.".to_owned()));
+            return;
+        }
+        match self.worker.as_mut().map(|w| w.request_fit(&parts)) {
+            Some(Ok(id)) => fit.sent(id),
+            Some(Err(e)) => fit.result(Err(format!("{e:#}"))),
+            None => fit.result(Err("The geometry worker isn't running.".to_owned())),
+        }
+    }
+
+    /// Results of the fit check, with the gap of the
+    /// row under the pointer drawn in the 3D view.
+    fn fit_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let Some(fit) = &mut self.fit else { return };
+        // Top right, under the section controls when those are showing.
+        let top = if self.viewport.section.is_some() { 78.0 } else { 8.0 };
+        let panel = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-328.0, top), egui::vec2(320.0, 220.0));
+        let mut hovered = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(300.0);
+                hovered = fit.panel_ui(ui);
+            });
+        });
+        if let Some((a, b)) = hovered {
+            if let (Some(sa), Some(sb)) = (self.viewport.project(a), self.viewport.project(b)) {
+                let painter = ui.painter_at(rect);
+                painter.line_segment([sa, sb], egui::Stroke::new(2.0, egui::Color32::WHITE));
+                painter.circle_filled(sa, 3.5, egui::Color32::from_rgb(240, 150, 40));
+                painter.circle_filled(sb, 3.5, egui::Color32::from_rgb(40, 190, 230));
+            }
+        }
+    }
+
+    /// Controls for the section plane, in the top right corner of the viewport.
+    fn section_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let (Some(mut section), Some((lo, hi))) = (self.viewport.section, self.viewport.visible_bounds()) else {
+            return;
+        };
+        let panel = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-268.0, 8.0), egui::vec2(260.0, 90.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Cut along");
+                    for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {
+                        if ui.selectable_label(section.axis == axis, name).clicked() && section.axis != axis {
+                            section = self.viewport.section_across(axis).unwrap_or(section);
+                        }
+                    }
+                    if ui.selectable_label(section.flip, "Flip").on_hover_text("Cut away the other side").clicked() {
+                        section.flip = !section.flip;
+                    }
+                });
+                // A little past each end, so the plane can clear the model completely.
+                let (a, b) = (lo[section.axis], hi[section.axis]);
+                let margin = ((b - a) * 0.02).max(0.1);
+                ui.spacing_mut().slider_width = 170.0;
+                ui.add(
+                    egui::Slider::new(&mut section.offset, (a - margin)..=(b + margin))
+                        .suffix(" mm")
+                        .max_decimals(1),
+                );
+            });
+        });
+        self.viewport.section = Some(section);
+    }
+
     /// Write parts to the project's exports folder, using the viewer's own worker.
     fn export(&mut self, parts: &[String], format: ExportFormat) {
         let (Some(loaded), Some(worker)) = (&self.project, &mut self.worker) else {
@@ -568,6 +804,11 @@ impl State {
                 self.project = Some(loaded);
                 // Picks point at shapes that are about to change.
                 self.measure.clear();
+                // An open fit check runs again once the rebuild has finished.
+                if let Some(fit) = &mut self.fit {
+                    fit.invalidate();
+                    self.viewport.set_overlays(&[]);
+                }
                 self.rebuild_all();
             }
             // Keep showing the last good project. A half-saved file shouldn't blank the view.
@@ -645,6 +886,18 @@ impl State {
                 }
                 GeoEvent::Measured { id, data } => self.measure.result(id, Ok(data)),
                 GeoEvent::Inspected { .. } => {}
+                GeoEvent::Fitted { id, data } => {
+                    if let Some(fit) = self.fit.as_mut().filter(|f| f.waiting_for(id)) {
+                        let meshes: Vec<Mesh> = fit::overlap_meshes(&data).iter().filter_map(|p| Mesh::load(p).ok()).collect();
+                        self.viewport.set_overlays(&meshes);
+                        fit.result(Ok(data));
+                    }
+                }
+                GeoEvent::Error { id: Some(id), error } if self.fit.as_ref().is_some_and(|f| f.waiting_for(id)) => {
+                    if let Some(fit) = &mut self.fit {
+                        fit.result(Err(error));
+                    }
+                }
                 GeoEvent::Error { id: Some(id), error } if self.measure.waiting_for(id) => {
                     self.measure.result(id, Err(error));
                 }
@@ -848,6 +1101,14 @@ impl State {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Rename...").clicked() {
+                    action = Some(PartAction::Rename(name.clone()));
+                    ui.close();
+                }
+                if ui.button("Duplicate").clicked() {
+                    action = Some(PartAction::Duplicate(name.clone()));
+                    ui.close();
+                }
                 let (label, kind) = match part.kind {
                     PartKind::Design => ("Lock as reference", PartKind::Reference),
                     PartKind::Reference => ("Unlock for editing", PartKind::Design),
@@ -893,9 +1154,12 @@ impl State {
             Some(PartAction::ShowAll) => self.show_all(),
             Some(PartAction::Kind(name, kind)) => self.set_part_kind(&name, kind),
             Some(PartAction::Delete(name)) => self.delete_part(&name),
+            Some(PartAction::Rename(name)) => self.rename = Some((name.clone(), name, None)),
+            Some(PartAction::Duplicate(name)) => self.duplicate_part(&name),
             Some(PartAction::Import) => self.import_step_dialog(),
             None => {}
         }
+        self.rename_window(ui.ctx());
     }
 
     fn inspector_ui(&mut self, ui: &mut egui::Ui) {
@@ -913,6 +1177,18 @@ impl State {
             ui.weak("Select a part to see its steps.");
             return None;
         };
+        let mut commit = None;
+        // Where the part sits in the assembly. Open by itself once the part has been moved.
+        egui::CollapsingHeader::new("Placement")
+            .id_salt(("placement", &part.name))
+            .default_open(part.placement().is_some())
+            .show(ui, |ui| {
+                egui::Grid::new("placement").num_columns(2).show(ui, |ui| {
+                    commit = params::placement_rows(ui, part, drag);
+                });
+                ui.weak("X, Y, Z in mm, then degrees about each axis.");
+            });
+
         // Follow the latest step unless one is picked on the timeline.
         let steps = steps(part);
         let index = match &self.selected_step {
@@ -921,7 +1197,7 @@ impl State {
         };
         let Some(index) = index else {
             ui.weak("This part has no steps yet.");
-            return None;
+            return commit;
         };
         let step = &steps[index];
 
@@ -939,7 +1215,6 @@ impl State {
             ui.label(egui::RichText::new(step.prompt).italics());
         }
 
-        let mut commit = None;
         if let Some(params) = step.params.filter(|p| !p.is_empty()) {
             ui.separator();
             let editable = part.kind == PartKind::Design;
@@ -1078,6 +1353,8 @@ enum PartAction {
     ShowAll,
     Kind(String, PartKind),
     Delete(String),
+    Rename(String),
+    Duplicate(String),
     Import,
 }
 

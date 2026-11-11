@@ -4,6 +4,7 @@
 // ureq 3.5 (json), serde_json 1, anyhow 1
 
 mod anthropic;
+mod claude_code;
 mod sse;
 
 use std::sync::atomic::AtomicBool;
@@ -12,6 +13,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 pub use anthropic::{AnthropicChat, AnthropicSettings, ANTHROPIC_MODELS};
+pub use claude_code::{claude_code_version, ClaudeCodeChat, ClaudeCodeSettings, CLAUDE_CODE_MODELS};
 
 /// A tool the model may call, in provider-neutral form.
 #[derive(Debug, Clone)]

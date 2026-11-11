@@ -2,6 +2,8 @@
 // eframe/egui 0.36.2 (wgpu 30), egui_dock 0.21.1, glam 0.34, bytemuck 1
 // Worker: Python 3.11, build123d 0.13.0, numpy 2.4.6
 
+mod chat;
+mod settings;
 mod viewport;
 
 use std::collections::{HashMap, HashSet};
@@ -92,6 +94,7 @@ struct State {
     hidden: HashSet<String>,
 
     viewport: Viewport,
+    chat: chat::ChatPanel,
 }
 
 impl App {
@@ -116,7 +119,7 @@ impl App {
         tree.split_below(centre, 0.82, vec![Tab::Timeline]);
 
         let mut state = State {
-            project_dir,
+            project_dir: project_dir.clone(),
             project: None,
             project_error: None,
             last_mtime: None,
@@ -130,6 +133,7 @@ impl App {
             shown: HashMap::new(),
             hidden: HashSet::new(),
             viewport: Viewport::new(render_state),
+            chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
         };
         state.reload_project();
         Ok(Self { dock, state })
@@ -139,6 +143,11 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.state.drain_worker_events();
+        // Follow the part the chat model is editing, so its steps show as they land.
+        if let Some(part) = self.state.chat.poll() {
+            self.state.selected_part = Some(part);
+            self.state.selected_step = None;
+        }
         self.state.poll_files();
         self.state.fix_selection();
         self.state.sync_meshes();
@@ -651,7 +660,11 @@ impl TabViewer for State {
             Tab::Inspector => self.inspector_ui(ui),
             Tab::Timeline => self.timeline_ui(ui),
             Tab::Chat => {
-                ui.weak("Chat with the LLM goes here (milestone 3).");
+                let context = self
+                    .selected_part
+                    .as_ref()
+                    .map(|part| format!("Viewer note: the user has part '{part}' selected"));
+                self.chat.ui(ui, context);
             }
             Tab::Sketch => {
                 ui.weak("Quick sketch canvas goes here (milestone 4).");
@@ -669,6 +682,7 @@ impl TabViewer for State {
     }
 
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
-        if *tab == Tab::Viewport { [false, false] } else { [true, true] }
+        // These two manage their own scrolling.
+        if matches!(tab, Tab::Viewport | Tab::Chat) { [false, false] } else { [true, true] }
     }
 }

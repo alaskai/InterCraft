@@ -12,12 +12,11 @@ use intercraft_tools::{ToolHost, GUIDE};
 use serde_json::{json, Value};
 
 fn main() -> Result<()> {
-    let dir = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("INTERCRAFT_PROJECT").ok())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let mut server = ToolHost::new(dir);
+    // A folder argument pins the server to one project. Without one it follows the viewer.
+    let mut server = match std::env::args().nth(1).or_else(|| std::env::var("INTERCRAFT_PROJECT").ok()) {
+        Some(dir) => ToolHost::new(PathBuf::from(dir)),
+        None => ToolHost::follow_viewer(),
+    };
     server.warm_up();
 
     let stdin = std::io::stdin();

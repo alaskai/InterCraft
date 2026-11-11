@@ -135,6 +135,10 @@ impl App {
             viewport: Viewport::new(render_state),
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
         };
+        // Lets an MCP server started by another app (Claude Code, Cursor...) edit this project.
+        if let Err(e) = intercraft_tools::record_active_project(&state.project_dir) {
+            state.worker_status = format!("{} (couldn't record the open project: {e:#})", state.worker_status);
+        }
         state.reload_project();
         Ok(Self { dock, state })
     }

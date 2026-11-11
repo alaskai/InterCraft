@@ -1,9 +1,9 @@
 // intercraft-tools: the tools an LLM can call, and what each one does to the project.
 // Shared by the MCP server and the built-in chat panel, so both behave the same.
-// serde_json 1, anyhow 1
+// serde_json 1, anyhow 1, dirs 7
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use intercraft_core::{FeatureEdit, LoadedProject, NewFeature, Params, Part};
@@ -31,9 +31,39 @@ Working method:
 - Pass the user's request in `prompt` when adding a feature. It is shown on their timeline.
 - State which values you measured from a report and which you assumed."#;
 
+/// Which project the tools edit.
+enum Target {
+    Fixed(PathBuf),
+    /// Whatever the InterCraft viewer opened most recently, checked on every call.
+    FollowViewer,
+}
+
 pub struct ToolHost {
-    dir: PathBuf,
+    target: Target,
     worker: Option<PythonWorker>,
+}
+
+/// Small file where the viewer records the project it has open, so an MCP server
+/// started by another app (Claude Code, Cursor...) edits the same project.
+fn active_project_file() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("InterCraft").join("active_project.txt"))
+}
+
+/// Called by the viewer when it opens a project.
+pub fn record_active_project(dir: &Path) -> Result<()> {
+    let file = active_project_file().context("no config folder on this system")?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    std::fs::write(file, dir.to_string_lossy().as_bytes())?;
+    Ok(())
+}
+
+pub fn active_project() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(active_project_file()?).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| PathBuf::from(text))
 }
 
 pub fn definitions() -> Value {
@@ -137,7 +167,12 @@ impl ToolHost {
     /// The geometry worker starts on the first tool call. Call `warm_up` to start it sooner.
     pub fn new(dir: PathBuf) -> Self {
         let dir = std::path::absolute(&dir).unwrap_or(dir);
-        Self { dir, worker: None }
+        Self { target: Target::Fixed(dir), worker: None }
+    }
+
+    /// Edit whichever project the viewer has open.
+    pub fn follow_viewer() -> Self {
+        Self { target: Target::FollowViewer, worker: None }
     }
 
     /// Start the worker now so the first tool call doesn't wait for OpenCascade to load.
@@ -147,8 +182,13 @@ impl ToolHost {
         }
     }
 
-    pub fn dir(&self) -> &std::path::Path {
-        &self.dir
+    pub fn project_dir(&self) -> Result<PathBuf> {
+        match &self.target {
+            Target::Fixed(dir) => Ok(dir.clone()),
+            Target::FollowViewer => active_project().context(
+                "no InterCraft project is open. Ask the user to start the viewer with `cargo run -- <project folder>` and try again",
+            ),
+        }
     }
 
     pub fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
@@ -162,7 +202,7 @@ impl ToolHost {
                 Ok(json!({
                     "name": project.project.name,
                     "units": project.project.units,
-                    "folder": self.dir,
+                    "folder": project.dir,
                     "parts": parts,
                 }))
             }
@@ -228,7 +268,7 @@ impl ToolHost {
                 let mut files = Vec::new();
                 for format in formats {
                     let ext = if format == ExportFormat::Step { "step" } else { "stl" };
-                    let path = self.dir.join("exports").join(format!("{}.{ext}", part.name));
+                    let path = project.dir.join("exports").join(format!("{}.{ext}", part.name));
                     let request = request_for(part);
                     files.push(self.with_worker(|w| w.export_blocking(request, format, &path))?);
                 }
@@ -239,12 +279,14 @@ impl ToolHost {
     }
 
     /// Reads the project fresh on every call, because the user may have edited the files.
+    /// A missing project is created, so a new folder opened in the viewer just works.
     fn load(&self) -> Result<LoadedProject> {
-        if self.dir.join("project.json").exists() {
-            return LoadedProject::load(&self.dir);
+        let dir = self.project_dir()?;
+        if dir.join("project.json").exists() {
+            return LoadedProject::load(&dir);
         }
-        let name = self.dir.file_name().and_then(|n| n.to_str()).unwrap_or("Untitled");
-        LoadedProject::create(&self.dir, name)
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("Untitled");
+        LoadedProject::create(&dir, name)
     }
 
     /// Runs `job` on the worker, starting it if needed. A failed worker is dropped

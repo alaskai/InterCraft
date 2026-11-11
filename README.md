@@ -51,9 +51,9 @@ To see the live update, leave the app open and change a value in `examples/brack
 
 | Panel | What it shows |
 |---|---|
-| Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it, click the eye to hide or show it, and right-click for Show only this, Show all, Lock, Unlock and Delete. Delete removes the selected part while the pointer is over the list. |
+| Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it, click the eye to hide or show it, and right-click for Show only this, Show all, Rename, Duplicate, Lock, Unlock and Delete. Delete removes the selected part while the pointer is over the list. |
 | Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. Right-click a step to delete it. |
-| Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. |
+| Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. Placement, at the top, moves and turns the selected part in the assembly the same way. |
 
 ### Menus
 
@@ -78,10 +78,22 @@ New projects go in `Documents\InterCraft Projects` unless you pick another folde
 | Measure | M, or the Measure button (Esc clears) |
 | Show or hide edges | E |
 | Hide or show the selected part | H |
+| Section view | S, or the Section button |
+| Fit check | The Fit check button |
 
 ### Measuring
 
 Turn on Measure and click a corner, edge or face. Corners and edges snap when the cursor is close. One click describes what you picked (an edge's length, a circle's diameter and centre, a corner's position). A second click gives the distance between the two, the X, Y and Z offsets, and the angle when both are straight edges or flat faces. The numbers come from the CAD kernel, so they are exact for corners and edges. A point on a curved face comes from the mesh, which is within 0.05 mm.
+
+### Section view
+
+Section cuts the model open with a plane across X, Y or Z. Drag the slider to move the plane and use Flip to cut away the other side. The cut face is filled and hatched in each part's colour, so walls, pockets and bores are easy to judge. Measuring ignores whatever has been cut away.
+
+### Assemblies and the fit check
+
+Each part has a placement: a position in mm and a rotation in degrees about X, Y and Z. Set it under Placement in the Inspector. Features never see the placement. A snippet always works in the part's own frame, so moving a part can't break it. Right-click a part to duplicate or rename it.
+
+Fit check compares every pair of visible parts on the real CAD shapes. A pair either clashes, with the overlapping volume listed and drawn in red through the parts, or is clear, with the smallest gap listed. Hover a row to see where the gap is. The check runs again by itself after each change while its panel is open.
 
 ### Importing STEP files
 
@@ -143,12 +155,16 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `set_param` | Changes one dimension |
 | `delete_feature` | Removes a feature |
 | `delete_part` | Removes a design part (reference parts can only be removed by you) |
+| `place_part` | Moves or turns a design part in the assembly |
+| `duplicate_part`, `rename_part` | Copies or renames a part |
+| `check_fit` | Clashes (with volume) and clearances between parts |
+| `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing one part |
 | `undo`, `redo` | Step back or forward through the project history |
 | `inspect_part` | Faces, holes and circular edges of a part with exact sizes and positions |
 | `measure` | Exact distance, angle, length or diameter between faces, edges, corners and points |
 | `export_part` | Writes STEP and STL to the project's `exports` folder |
 
-Every edit returns a build report (volume, volume change, size, errors), so the LLM can check its own work with numbers. A feature that fails to build stays saved and shows red in the app until it is fixed.
+Every edit returns a build report (volume, volume change, size, errors), so the LLM can check its own work with numbers. With `view_model` it can also look at the result, which catches mistakes numbers miss, such as a hole on the wrong face. The picture is drawn by the open viewer without changing your own view, so that tool needs the viewer running. A feature that fails to build stays saved and shows red in the app until it is fixed.
 
 Other MCP clients (Codex CLI, Gemini CLI, Cursor) use the same command: `python <repo>/dev/mcp_launcher.py` as a stdio server.
 
@@ -160,6 +176,7 @@ A project is a folder with a `project.json` and one Python snippet per feature.
 examples/bracket/
   project.json            parts, feature order, labels, prompts, parameters
   .intercraft/history/    undo snapshots (not needed to share the project)
+  .intercraft/view/       picture requests from the model, removed once answered
   RodBracket/
     010_base.py
     020_bore.py
@@ -229,5 +246,6 @@ The suites include stress tests for both chat routes (a fake Messages API and a 
 7. OpenAI-compatible client (OpenAI, OpenRouter, local models through Ollama or LM Studio)
 8. Undo and history, hiding and deleting parts and steps (done)
 9. Editing parameters in the Inspector with a live preview (done)
-10. Sketch panel
-11. Fit checks, section view, before and after overlay
+10. Section view, part placement, rename and duplicate, fit check, and pictures for the model (done)
+11. Sketch panel
+12. Before and after overlay

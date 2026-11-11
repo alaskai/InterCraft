@@ -62,6 +62,11 @@ struct ToolCall {
     input: Value,
     /// None while running.
     result: Option<(bool, Value)>,
+    /// For ask_user: what the user picked or typed.
+    answer: Option<String>,
+    /// For ask_user: the "Other" text box and the multi-select ticks.
+    other: String,
+    picks: Vec<bool>,
 }
 
 pub struct ChatPanel {
@@ -79,6 +84,7 @@ pub struct ChatPanel {
     cancel: Arc<AtomicBool>,
     busy: bool,
     messages: Vec<Message>,
+    markdown: egui_commonmark::CommonMarkCache,
     input: String,
     usage: Usage,
     ctx: egui::Context,
@@ -102,6 +108,7 @@ impl ChatPanel {
             cancel: Arc::new(AtomicBool::new(false)),
             busy: false,
             messages: Vec::new(),
+            markdown: Default::default(),
             input: String::new(),
             usage: Usage::default(),
             ctx,
@@ -137,6 +144,8 @@ impl ChatPanel {
                 mcp_args: vec![
                     launcher.to_string_lossy().into_owned(),
                     self.project_dir.to_string_lossy().into_owned(),
+                    // Adds ask_user, which only this chat panel can show.
+                    "--chat-panel".to_owned(),
                 ],
                 model: self.settings.claude_code_model.clone(),
                 extra_prompt: CLAUDE_CODE_PROMPT.to_owned(),
@@ -175,6 +184,13 @@ impl ChatPanel {
             return;
         }
         self.input.clear();
+        self.send_text(text, context);
+    }
+
+    fn send_text(&mut self, text: String, context: Option<String>) {
+        if self.busy || !self.ready() {
+            return;
+        }
         self.messages.push(Message::User(text.clone()));
         let full = match context {
             Some(context) => format!("{text}\n\n[{context}]"),
@@ -251,7 +267,15 @@ impl ChatPanel {
                 _ => items.push(Item::Note(text)),
             },
             ChatEvent::ToolStarted { id, name, input } => {
-                items.push(Item::Tool(ToolCall { id, name, input, result: None }));
+                items.push(Item::Tool(ToolCall {
+                    id,
+                    name,
+                    input,
+                    result: None,
+                    answer: None,
+                    other: String::new(),
+                    picks: Vec::new(),
+                }));
             }
             ChatEvent::ToolFinished { id, ok, output } => {
                 for item in items.iter_mut().rev() {
@@ -319,6 +343,7 @@ impl ChatPanel {
             ui.add_space(4.0);
         });
 
+        let mut answered = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
@@ -330,11 +355,50 @@ impl ChatPanel {
                         ui.weak("Ask for a part, for example: \"Make a 60 x 40 x 5 mm plate with four M4 holes 6 mm in from the corners.\"");
                     }
                 }
-                for message in &self.messages {
-                    message_ui(ui, message);
+                // Questions can only be answered on the newest reply, once it has finished.
+                let newest = self.messages.iter().rposition(|m| matches!(m, Message::Assistant { .. }));
+                let open = newest.filter(|&i| {
+                    !self.busy && !self.messages[i + 1..].iter().any(|m| matches!(m, Message::User(_)))
+                });
+                for (i, message) in self.messages.iter_mut().enumerate() {
+                    answered |= message_ui(ui, message, &mut self.markdown, open == Some(i));
                     ui.add_space(6.0);
                 }
             });
+
+        // Once every question in the reply has an answer, send them together.
+        if answered {
+            if let Some(reply) = self.answers_ready() {
+                self.send_text(reply, context);
+            }
+        }
+    }
+
+    /// The answers to the newest reply's questions, if all of them are answered.
+    fn answers_ready(&self) -> Option<String> {
+        let Some(Message::Assistant { items, .. }) =
+            self.messages.iter().rev().find(|m| matches!(m, Message::Assistant { .. }))
+        else {
+            return None;
+        };
+        let questions: Vec<&ToolCall> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Tool(call) if is_question(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        if questions.is_empty() || questions.iter().any(|q| q.answer.is_none()) {
+            return None;
+        }
+        let lines: Vec<String> = questions
+            .iter()
+            .map(|q| {
+                let question = q.input["question"].as_str().unwrap_or_default();
+                format!("{question} {}", q.answer.as_deref().unwrap_or_default())
+            })
+            .collect();
+        Some(lines.join("\n"))
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -529,7 +593,14 @@ fn subscription_help(ui: &mut egui::Ui) {
         });
 }
 
-fn message_ui(ui: &mut egui::Ui, message: &Message) {
+/// Returns true when the user answered a question this frame.
+fn message_ui(
+    ui: &mut egui::Ui,
+    message: &mut Message,
+    markdown: &mut egui_commonmark::CommonMarkCache,
+    open: bool,
+) -> bool {
+    let mut answered = false;
     match message {
         Message::User(text) => {
             egui::Frame::new()
@@ -538,21 +609,22 @@ fn message_ui(ui: &mut egui::Ui, message: &Message) {
                 .inner_margin(8)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(text);
+                    ui.label(text.as_str());
                 });
         }
         Message::Assistant { model, items } => {
             if !model.is_empty() {
-                ui.weak(model);
+                ui.weak(model.as_str());
             }
-            for item in items {
+            for item in items.iter_mut() {
                 match item {
                     Item::Text(text) => {
-                        ui.label(text.trim());
+                        egui_commonmark::CommonMarkViewer::new().show(ui, markdown, text.trim());
                     }
                     Item::Note(text) => {
                         ui.label(egui::RichText::new(text.trim()).italics().weak());
                     }
+                    Item::Tool(call) if is_question(call) => answered |= question_ui(ui, call, open),
                     Item::Tool(call) => tool_ui(ui, call),
                 }
             }
@@ -561,8 +633,101 @@ fn message_ui(ui: &mut egui::Ui, message: &Message) {
             ui.weak(text);
         }
         Message::Error(text) => {
-            ui.colored_label(ui.visuals().error_fg_color, text);
+            ui.colored_label(ui.visuals().error_fg_color, text.as_str());
         }
+    }
+    answered
+}
+
+/// An ask_user call that passed validation (a rejected one shows as a normal tool row).
+fn is_question(call: &ToolCall) -> bool {
+    call.name == "ask_user" && !matches!(call.result, Some((false, _)))
+}
+
+/// A question card. Returns true when the user answered it this frame.
+fn question_ui(ui: &mut egui::Ui, call: &mut ToolCall, open: bool) -> bool {
+    let question = call.input["question"].as_str().unwrap_or_default().to_owned();
+    let options: Vec<(String, String)> = call.input["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|o| {
+            (
+                o["label"].as_str().unwrap_or_default().to_owned(),
+                o["description"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let multi = call.input["multi_select"] == true;
+    if call.picks.len() != options.len() {
+        call.picks = vec![false; options.len()];
+    }
+
+    let mut answer = None;
+    let accent = ui.visuals().selection.stroke.color;
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, if open { accent } else { ui.visuals().widgets.noninteractive.bg_stroke.color }))
+        .corner_radius(6.0)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.strong(&question);
+            if let Some(given) = &call.answer {
+                ui.weak(format!("You answered: {given}"));
+                return;
+            }
+            ui.add_space(4.0);
+            ui.add_enabled_ui(open, |ui| {
+                for (i, (label, description)) in options.iter().enumerate() {
+                    if multi {
+                        ui.checkbox(&mut call.picks[i], label.as_str());
+                    } else {
+                        let button = egui::Button::new(label.as_str())
+                            .min_size(egui::vec2(ui.available_width(), 26.0));
+                        if ui.add(button).clicked() {
+                            answer = Some(label.clone());
+                        }
+                    }
+                    if !description.is_empty() {
+                        ui.label(egui::RichText::new(description).small().weak());
+                    }
+                    ui.add_space(2.0);
+                }
+                if multi {
+                    let any = call.picks.iter().any(|p| *p);
+                    if ui.add_enabled(any, egui::Button::new("Send choices")).clicked() {
+                        let chosen: Vec<&str> = options
+                            .iter()
+                            .zip(&call.picks)
+                            .filter(|(_, picked)| **picked)
+                            .map(|((label, _), _)| label.as_str())
+                            .collect();
+                        answer = Some(chosen.join(", "));
+                    }
+                }
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut call.other)
+                            .hint_text("Or type your own answer")
+                            .desired_width((ui.available_width() - 60.0).max(80.0)),
+                    );
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let typed = !call.other.trim().is_empty();
+                    if (ui.add_enabled(typed, egui::Button::new("Send")).clicked() || enter) && typed {
+                        answer = Some(call.other.trim().to_owned());
+                    }
+                });
+            });
+            if !open {
+                ui.weak("Answer once the reply has finished.");
+            }
+        });
+    match answer {
+        Some(given) => {
+            call.answer = Some(given);
+            true
+        }
+        None => false,
     }
 }
 
@@ -645,7 +810,7 @@ struct HostTools(ToolHost);
 
 impl ToolExecutor for HostTools {
     fn definitions(&self) -> Vec<ToolDef> {
-        intercraft_tools::definitions()
+        intercraft_tools::chat_panel_definitions()
             .as_array()
             .into_iter()
             .flatten()
@@ -671,7 +836,7 @@ fn run_worker(
     ctx: egui::Context,
 ) {
     // Claude Code runs the tools itself, so only the API route needs a warm tool host.
-    let mut host = ToolHost::new(dir);
+    let mut host = ToolHost::new(dir).with_ask_user();
     if config.provider == Provider::Anthropic {
         host.warm_up();
     }

@@ -12,18 +12,36 @@ const KEYRING_USER: &str = "anthropic-api-key";
 
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
+/// Where the chat panel sends messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    /// Anthropic Messages API with the user's API key.
+    #[default]
+    Anthropic,
+    /// The user's own Claude Code install, signed in with their subscription.
+    ClaudeCode,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    pub provider: Provider,
     pub model: String,
     pub effort: String,
+    /// Alias for Claude Code's --model, empty for the user's own default.
+    #[serde(default)]
+    pub claude_code_model: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            provider: Provider::default(),
             model: intercraft_llm::ANTHROPIC_MODELS[0].0.to_owned(),
             // Multi-step tool work does better above the model's default effort.
             effort: "high".to_owned(),
+            claude_code_model: String::new(),
         }
     }
 }

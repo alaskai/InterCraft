@@ -47,6 +47,11 @@ def feature_hash(prev, feature):
 
 
 def write_mesh(shape, path):
+    # Mesh files are named by a hash of everything that shaped them, so an existing
+    # file is already right. The viewer and an MCP server each run a worker and can
+    # build the same step at the same moment.
+    if os.path.exists(path):
+        return
     verts, tris = shape.tessellate(LINEAR_TOL, ANGULAR_TOL)
     v = np.array([(q.X, q.Y, q.Z) for q in verts], dtype=np.float32).reshape(-1, 3)
     t = np.array(tris, dtype=np.uint32).reshape(-1, 3)
@@ -61,14 +66,21 @@ def write_mesh(shape, path):
         length = np.linalg.norm(n, axis=1, keepdims=True)
         n = n / np.where(length > 0, length, 1)
 
-    tmp = path + ".tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "wb") as f:
         f.write(b"ICM1")
         f.write(struct.pack("<II", len(v), len(t)))
         f.write(v.astype("<f4").tobytes())
         f.write(n.astype("<f4").tobytes())
         f.write(t.astype("<u4").tobytes())
-    os.replace(tmp, path)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        # Windows refuses to replace a file another process has open. If another
+        # worker finished the same mesh first, that file is identical, so use it.
+        os.remove(tmp)
+        if not os.path.exists(path):
+            raise
 
 
 def make_report(shape, volume_before):

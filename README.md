@@ -3,7 +3,7 @@
 A desktop tool for watching an LLM build a parametric CAD model, one feature at a time. It is not a CAD package. The model is a list of small build123d snippets, and the app rebuilds and redraws the part every time one of them changes.
 
 > [!note]
-> Status: milestone 3. An LLM can edit the model from the built-in chat panel (Anthropic API key) or from any MCP client. The sketch panel is not built yet.
+> Status: milestone 3. An LLM can edit the model from the built-in chat panel (API key or your own Claude Code) or from any MCP client. Projects can be created, opened and exported from the menus. The sketch panel is not built yet.
 
 ## Requirements
 
@@ -39,8 +39,8 @@ target-dir = "C:/Users/<you>/AppData/Local/InterCraft/target"
 ## Run
 
 ```powershell
-cargo run                      # opens examples/bracket
-cargo run -- path\to\project   # opens another project folder
+cargo run                      # opens your last project (the example the first time)
+cargo run -- path\to\project   # opens a specific project folder
 ```
 
 The geometry worker takes about ten seconds to start the first time, because it has to load OpenCascade.
@@ -54,6 +54,17 @@ To see the live update, leave the app open and change a value in `examples/brack
 | Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it. |
 | Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. |
 | Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). |
+
+### Menus
+
+| Menu | What it does |
+|---|---|
+| File | New project (Ctrl+N), Open project (Ctrl+O), Open recent, Show project folder, Quit |
+| Export | The selected part or all parts as STEP (exact, editable) or STL (for printing), into the project's `exports` folder |
+| View | Fit to view, show or hide panels, Reset layout, theme (System, Dark, Light) |
+| Settings | Chat provider, model, effort, API key and theme (Ctrl+,) |
+
+New projects go in `Documents\InterCraft Projects` unless you pick another folder.
 
 ### Viewport controls
 
@@ -76,13 +87,13 @@ There are three ways in. All use the same tools, so the model behaves the same e
 
 ### Built-in chat
 
-1. Open the Chat tab and expand the settings at the top.
+1. Open Settings (the Settings menu, or the button at the top of the chat).
 2. Choose what to use:
    - **Anthropic API key.** Paste a key and press Save. It is stored in the system credential store (Windows Credential Manager, macOS Keychain or Secret Service on Linux), never in a file. If `ANTHROPIC_API_KEY` is set, that is used instead. Pick a model and effort (Claude Opus 5.5 at high effort is the default).
    - **Claude Code (your subscription).** Needs Claude Code installed and signed in (run `claude` once in a terminal). InterCraft starts your own Claude Code in the background and shows its replies here. Pick a model or keep your Claude Code default.
 3. Describe the part. Enter sends, Shift+Enter starts a new line, Stop ends the reply.
 
-While it works you see its short notes between steps, each tool call with its result (green for built, red for failed), and the viewer follows the part being edited. The size of the last request and how much came from the prompt cache show under the buttons.
+While it works you see its short notes between steps, each tool call with its result (green for built, red for failed), and the viewer follows the part being edited. Replies are formatted (headings, lists, tables, code). When a choice is genuinely yours, the model can ask with clickable options, and your pick goes back as your next message. The size of the last request and how much came from the prompt cache show under the buttons.
 
 The Claude Code session is locked down: no built-in tools (no shell or file editing), no other MCP servers, and only the InterCraft tools allowed. It runs in the project folder with your personal hooks and settings left out. InterCraft never reads your Claude login; the unmodified `claude` program signs in by itself. The conversation is a normal Claude Code session, so `claude --resume` can pick it up in a terminal.
 
@@ -173,14 +184,25 @@ flowchart LR
 The worker caches the shape after every feature. Changing one feature only rebuilds from that feature onwards.
 
 > [!warning]
-> The worker runs the snippets as normal Python on your machine. Only open projects you trust.
+> Snippets are Python written by a model or by whoever made the project. They run in a sandbox (no imports, file access or Python internals), with a 4 GB memory cap and a 60 second limit per step, but it is not full OS isolation. Only open projects you trust. See [docs/security-review.md](docs/security-review.md) for the full review.
+
+## Tests
+
+```powershell
+cargo test --workspace
+& "$env:LOCALAPPDATA\InterCraft\venv\Scripts\python.exe" -m unittest worker/test_sandbox.py
+```
+
+The suites include stress tests for both chat routes (a fake Messages API and a fake `claude`), sandbox escape attempts, and tool tests that use the real geometry worker. Those skip themselves when the Python environment isn't set up.
 
 ## Roadmap
 
 1. Viewer with live rebuild from files (done)
 2. Tool API and MCP server so an LLM can drive it (done)
-3. Built-in chat panel with the Anthropic API (done)
-4. OpenAI-compatible client (OpenAI, OpenRouter, local models through Ollama or LM Studio)
-5. Editing steps from the timeline and Inspector
-6. Sketch panel
-7. Fit checks, section view, before and after overlay
+3. Built-in chat panel with the Anthropic API or your own Claude Code (done)
+4. Menus, project navigation, rich text and choice questions (done)
+5. OS-level isolation for the geometry worker
+6. OpenAI-compatible client (OpenAI, OpenRouter, local models through Ollama or LM Studio)
+7. Editing steps from the timeline and Inspector, with undo
+8. Sketch panel
+9. Fit checks, section view, before and after overlay

@@ -1,13 +1,20 @@
 // intercraft-core: the project model (parts, features), loading, editing and saving.
 // serde 1, serde_json 1, anyhow 1
 
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub type Params = serde_json::Map<String, serde_json::Value>;
+
+/// Limits on what a feature can hold, so a runaway model can't bloat the project.
+pub const MAX_CODE_CHARS: usize = 20_000;
+pub const MAX_LABEL_CHARS: usize = 80;
+pub const MAX_PROMPT_CHARS: usize = 4_000;
+pub const MAX_FEATURES_PER_PART: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -93,8 +100,19 @@ impl LoadedProject {
         let mut project: Project =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", manifest.display()))?;
 
+        // Project files can come from anywhere, so nothing in them may reach outside the folder.
+        let mut part_names = HashSet::new();
         for part in &mut project.parts {
+            check_part_name(&part.name)?;
+            if !part_names.insert(part.name.to_ascii_lowercase()) {
+                bail!("project.json lists the part '{}' twice", part.name);
+            }
+            let mut ids = HashSet::new();
             for feature in &mut part.features {
+                if !ids.insert(feature.id.clone()) {
+                    bail!("part '{}' has two features with the id '{}'", part.name, feature.id);
+                }
+                check_snippet_path(&feature.file)?;
                 let path = dir.join(&feature.file);
                 feature.code = std::fs::read_to_string(&path)
                     .with_context(|| format!("reading snippet {}", path.display()))?;
@@ -153,10 +171,7 @@ impl LoadedProject {
     }
 
     pub fn add_part(&mut self, name: &str) -> Result<()> {
-        // The name becomes a folder, so keep it simple.
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            bail!("part names may only use letters, digits, '_' and '-'");
-        }
+        check_part_name(name)?;
         if self.project.parts.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
             bail!("a part named '{name}' already exists");
         }
@@ -170,7 +185,11 @@ impl LoadedProject {
 
     /// Returns the new feature's id.
     pub fn add_feature(&mut self, part_name: &str, new: NewFeature) -> Result<String> {
+        check_feature_text(Some(&new.label), Some(&new.code), Some(&new.prompt))?;
         let part = self.design_part_mut(part_name)?;
+        if part.features.len() >= MAX_FEATURES_PER_PART {
+            bail!("'{part_name}' already has {MAX_FEATURES_PER_PART} features, the most a part can hold");
+        }
         let index = match &new.after {
             Some(after) => {
                 1 + part
@@ -208,6 +227,7 @@ impl LoadedProject {
     }
 
     pub fn edit_feature(&mut self, part_name: &str, id: &str, edit: FeatureEdit) -> Result<()> {
+        check_feature_text(edit.label.as_deref(), edit.code.as_deref(), edit.prompt.as_deref())?;
         let feature = self.feature_mut(part_name, id)?;
         if let Some(label) = edit.label {
             feature.label = label;
@@ -276,6 +296,51 @@ impl LoadedProject {
     }
 }
 
+/// Part names become folder names, so keep them plain.
+fn check_part_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!("part names may only use letters, digits, '_' and '-' (up to 64 characters), not '{name}'");
+    }
+    // Windows treats these as devices, not folders, whatever the case.
+    let upper = name.to_ascii_uppercase();
+    let device = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && upper.as_bytes()[3].is_ascii_digit());
+    if device {
+        bail!("'{name}' is reserved by Windows and can't be used as a part name");
+    }
+    Ok(())
+}
+
+/// A snippet path must be a plain relative path inside the project, like "Part/010_base.py".
+fn check_snippet_path(file: &str) -> Result<()> {
+    let path = Path::new(file);
+    let plain = path.components().all(|c| matches!(c, Component::Normal(_)));
+    if file.is_empty() || !plain || path.extension().is_none_or(|e| e != "py") {
+        bail!("snippet path '{file}' must be a .py file inside the project folder");
+    }
+    Ok(())
+}
+
+fn check_feature_text(label: Option<&str>, code: Option<&str>, prompt: Option<&str>) -> Result<()> {
+    if let Some(label) = label {
+        if label.trim().is_empty() || label.chars().count() > MAX_LABEL_CHARS {
+            bail!("a feature label must be 1 to {MAX_LABEL_CHARS} characters");
+        }
+    }
+    if code.is_some_and(|c| c.chars().count() > MAX_CODE_CHARS) {
+        bail!("snippets are limited to {MAX_CODE_CHARS} characters; split the work into smaller features");
+    }
+    if prompt.is_some_and(|p| p.chars().count() > MAX_PROMPT_CHARS) {
+        bail!("the prompt is limited to {MAX_PROMPT_CHARS} characters");
+    }
+    Ok(())
+}
+
 fn ensure_trailing_newline(mut code: String) -> String {
     if !code.ends_with('\n') {
         code.push('\n');
@@ -308,8 +373,12 @@ fn write_if_changed(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    // Write next to the target and rename, so readers never see half a file.
-    let tmp = path.with_extension("tmp");
+    // Write next to the target and rename, so readers never see half a file. The temp
+    // name is unique so two writers (chat panel and an MCP client) never share one.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{file_name}.{}-{n}.tmp", std::process::id()));
     std::fs::write(&tmp, content).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
@@ -372,6 +441,38 @@ mod tests {
         p.project.parts[0].kind = PartKind::Reference;
         assert!(p.add_feature("Rail", feature("Cut", None)).is_err());
 
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn load_refuses_paths_outside_the_project() {
+        let p = temp_project("traversal");
+        let bad_files = ["../outside.py", "C:/Windows/evil.py", "/etc/passwd", "Part/../../x.py", "Part/notes.txt", ""];
+        for file in bad_files {
+            let json = format!(
+                r#"{{"name":"T","parts":[{{"name":"Part","features":[{{"id":"f010","label":"x","file":"{file}"}}]}}]}}"#
+            );
+            std::fs::write(p.dir.join("project.json"), json).unwrap();
+            assert!(LoadedProject::load(&p.dir).is_err(), "accepted {file}");
+        }
+        let bad_parts = ["..", "a/b", "C:", ""];
+        for name in bad_parts {
+            let json = format!(r#"{{"name":"T","parts":[{{"name":"{name}","features":[]}}]}}"#);
+            std::fs::write(p.dir.join("project.json"), json).unwrap();
+            assert!(LoadedProject::load(&p.dir).is_err(), "accepted part {name}");
+        }
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_oversized_features() {
+        let mut p = temp_project("limits");
+        p.add_part("Bracket").unwrap();
+        let mut big = feature("Block", None);
+        big.code = "x = 1\n".repeat(5000);
+        assert!(p.add_feature("Bracket", big).is_err());
+        assert!(p.add_feature("Bracket", feature(&"L".repeat(200), None)).is_err());
+        assert!(p.add_feature("Bracket", feature("   ", None)).is_err());
         std::fs::remove_dir_all(&p.dir).unwrap();
     }
 

@@ -29,7 +29,12 @@ Working method:
 - If a feature fails, the error is in the report and the change stays saved. Fix it with edit_feature, or remove it with delete_feature.
 - Prefer set_param for dimension changes. Later features rebuild automatically.
 - Pass the user's request in `prompt` when adding a feature. It is shown on their timeline.
-- State which values you measured from a report and which you assumed."#;
+- State which values you measured from a report and which you assumed.
+
+Imported parts and measuring:
+- A part can start from an imported STEP file (its first step is "import"). In the first feature after it, `part` is that imported shape, so cuts, holes and fillets work on it like any other.
+- Before editing an imported part, call inspect_part to find its faces, holes and their exact positions instead of guessing.
+- Use measure to check clearances, hole spacing and wall thickness after a change."#;
 
 /// Which project the tools edit.
 enum Target {
@@ -113,8 +118,17 @@ pub fn validate_question(args: &Value) -> Result<()> {
 
 /// Small file where the viewer records the project it has open, so an MCP server
 /// started by another app (Claude Code, Cursor...) edits the same project.
+/// InterCraft's folder for settings and the active project. INTERCRAFT_CONFIG_DIR
+/// overrides it, so tests never touch the user's real settings.
+pub fn config_dir() -> Option<PathBuf> {
+    match std::env::var_os("INTERCRAFT_CONFIG_DIR") {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => Some(dirs::config_dir()?.join("InterCraft")),
+    }
+}
+
 fn active_project_file() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("InterCraft").join("active_project.txt"))
+    Some(config_dir()?.join("active_project.txt"))
 }
 
 /// Called by the viewer when it opens a project.
@@ -214,6 +228,31 @@ pub fn definitions() -> Value {
                 "type": "object",
                 "properties": { "part": part, "feature_id": feature_id },
                 "required": ["part", "feature_id"],
+            },
+        },
+        {
+            "name": "inspect_part",
+            "description": "Describe a part's built shape precisely: volume, bounding box, cylindrical faces (holes and bosses) with diameter and axis, circular edge diameters, and the largest faces with type, area, centre and normal. Face and edge indices match measure. Use it before editing an imported part or when you need exact positions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "part": part,
+                    "feature_id": { "type": "string", "description": "Inspect the shape as it was after this step. Omit for the latest." },
+                },
+                "required": ["part"],
+            },
+        },
+        {
+            "name": "measure",
+            "description": "Measure exactly with the CAD kernel. With 'a' only: describe one face, edge or vertex (length, radius, diameter, area, normal). With 'a' and 'b': the minimum distance between them, the closest points, the X/Y/Z offset, and the angle when both are straight edges or flat faces. Each selection is {\"kind\": \"face\"|\"edge\"|\"vertex\", \"index\": n, \"part\": optional} using indices from inspect_part, or {\"point\": [x, y, z]}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "part": { "type": "string", "description": "Default part for selections that don't name one." },
+                    "a": { "type": "object", "description": "First selection." },
+                    "b": { "type": "object", "description": "Second selection. Omit to describe 'a' alone." },
+                },
+                "required": ["a"],
             },
         },
         {
@@ -341,6 +380,28 @@ impl ToolHost {
                 project.save()?;
                 self.build_report(project.part(part)?, false)
             }
+            "inspect_part" => {
+                let part = project.part(text(args, "part")?)?.clone();
+                let key = self.built_key(&project.dir, &part, optional_text(args, "feature_id"))?;
+                let mut data = self.with_worker(|w| w.inspect_blocking(&key))?;
+                data["part"] = part.name.into();
+                Ok(data)
+            }
+            "measure" => {
+                let default_part = optional_text(args, "part").map(str::to_owned);
+                let dir = project.dir.clone();
+                let parts = project.project.parts.clone();
+                let mut key_for = |name: &str| -> Result<String> {
+                    let part = parts.iter().find(|p| p.name == name).with_context(|| format!("no part named '{name}'"))?;
+                    self.built_key(&dir, part, None)
+                };
+                let a = selection(&mut key_for, default_part.as_deref(), args.get("a").context("missing 'a'")?)?;
+                let b = match args.get("b") {
+                    Some(b) if !b.is_null() => Some(selection(&mut key_for, default_part.as_deref(), b)?),
+                    _ => None,
+                };
+                self.with_worker(|w| w.measure_blocking(a, b))
+            }
             "export_part" => {
                 let part = project.part(text(args, "part")?)?;
                 let formats = match optional_text(args, "format") {
@@ -353,7 +414,7 @@ impl ToolHost {
                 for format in formats {
                     let ext = if format == ExportFormat::Step { "step" } else { "stl" };
                     let path = project.dir.join("exports").join(format!("{}.{ext}", part.name));
-                    let request = request_for(part);
+                    let request = request_for(&project.dir, part);
                     files.push(self.with_worker(|w| w.export_blocking(request, format, &path))?);
                 }
                 Ok(json!({ "exported": files }))
@@ -401,22 +462,43 @@ impl ToolHost {
     }
 
     /// Builds a part and describes each feature's outcome in numbers.
+    /// Build a part and return the cache key of its final shape (or of `feature_id`).
+    fn built_key(&mut self, dir: &Path, part: &Part, feature_id: Option<&str>) -> Result<String> {
+        let request = request_for(dir, part);
+        let results = self.with_worker(|w| w.build_blocking(request))?;
+        let wanted = match feature_id {
+            Some(id) => results.iter().find(|r| r.feature_id == id).with_context(|| format!("no step '{id}' in '{}'", part.name))?,
+            None => results.last().with_context(|| format!("'{}' has nothing to measure yet", part.name))?,
+        };
+        if !wanted.ok {
+            bail!("step '{}' of '{}' doesn't build, so it can't be inspected", wanted.feature_id, part.name);
+        }
+        wanted.mesh.as_deref().and_then(intercraft_geo::Mesh::key_of).context("the worker gave no shape")
+    }
+
     fn build_report(&mut self, part: &Part, with_source: bool) -> Result<Value> {
-        let request = request_for(part);
+        let dir = self.project_dir()?;
+        let request = request_for(&dir, part);
         let results = self.with_worker(|w| w.build_blocking(request))?;
         let by_id: HashMap<&str, &FeatureResult> =
             results.iter().map(|r| (r.feature_id.as_str(), r)).collect();
 
         let mut all_ok = true;
         let mut features = Vec::new();
-        for feature in &part.features {
-            let mut entry = json!({ "id": feature.id, "label": feature.label });
-            if with_source {
+        // The imported file, if any, is step 0.
+        let import_step = part.source.as_ref().map(|source| (intercraft_geo::IMPORT_STEP_ID.to_owned(), source.clone()));
+        let steps = import_step
+            .iter()
+            .map(|(id, source)| (id.as_str(), format!("Imported {source}"), None))
+            .chain(part.features.iter().map(|f| (f.id.as_str(), f.label.clone(), Some(f))));
+        for (id, label, feature) in steps {
+            let mut entry = json!({ "id": id, "label": label });
+            if let (true, Some(feature)) = (with_source, feature) {
                 entry["params"] = Value::Object(feature.params.clone());
                 entry["code"] = feature.code.clone().into();
                 entry["prompt"] = feature.prompt.clone().into();
             }
-            match by_id.get(feature.id.as_str()) {
+            match by_id.get(id) {
                 Some(result) if result.ok => {
                     entry["status"] = "built".into();
                     if let Some(r) = &result.report {
@@ -451,6 +533,9 @@ impl ToolHost {
         }
 
         let mut report = json!({ "part": part.name, "kind": part.kind, "ok": all_ok, "features": features });
+        if let Some(source) = &part.source {
+            report["imported_from"] = source.clone().into();
+        }
         if !all_ok {
             report["note"] =
                 "The change is saved but the part does not build cleanly. Fix it with edit_feature or delete_feature.".into();
@@ -459,15 +544,33 @@ impl ToolHost {
     }
 }
 
-fn request_for(part: &Part) -> RebuildRequest {
-    RebuildRequest {
-        part: part.name.clone(),
-        features: part
-            .features
-            .iter()
-            .map(|f| FeatureInput { id: f.id.clone(), code: f.code.clone(), params: f.params.clone() })
-            .collect(),
+/// Everything the worker needs to build a part: the imported file first, if any,
+/// then each feature. Shared by the viewer and the tools so both build the same thing.
+pub fn request_for(dir: &Path, part: &Part) -> RebuildRequest {
+    let mut features = Vec::new();
+    if let Some(source) = &part.source {
+        features.push(FeatureInput::import(dir.join(source)));
     }
+    features.extend(part.features.iter().map(|f| FeatureInput::snippet(&f.id, &f.code, &f.params)));
+    RebuildRequest { part: part.name.clone(), features }
+}
+
+/// One selection for `measure`, as the model writes it.
+fn selection(dir_part: &mut dyn FnMut(&str) -> Result<String>, default_part: Option<&str>, value: &Value) -> Result<Value> {
+    if let Some(point) = value.get("point") {
+        let coords: Vec<f64> = point.as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+        if coords.len() != 3 {
+            bail!("'point' must be [x, y, z] in mm");
+        }
+        return Ok(json!({ "kind": "point", "point": coords }));
+    }
+    let kind = value.get("kind").and_then(Value::as_str).context("give 'kind' (face, edge or vertex) and 'index', or a 'point'")?;
+    if !matches!(kind, "face" | "edge" | "vertex") {
+        bail!("'kind' must be face, edge or vertex");
+    }
+    let index = value.get("index").and_then(Value::as_u64).context("'index' must be a whole number")?;
+    let part = value.get("part").and_then(Value::as_str).or(default_part).context("say which 'part'")?;
+    Ok(json!({ "mesh": dir_part(part)?, "kind": kind, "index": index }))
 }
 
 /// Three decimals is plenty for mm and keeps the reports short.

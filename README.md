@@ -3,7 +3,7 @@
 A desktop tool for watching an LLM build a parametric CAD model, one feature at a time. It is not a CAD package. The model is a list of small build123d snippets, and the app rebuilds and redraws the part every time one of them changes.
 
 > [!note]
-> Status: milestone 2. The viewer works from files on disk, and an LLM can edit the model through the MCP server. The built-in chat and sketch panels are not built yet.
+> Status: milestone 3. An LLM can edit the model from the built-in chat panel (Anthropic API key) or from any MCP client. The sketch panel is not built yet.
 
 ## Requirements
 
@@ -12,6 +12,8 @@ A desktop tool for watching an LLM build a parametric CAD model, one feature at 
 | Rust | 1.99 (stable, MSVC) |
 | eframe / egui | 0.36.2 (wgpu 30) |
 | egui_dock | 0.21.1 |
+| ureq | 3.5 (HTTP client for the chat) |
+| keyring | 4.2 (stores the API key) |
 | Python | 3.11 |
 | build123d | 0.13.0 |
 | numpy | 2.4.6 |
@@ -56,6 +58,28 @@ To see the live update, leave the app open and change a value in `examples/brack
 | Fit to view | Double click |
 
 ## Driving it from an LLM
+
+There are two ways in. Both use the same tools, so the model behaves the same either way.
+
+| Route | Who it suits | Billing |
+|---|---|---|
+| Built-in chat panel | Anyone with an API key | Your API account |
+| MCP server | People who already use an agent app that supports MCP (Claude Code, Codex CLI, Gemini CLI, Cursor) | Whatever that app uses, including subscriptions |
+
+### Built-in chat
+
+1. Open the Chat tab and expand the settings at the top.
+2. Paste an Anthropic API key and press Save. It is stored in the system credential store (Windows Credential Manager, macOS Keychain or Secret Service on Linux), never in a file. If `ANTHROPIC_API_KEY` is set, that is used instead.
+3. Pick a model and effort. Claude Opus 5.5 at high effort is the default.
+4. Describe the part. Enter sends, Shift+Enter starts a new line, Stop ends the reply.
+
+While it works you see its short notes between steps, each tool call with its result (green for built, red for failed), and the viewer follows the part being edited. The last request's size and how much came from the prompt cache show next to the buttons.
+
+Each message also tells the model which part you have selected, so "make the bore bigger" refers to the part you are looking at.
+
+To test the chat without an API key or any cost, run the mock server in `dev/mock_anthropic.py` and point the app at it with `INTERCRAFT_ANTHROPIC_URL`. The script's header explains how.
+
+### MCP server
 
 `intercraft-mcp` is an MCP server (stdio) that edits a project folder. The app watches the same folder, so each tool call shows up in the viewport as it happens.
 
@@ -110,7 +134,10 @@ flowchart LR
     W -- mesh file + report --> G
     G -- events --> A
     L[LLM client] -- MCP tools --> M[mcp: intercraft-mcp]
-    M -- writes --> F
+    M --> T[tools: shared tool host]
+    A -- chat panel --> LL[llm: provider client]
+    LL --> T
+    T -- writes --> F
 ```
 
 </div>
@@ -120,7 +147,9 @@ flowchart LR
 | `crates/core` | Project model and loading |
 | `crates/geo` | `GeometryBackend` trait and the Python worker client |
 | `crates/app` | Window, docked panels and the 3D viewport |
-| `crates/mcp` | MCP server with the editing tools |
+| `crates/tools` | The editing tools and model guide, shared by the chat panel and the MCP server |
+| `crates/llm` | Provider-neutral chat interface and the Anthropic client |
+| `crates/mcp` | MCP server that exposes the tools |
 | `worker` | Runs the snippets, caches each step, writes meshes and reports |
 
 The worker caches the shape after every feature. Changing one feature only rebuilds from that feature onwards.
@@ -132,6 +161,8 @@ The worker caches the shape after every feature. Changing one feature only rebui
 
 1. Viewer with live rebuild from files (done)
 2. Tool API and MCP server so an LLM can drive it (done)
-3. Chat panel and prompt-linked timeline editing
-4. Sketch panel
-5. Fit checks, section view, before and after overlay
+3. Built-in chat panel with the Anthropic API (done)
+4. OpenAI-compatible client (OpenAI, OpenRouter, local models through Ollama or LM Studio)
+5. Editing steps from the timeline and Inspector
+6. Sketch panel
+7. Fit checks, section view, before and after overlay

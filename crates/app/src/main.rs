@@ -10,9 +10,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
-use intercraft_core::{LoadedProject, PartKind};
+use intercraft_core::{LoadedProject, Part, PartKind};
 use intercraft_geo::{
     FeatureInput, FeatureResult, GeoEvent, GeometryBackend, Mesh, PythonWorker, RebuildRequest,
+    Report,
 };
 use viewport::Viewport;
 
@@ -50,7 +51,7 @@ fn main() -> eframe::Result {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Tab {
     Viewport,
-    Hierarchy,
+    Parts,
     Inspector,
     Timeline,
     Chat,
@@ -82,8 +83,10 @@ struct State {
 
     /// (part, feature id) -> result
     results: HashMap<(String, String), Entry>,
-    /// (part, feature id) being inspected. None follows the latest step.
-    selected: Option<(String, String)>,
+    /// Part whose steps the timeline shows.
+    selected_part: Option<String>,
+    /// Step of the selected part being inspected. None follows the latest step.
+    selected_step: Option<String>,
     /// Mesh file currently on screen for each part.
     shown: HashMap<String, PathBuf>,
     hidden: HashSet<String>,
@@ -104,11 +107,11 @@ impl App {
             Err(e) => (None, format!("Worker failed to start: {e:#}")),
         };
 
-        // Viewport in the middle, hierarchy on the left, chat on the right, timeline below.
+        // Viewport in the middle, parts list on the left, chat on the right, timeline below.
         let mut dock = DockState::new(vec![Tab::Viewport]);
         let tree = dock.main_surface_mut();
         let [centre, _right] = tree.split_right(NodeIndex::root(), 0.76, vec![Tab::Chat, Tab::Sketch]);
-        let [centre, left] = tree.split_left(centre, 0.24, vec![Tab::Hierarchy]);
+        let [centre, left] = tree.split_left(centre, 0.24, vec![Tab::Parts]);
         tree.split_below(left, 0.5, vec![Tab::Inspector]);
         tree.split_below(centre, 0.82, vec![Tab::Timeline]);
 
@@ -122,7 +125,8 @@ impl App {
             worker_status,
             building: HashSet::new(),
             results: HashMap::new(),
-            selected: None,
+            selected_part: None,
+            selected_step: None,
             shown: HashMap::new(),
             hidden: HashSet::new(),
             viewport: Viewport::new(render_state),
@@ -136,6 +140,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.state.drain_worker_events();
         self.state.poll_files();
+        self.state.fix_selection();
         self.state.sync_meshes();
         // Keeps the file polling ticking while nothing else is happening.
         ctx.request_repaint_after(POLL_INTERVAL);
@@ -258,7 +263,7 @@ impl State {
                     }
                     _ => break,
                 }
-                if self.selected.as_ref() == Some(&key) {
+                if self.is_selected_step(&part.name, &feature.id) {
                     break;
                 }
             }
@@ -270,11 +275,7 @@ impl State {
             }
             match Mesh::load(&path) {
                 Ok(mesh) => {
-                    let color = match part.kind {
-                        PartKind::Reference => REFERENCE_COLOR,
-                        PartKind::Design => PART_COLORS[i % PART_COLORS.len()],
-                    };
-                    self.viewport.set_mesh(&part.name, &mesh, color);
+                    self.viewport.set_mesh(&part.name, &mesh, part_color(part.kind, i));
                     self.shown.insert(part.name.clone(), path);
                 }
                 Err(e) => self.worker_status = format!("Mesh load failed: {e:#}"),
@@ -286,7 +287,58 @@ impl State {
         self.shown.retain(|name, _| names.contains(name.as_str()));
     }
 
-    fn hierarchy_ui(&mut self, ui: &mut egui::Ui) {
+    /// Keep the selection pointing at things that still exist after a reload.
+    fn fix_selection(&mut self) {
+        let Some(loaded) = &self.project else { return };
+        let parts = &loaded.project.parts;
+        let part = self
+            .selected_part
+            .as_ref()
+            .and_then(|name| parts.iter().find(|p| &p.name == name))
+            .or(parts.first());
+        let still_there = |step: &String| part.is_some_and(|p| p.features.iter().any(|f| &f.id == step));
+        if !self.selected_step.as_ref().is_none_or(still_there) {
+            self.selected_step = None;
+        }
+        self.selected_part = part.map(|p| p.name.clone());
+    }
+
+    fn is_selected_step(&self, part: &str, feature_id: &str) -> bool {
+        self.selected_part.as_deref() == Some(part)
+            && self.selected_step.as_deref() == Some(feature_id)
+    }
+
+    fn selected_part(&self) -> Option<(usize, &Part)> {
+        let name = self.selected_part.as_ref()?;
+        let parts = &self.project.as_ref()?.project.parts;
+        parts.iter().enumerate().find(|(_, p)| &p.name == name)
+    }
+
+    /// Overall state of a part: failed beats rebuilding beats built.
+    fn part_status(&self, ui: &egui::Ui, part: &Part) -> (egui::Color32, &'static str) {
+        if part.features.is_empty() {
+            return (ui.visuals().weak_text_color(), "No steps yet");
+        }
+        let mut status = (egui::Color32::from_rgb(70, 170, 90), "Built");
+        for feature in &part.features {
+            match self.results.get(&(part.name.clone(), feature.id.clone())) {
+                Some(e) if !e.stale && !e.result.ok => {
+                    return (ui.visuals().error_fg_color, "A step failed");
+                }
+                Some(e) if !e.stale => {}
+                _ => status = (ui.visuals().weak_text_color(), "Rebuilding"),
+            }
+        }
+        status
+    }
+
+    fn latest_report(&self, part: &Part) -> Option<&Report> {
+        let last = part.features.last()?;
+        let entry = self.results.get(&(part.name.clone(), last.id.clone()))?;
+        entry.result.report.as_ref()
+    }
+
+    fn parts_ui(&mut self, ui: &mut egui::Ui) {
         let Some(loaded) = &self.project else {
             ui.label("No project loaded.");
             return;
@@ -294,66 +346,99 @@ impl State {
         ui.heading(&loaded.project.name);
         ui.weak(format!("Units: {}", loaded.project.units));
         ui.separator();
+        if loaded.project.parts.is_empty() {
+            ui.weak("No parts yet. Ask the LLM to add one.");
+        }
 
         let mut clicked = None;
-        for part in &loaded.project.parts {
-            ui.horizontal(|ui| {
-                let mut visible = !self.hidden.contains(&part.name);
-                if ui.checkbox(&mut visible, "").on_hover_text("Show or hide").changed() {
-                    if visible {
-                        self.hidden.remove(&part.name);
-                    } else {
-                        self.hidden.insert(part.name.clone());
-                    }
-                    self.viewport.set_visible(&part.name, visible);
-                }
-                ui.strong(&part.name);
-                ui.weak(match part.kind {
-                    PartKind::Design => "design",
-                    PartKind::Reference => "reference",
-                });
-            });
-
-            ui.indent(&part.name, |ui| {
-                for feature in &part.features {
-                    let key = (part.name.clone(), feature.id.clone());
-                    let entry = self.results.get(&key);
+        let mut visibility = None;
+        for (i, part) in loaded.project.parts.iter().enumerate() {
+            let selected = self.selected_part.as_ref() == Some(&part.name);
+            let fill = if selected {
+                ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let response = egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .corner_radius(4.0)
+                .fill(fill)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        let (color, hint) = status_dot(ui, entry);
-                        paint_dot(ui, color, hint);
-                        let selected = self.selected.as_ref() == Some(&key);
-                        if ui.selectable_label(selected, &feature.label).clicked() {
-                            clicked = Some(if selected { None } else { Some(key.clone()) });
+                        let mut visible = !self.hidden.contains(&part.name);
+                        if ui.checkbox(&mut visible, "").on_hover_text("Show or hide").changed() {
+                            visibility = Some((part.name.clone(), visible));
                         }
-                        if let Some(text) = entry.and_then(|e| volume_delta(&e.result)) {
-                            ui.weak(text);
-                        }
+                        // Same colour as in the viewport, so parts are easy to match up.
+                        let [r, g, b] = part_color(part.kind, i).map(|c| (c * 255.0) as u8);
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+                        ui.strong(&part.name);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (color, hint) = self.part_status(ui, part);
+                            paint_dot(ui, color, hint);
+                        });
                     });
-                }
-            });
-            ui.add_space(6.0);
+                    let kind = match part.kind {
+                        PartKind::Design => "design",
+                        PartKind::Reference => "reference",
+                    };
+                    let mut detail = format!("{kind} · {}", plural(part.features.len(), "step"));
+                    if let Some(r) = self.latest_report(part) {
+                        detail += &format!(" · {:.1} mm³", r.volume);
+                    }
+                    ui.weak(detail);
+                })
+                .response
+                .interact(egui::Sense::click());
+            if response.clicked() {
+                clicked = Some(part.name.clone());
+            }
         }
-        if let Some(selection) = clicked {
-            self.selected = selection;
+
+        if let Some((name, visible)) = visibility {
+            self.viewport.set_visible(&name, visible);
+            if visible {
+                self.hidden.remove(&name);
+            } else {
+                self.hidden.insert(name);
+            }
+        }
+        if let Some(name) = clicked {
+            if self.selected_part.as_ref() != Some(&name) {
+                self.selected_part = Some(name);
+                self.selected_step = None;
+            }
         }
     }
 
     fn inspector_ui(&mut self, ui: &mut egui::Ui) {
-        let Some((part_name, feature_id)) = &self.selected else {
-            ui.weak("Select a feature to see its prompt, parameters and numbers.");
+        let Some((_, part)) = self.selected_part() else {
+            ui.weak("Select a part to see its steps.");
             return;
         };
-        let feature = self.project.as_ref().and_then(|l| {
-            let part = l.project.parts.iter().find(|p| &p.name == part_name)?;
-            part.features.iter().find(|f| &f.id == feature_id)
-        });
-        let Some(feature) = feature else {
-            ui.weak("That feature no longer exists.");
+        // Follow the latest step unless one is picked on the timeline.
+        let index = match &self.selected_step {
+            Some(id) => part.features.iter().position(|f| &f.id == id),
+            None => part.features.len().checked_sub(1),
+        };
+        let Some(index) = index else {
+            ui.weak("This part has no steps yet.");
             return;
         };
+        let feature = &part.features[index];
 
+        ui.weak(format!(
+            "{} · step {} of {}{}",
+            part.name,
+            index + 1,
+            part.features.len(),
+            if self.selected_step.is_none() { " (latest)" } else { "" }
+        ));
         ui.heading(&feature.label);
-        ui.weak(format!("{part_name} / {}", feature.file));
+        ui.weak(&feature.file);
         if !feature.prompt.is_empty() {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(&feature.prompt).italics());
@@ -371,7 +456,7 @@ impl State {
         }
 
         ui.separator();
-        let Some(entry) = self.results.get(&(part_name.clone(), feature_id.clone())) else {
+        let Some(entry) = self.results.get(&(part.name.clone(), feature.id.clone())) else {
             ui.weak("Not built yet.");
             return;
         };
@@ -383,17 +468,19 @@ impl State {
         if let Some(r) = &result.report {
             egui::Grid::new("report").num_columns(2).show(ui, |ui| {
                 ui.label("Volume");
-                ui.monospace(match r.volume_before {
-                    Some(before) => format!("{before:.1} -> {:.1} mm³", r.volume),
-                    None => format!("{:.1} mm³", r.volume),
-                });
+                ui.monospace(format!("{:.1} mm³", r.volume));
                 ui.end_row();
+                if let Some(before) = r.volume_before {
+                    ui.label("Change");
+                    ui.monospace(format!("{:+.1} mm³", r.volume - before));
+                    ui.end_row();
+                }
                 ui.label("Size (X Y Z)");
                 ui.monospace(format!(
-                    "{:.2} x {:.2} x {:.2} mm",
-                    r.bbox_max[0] - r.bbox_min[0],
-                    r.bbox_max[1] - r.bbox_min[1],
-                    r.bbox_max[2] - r.bbox_min[2]
+                    "{} x {} x {} mm",
+                    trim_mm(r.bbox_max[0] - r.bbox_min[0]),
+                    trim_mm(r.bbox_max[1] - r.bbox_min[1]),
+                    trim_mm(r.bbox_max[2] - r.bbox_min[2])
                 ));
                 ui.end_row();
                 ui.label("Faces / edges");
@@ -413,36 +500,112 @@ impl State {
         }
     }
 
+    /// One card per step of the selected part, oldest on the left.
     fn timeline_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(loaded) = &self.project else { return };
+        let Some((_, part)) = self.selected_part() else {
+            ui.weak("Select a part to see its steps.");
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.strong(&part.name);
+            ui.weak(format!(
+                "{}. Click a step to see the part as it was then.",
+                plural(part.features.len(), "step")
+            ));
+        });
+        ui.add_space(4.0);
+
         let mut clicked = None;
-        for part in &loaded.project.parts {
-            ui.horizontal(|ui| {
-                ui.strong(&part.name);
+        egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
+            ui.horizontal_top(|ui| {
                 for (i, feature) in part.features.iter().enumerate() {
-                    let key = (part.name.clone(), feature.id.clone());
-                    let (dot, _) = status_dot(ui, self.results.get(&key));
-                    let text = egui::RichText::new(format!("{}  {}", i + 1, feature.label));
-                    let selected = self.selected.as_ref() == Some(&key);
-                    let chip = ui
-                        .selectable_label(selected, text.color(dot))
-                        .on_hover_text(if feature.prompt.is_empty() {
+                    let entry = self.results.get(&(part.name.clone(), feature.id.clone()));
+                    let selected = self.selected_step.as_ref() == Some(&feature.id);
+                    let response = step_card(ui, selected, |ui| {
+                        ui.horizontal(|ui| {
+                            let (color, hint) = status_dot(ui, entry);
+                            paint_dot(ui, color, hint);
+                            ui.strong(format!("{}  {}", i + 1, feature.label));
+                        });
+                        if let Some(text) = entry.and_then(|e| volume_delta(&e.result)) {
+                            ui.weak(text);
+                        }
+                        let prompt = if feature.prompt.is_empty() {
                             "(no prompt recorded)"
                         } else {
-                            &feature.prompt
-                        });
-                    if chip.clicked() {
-                        clicked = Some(Some(key));
+                            feature.prompt.as_str()
+                        };
+                        let text = egui::RichText::new(shorten(prompt, 90)).italics().weak();
+                        ui.add(egui::Label::new(text).wrap());
+                    });
+                    let response = if feature.prompt.is_empty() {
+                        response
+                    } else {
+                        response.on_hover_text(&feature.prompt)
+                    };
+                    if response.clicked() {
+                        clicked = Some(if selected { None } else { Some(feature.id.clone()) });
                     }
                 }
-                if ui.selectable_label(self.selected.is_none(), "Latest").clicked() {
+
+                let latest = step_card(ui, self.selected_step.is_none(), |ui| {
+                    ui.strong("Latest");
+                    ui.weak("Show the current part");
+                });
+                if latest.clicked() {
                     clicked = Some(None);
                 }
             });
+        });
+        if let Some(step) = clicked {
+            self.selected_step = step;
         }
-        if let Some(selection) = clicked {
-            self.selected = selection;
-        }
+    }
+}
+
+fn step_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let visuals = ui.visuals();
+    let stroke = if selected {
+        egui::Stroke::new(1.5, visuals.selection.stroke.color)
+    } else {
+        visuals.widgets.noninteractive.bg_stroke
+    };
+    egui::Frame::new()
+        .fill(visuals.faint_bg_color)
+        .stroke(stroke)
+        .corner_radius(6.0)
+        .inner_margin(8)
+        .show(ui, |ui| {
+            ui.set_width(170.0);
+            ui.set_min_height(70.0);
+            // The timeline row is horizontal, so stack the card's own contents.
+            ui.vertical(add);
+        })
+        .response
+        .interact(egui::Sense::click())
+}
+
+fn shorten(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}...", text[..cut].trim_end()),
+        None => text.to_owned(),
+    }
+}
+
+/// 8.2 stays 8.2, 60.00 becomes 60. Keeps sizes short in narrow panels.
+fn trim_mm(value: f64) -> String {
+    let text = format!("{value:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
+}
+
+fn part_color(kind: PartKind, index: usize) -> [f32; 3] {
+    match kind {
+        PartKind::Reference => REFERENCE_COLOR,
+        PartKind::Design => PART_COLORS[index % PART_COLORS.len()],
     }
 }
 
@@ -484,7 +647,7 @@ impl TabViewer for State {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         match tab {
             Tab::Viewport => self.viewport.ui(ui),
-            Tab::Hierarchy => self.hierarchy_ui(ui),
+            Tab::Parts => self.parts_ui(ui),
             Tab::Inspector => self.inspector_ui(ui),
             Tab::Timeline => self.timeline_ui(ui),
             Tab::Chat => {

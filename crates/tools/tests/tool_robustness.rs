@@ -1,0 +1,187 @@
+// Robustness tests for the tools the model calls, with the real geometry worker.
+// They need the worker's Python environment (see the README); without it they skip.
+
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, Once};
+use std::time::{Duration, Instant};
+
+use intercraft_tools::ToolHost;
+use serde_json::{json, Value};
+
+/// Each worker loads OpenCascade (about 500 MB), so only one worker test runs at a time.
+fn one_at_a_time() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn worker_available() -> bool {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| std::env::set_var("INTERCRAFT_BUILD_TIMEOUT", "5"));
+    let venv = std::env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("InterCraft/venv/Scripts/python.exe"))
+        .is_some_and(|p| p.exists());
+    if !venv && std::env::var_os("INTERCRAFT_PYTHON").is_none() {
+        eprintln!("skipping: the geometry worker's Python environment isn't set up");
+        return false;
+    }
+    true
+}
+
+fn project(name: &str) -> (ToolHost, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("intercraft-tools-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    (ToolHost::new(dir.clone()), dir)
+}
+
+fn add(host: &mut ToolHost, part: &str, label: &str, code: &str) -> anyhow::Result<Value> {
+    host.call("add_feature", &json!({ "part": part, "label": label, "code": code }))
+}
+
+#[test]
+fn bad_arguments_are_errors_not_crashes() {
+    let (mut host, dir) = project("args");
+    host.call("add_part", &json!({ "name": "P" })).unwrap();
+    let cases = [
+        ("add_part", json!({})),
+        ("add_part", json!({ "name": 5 })),
+        ("add_part", json!({ "name": ["P"] })),
+        ("add_feature", json!({ "part": "P" })),
+        ("add_feature", json!({ "part": "P", "label": "x", "code": 42 })),
+        ("add_feature", json!({ "part": "P", "label": "x", "code": "part = Box(1,1,1)", "params": "not an object" })),
+        ("add_feature", json!({ "part": "Nope", "label": "x", "code": "part = Box(1,1,1)" })),
+        ("add_feature", json!({ "part": "P", "label": "x", "code": "part = Box(1,1,1)", "after": "f999" })),
+        ("edit_feature", json!({ "part": "P", "feature_id": "f999" })),
+        ("set_param", json!({ "part": "P", "feature_id": "f010", "name": "w" })),
+        ("delete_feature", json!({ "part": "P", "feature_id": "../../etc" })),
+        ("export_part", json!({ "part": "P", "format": "obj" })),
+        ("no_such_tool", json!({})),
+        ("add_part", Value::Null),
+        ("add_part", json!("a string")),
+    ];
+    for (tool, args) in cases {
+        assert!(host.call(tool, &args).is_err(), "{tool} accepted {args}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn unsafe_part_names_are_refused() {
+    let (mut host, dir) = project("names");
+    for name in ["..", "../escape", "a/b", "a\\b", "C:", "", " ", "CON", "nul", "Com1", "LPT9", "x".repeat(65).as_str()] {
+        assert!(host.call("add_part", &json!({ "name": name })).is_err(), "accepted part name {name:?}");
+    }
+    assert!(!dir.join("..").join("escape").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn sandbox_refusal_is_a_failed_step_and_recoverable() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    let (mut host, dir) = project("sandbox");
+    host.call("add_part", &json!({ "name": "P" })).unwrap();
+    add(&mut host, "P", "Base", "part = Box(10, 10, 10)").unwrap();
+    let report = add(&mut host, "P", "Sneaky", "import os\npart = Box(1, 1, 1)").unwrap();
+    assert_eq!(report["ok"], false);
+    let error = report["features"][1]["error"].as_str().unwrap();
+    assert!(error.contains("imports aren't allowed"), "{error}");
+    // The model can fix it.
+    let fixed = host.call("delete_feature", &json!({ "part": "P", "feature_id": "f020" })).unwrap();
+    assert_eq!(fixed["ok"], true);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn endless_loop_is_stopped_and_the_worker_recovers() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    let (mut host, dir) = project("loop");
+    host.call("add_part", &json!({ "name": "P" })).unwrap();
+    add(&mut host, "P", "Base", "part = Box(10, 10, 10)").unwrap();
+    let started = Instant::now();
+    let result = add(&mut host, "P", "Spin", "while True:\n    pass");
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("endless loop"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(30), "took {:?}", started.elapsed());
+    // Remove the loop and carry on with a fresh worker.
+    let report = host.call("delete_feature", &json!({ "part": "P", "feature_id": "f020" })).unwrap();
+    assert_eq!(report["ok"], true);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn memory_bomb_fails_without_taking_the_machine_down() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    let (mut host, dir) = project("memory");
+    host.call("add_part", &json!({ "name": "P" })).unwrap();
+    // 8 GB of list on its own; the worker is capped at 4 GB.
+    let result = add(&mut host, "P", "Hog", "x = [0] * (10**9)\npart = Box(1, 1, 1)");
+    let failed = match &result {
+        Ok(report) => report["ok"] == false,
+        Err(_) => true,
+    };
+    assert!(failed, "an 8 GB allocation succeeded: {result:?}");
+    host.call("delete_feature", &json!({ "part": "P", "feature_id": "f010" })).unwrap();
+    let report = add(&mut host, "P", "Base", "part = Box(10, 10, 10)").unwrap();
+    assert_eq!(report["ok"], true, "the worker didn't recover");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn worker_runs_under_the_memory_cap() {
+    let _one = one_at_a_time();
+    if !worker_available() || !cfg!(windows) {
+        return;
+    }
+    let worker = intercraft_geo::PythonWorker::spawn(|| {}).unwrap();
+    assert!(worker.memory_capped(), "the worker isn't inside the memory-capped job");
+}
+
+#[test]
+fn reference_parts_cannot_be_changed() {
+    let (mut host, dir) = project("reference");
+    host.call("add_part", &json!({ "name": "Rail" })).unwrap();
+    let manifest = dir.join("project.json");
+    let text = std::fs::read_to_string(&manifest).unwrap().replace("\"design\"", "\"reference\"");
+    std::fs::write(&manifest, text).unwrap();
+    assert!(add(&mut host, "Rail", "Cut", "part = Box(1, 1, 1)").is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn two_agents_editing_at_once_lose_nothing() {
+    // The chat panel and a Claude Code terminal can edit one project at the same time.
+    let dir = std::env::temp_dir().join(format!("intercraft-tools-concurrent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut setup = ToolHost::new(dir.clone());
+    setup.call("add_part", &json!({ "name": "A" })).unwrap();
+    setup.call("add_part", &json!({ "name": "B" })).unwrap();
+
+    let threads: Vec<_> = ["A", "B"]
+        .into_iter()
+        .map(|part| {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let mut host = ToolHost::new(dir);
+                for i in 0..15 {
+                    // Labels only: building isn't needed to test the bookkeeping.
+                    host.call("add_part", &json!({ "name": format!("{part}{i}") })).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let project: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("project.json")).unwrap()).unwrap();
+    let parts = project["parts"].as_array().unwrap().len();
+    assert_eq!(parts, 32, "edits were lost: {parts} parts instead of 32");
+    std::fs::remove_dir_all(dir).unwrap();
+}

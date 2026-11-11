@@ -192,6 +192,9 @@ impl ToolHost {
     }
 
     pub fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        // One tool call at a time per project, across processes, so two agents
+        // (say the chat panel and a Claude Code terminal) can't overwrite each other.
+        let _lock = self.lock_project()?;
         let mut project = self.load()?;
         match name {
             "get_project" => {
@@ -279,6 +282,20 @@ impl ToolHost {
     }
 
     /// Reads the project fresh on every call, because the user may have edited the files.
+    /// Held for the whole call; released when the returned file is dropped.
+    fn lock_project(&self) -> Result<std::fs::File> {
+        let dir = self.project_dir()?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".intercraft.lock"))
+            .context("opening the project lock")?;
+        file.lock().context("waiting for the project lock")?;
+        Ok(file)
+    }
+
     /// A missing project is created, so a new folder opened in the viewer just works.
     fn load(&self) -> Result<LoadedProject> {
         let dir = self.project_dir()?;

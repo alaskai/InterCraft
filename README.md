@@ -38,6 +38,14 @@ The geometry worker takes about ten seconds to start the first time, because it 
 
 To see the live update, leave the app open and change a value in `examples/bracket/project.json` (for example `bore_d`) or edit one of the snippets. The part rebuilds when you save.
 
+### Panels
+
+| Panel | What it shows |
+|---|---|
+| Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it. |
+| Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. |
+| Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). |
+
 ### Viewport controls
 
 | Action | Input |

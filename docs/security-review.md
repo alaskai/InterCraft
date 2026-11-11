@@ -130,6 +130,7 @@ A fake `claude` binary in `claude_code_stress.rs` checks every one of these flag
 4. **No dependency audit.** `cargo audit` and `pip-audit` have not been run, and there is no CI. Only build123d and numpy are pinned on the Python side, not their own dependencies. Adding CI with both audits and a Python lock file is the fix.
 5. **Local files can be changed by local programs.** Any program running as the user can edit `active_project.txt` to point an MCP client at another folder, or read the credential store. This needs local access already, so it is rated low.
 6. **The key stays in memory as plain text** while the app runs and is not cleared afterwards. Low impact.
+7. **Imported STEP files are parsed by OpenCascade** in the geometry worker. A malformed file can crash the worker, which then restarts, and parser bugs in large C++ libraries are a known class of problem. Imports are limited to `.step` and `.stp` files under 200 MB that the user picks, are copied into the project's `imports` folder, and are checked again by the worker. Only import files from people you trust.
 
 ## Checks you can repeat
 

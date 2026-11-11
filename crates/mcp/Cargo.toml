@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-intercraft-core = { path = "../core" }
-intercraft-geo = { path = "../geo" }
+intercraft-tools = { path = "../tools" }
 anyhow.workspace = true
 serde_json.workspace = true

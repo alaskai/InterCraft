@@ -1,4 +1,6 @@
-// The tools an LLM can call, and what each one does to the project.
+// intercraft-tools: the tools an LLM can call, and what each one does to the project.
+// Shared by the MCP server and the built-in chat panel, so both behave the same.
+// serde_json 1, anyhow 1
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,7 +10,28 @@ use intercraft_core::{FeatureEdit, LoadedProject, NewFeature, Params, Part};
 use intercraft_geo::{ExportFormat, FeatureInput, FeatureResult, PythonWorker, RebuildRequest};
 use serde_json::{json, Value};
 
-pub struct Server {
+/// How to use the tools well. Sent as MCP server instructions and as the chat system prompt.
+pub const GUIDE: &str = r#"InterCraft holds parametric CAD parts as an ordered list of features. The user watches the model update in a live viewer after every tool call, so make one small change per call.
+
+Writing a feature:
+- A feature is a short build123d snippet (algebra mode). `from build123d import *` and `math` are already imported.
+- The snippet reads `part` (the shape so far, None for the first feature) and must reassign `part`.
+- Parameters are in the dict `p`. Put every dimension a user may want to change in params, not in the code.
+- All lengths are mm. Z is up.
+- Examples:
+    part = Box(p["width"], p["depth"], p["height"])
+    part = part - Pos(0, 0, 5) * Cylinder(p["hole_d"] / 2, 50)
+    part = fillet(part.edges().filter_by(Axis.Z), p["radius"])
+
+Working method:
+- Call get_project first. It returns every part, feature, snippet and current build numbers.
+- Every edit returns a build report. Check it before moving on: a cut must lower the volume, an addition must raise it, and the size must be what you intended.
+- If a feature fails, the error is in the report and the change stays saved. Fix it with edit_feature, or remove it with delete_feature.
+- Prefer set_param for dimension changes. Later features rebuild automatically.
+- Pass the user's request in `prompt` when adding a feature. It is shown on their timeline.
+- State which values you measured from a report and which you assumed."#;
+
+pub struct ToolHost {
     dir: PathBuf,
     worker: Option<PythonWorker>,
 }
@@ -110,11 +133,22 @@ pub fn definitions() -> Value {
     ])
 }
 
-impl Server {
+impl ToolHost {
+    /// The geometry worker starts on the first tool call. Call `warm_up` to start it sooner.
     pub fn new(dir: PathBuf) -> Self {
         let dir = std::path::absolute(&dir).unwrap_or(dir);
-        // Start the worker now so it is warm by the first tool call.
-        Self { dir, worker: PythonWorker::spawn(|| {}).ok() }
+        Self { dir, worker: None }
+    }
+
+    /// Start the worker now so the first tool call doesn't wait for OpenCascade to load.
+    pub fn warm_up(&mut self) {
+        if self.worker.is_none() {
+            self.worker = PythonWorker::spawn(|| {}).ok();
+        }
+    }
+
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
     }
 
     pub fn call(&mut self, name: &str, args: &Value) -> Result<Value> {

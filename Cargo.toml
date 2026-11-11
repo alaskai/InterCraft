@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/geo", "crates/app", "crates/mcp"]
+members = ["crates/core", "crates/geo", "crates/tools", "crates/llm", "crates/app", "crates/mcp"]
 # Plain `cargo run` starts the viewer. Use `--workspace` to build or test everything.
 default-members = ["crates/app"]
 

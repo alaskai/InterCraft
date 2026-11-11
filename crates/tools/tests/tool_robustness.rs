@@ -274,3 +274,39 @@ fn imported_part_can_be_inspected_measured_and_edited() {
     std::fs::remove_dir_all(maker_dir).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn undo_redo_and_delete_part_through_the_tools() {
+    // None of these need the worker.
+    let (mut host, dir) = project("undo");
+    host.call("add_part", &json!({ "name": "A" })).unwrap();
+    host.call("add_part", &json!({ "name": "B" })).unwrap();
+    let names = |host: &mut ToolHost| -> Vec<String> {
+        let p = intercraft_core::LoadedProject::load(&host.project_dir().unwrap()).unwrap();
+        p.project.parts.iter().map(|p| p.name.clone()).collect()
+    };
+
+    let deleted = host.call("delete_part", &json!({ "part": "A" })).unwrap();
+    assert_eq!(deleted["deleted_part"], "A");
+    assert_eq!(names(&mut host), ["B"]);
+    let undone = host.call("undo", &json!({})).unwrap();
+    assert_eq!(undone["undone"], "Delete part 'A'");
+    assert_eq!(names(&mut host), ["A", "B"], "the part comes back in its old place");
+    host.call("redo", &json!({})).unwrap();
+    assert_eq!(names(&mut host), ["B"]);
+
+    // Back to the empty project, then nothing more to undo.
+    host.call("undo", &json!({})).unwrap();
+    host.call("undo", &json!({})).unwrap();
+    host.call("undo", &json!({})).unwrap();
+    assert!(names(&mut host).is_empty());
+    assert!(host.call("undo", &json!({})).is_err());
+
+    // The model can't remove a part the user locked.
+    host.call("redo", &json!({})).unwrap();
+    let mut p = intercraft_core::LoadedProject::load(&dir).unwrap();
+    p.set_kind("A", intercraft_core::PartKind::Reference).unwrap();
+    p.save().unwrap();
+    assert!(host.call("delete_part", &json!({ "part": "A" })).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

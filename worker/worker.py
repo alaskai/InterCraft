@@ -29,7 +29,9 @@ ANGULAR_TOL = 0.3  # rad
 
 _base_ns = sandbox.build_namespace()
 
-# chained hash -> (shape, report, mesh path)
+# chained hash -> the shape in the part's own frame, which the next feature builds on
+_local = {}
+# shown key (chained hash plus placement) -> (shape as placed, report, mesh path)
 _cache = {}
 
 
@@ -137,6 +139,21 @@ def import_step(path):
     return shape
 
 
+def shown_key(key, placement):
+    """Cache key of a step as it is shown: its chain hash, plus where the part sits."""
+    if not placement or not any(placement):
+        return key
+    return hashlib.sha1((key + json.dumps([float(v) for v in placement])).encode()).hexdigest()
+
+
+def place(shape, placement):
+    """Move a shape from the part's own frame to its place in the assembly."""
+    if not placement or not any(placement):
+        return shape
+    x, y, z, rx, ry, rz = (float(v) for v in placement)
+    return shape.moved(build123d.Location((x, y, z), (rx, ry, rz)))
+
+
 def run_feature(prev_shape, feature):
     if feature.get("import"):
         return import_step(feature["import"])
@@ -149,9 +166,11 @@ def run_feature(prev_shape, feature):
 
 
 def rebuild(req, emit=True):
-    """Build the feature chain. Returns (final shape, error text)."""
+    """Build the feature chain. Returns (final shape as placed, error text)."""
     rid = req["id"]
     part = req["part"]
+    placement = req.get("placement")
+    shown = None
     cache_dir = req["cache_dir"]
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -170,15 +189,23 @@ def rebuild(req, emit=True):
             "index": index,
         }
         try:
-            cached = key in _cache
+            # Moving a part re-places its cached steps without running the snippets again.
+            placed = shown_key(key, placement)
+            cached = placed in _cache and key in _local
             if cached:
-                shape, report, mesh_path = _cache[key]
+                shape = _local[key]
+                shown, report, mesh_path = _cache[placed]
             else:
-                shape = run_feature(shape, feature)
-                report = make_report(shape, volume)
-                mesh_path = os.path.join(cache_dir, key + ".icm")
-                write_mesh(shape, mesh_path)
-                _cache[key] = (shape, report, mesh_path)
+                if key in _local:
+                    shape = _local[key]
+                else:
+                    shape = run_feature(shape, feature)
+                    _local[key] = shape
+                shown = place(shape, placement)
+                report = make_report(shown, volume)
+                mesh_path = os.path.join(cache_dir, placed + ".icm")
+                write_mesh(shown, mesh_path)
+                _cache[placed] = (shown, report, mesh_path)
             volume = report["volume"]
             event.update(ok=True, cached=cached, mesh=mesh_path, report=report)
         except Exception:
@@ -196,7 +223,7 @@ def rebuild(req, emit=True):
 
     if emit:
         send({"id": rid, "event": "done", "part": part})
-    return shape, None
+    return shown, None
 
 
 def export(req):
@@ -329,6 +356,36 @@ def inspect(req):
     }})
 
 
+def fit(req):
+    """Check every pair of parts: where they overlap and by how much, or the gap between them."""
+    items = [(p["name"], p["mesh"], cached_shape(p["mesh"])) for p in req["parts"]]
+    pairs = []
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            (name_a, key_a, a), (name_b, key_b, b) = items[i], items[j]
+            pair = {"a": name_a, "b": name_b}
+            common = a.intersect(b)
+            solids = [s for item in (common or []) for s in item.solids()]
+            volume = sum(s.volume for s in solids)
+            if volume > 1e-6:
+                overlap = build123d.Compound(solids)
+                bb = overlap.bounding_box()
+                name = hashlib.sha1(f"overlap/{key_a}/{key_b}".encode()).hexdigest()
+                path = os.path.join(req["cache_dir"], name + ".icm")
+                write_mesh(overlap, path)
+                pair.update(status="overlap", overlap_volume=round(volume, 3), bbox_min=vec(bb.min), bbox_max=vec(bb.max), mesh=path)
+            else:
+                distance, pa, pb = a.distance_to_with_closest_points(b)
+                pair.update(
+                    status="touching" if distance < 1e-6 else "clear",
+                    clearance=round(distance, 4),
+                    a_point=vec(pa),
+                    b_point=vec(pb),
+                )
+            pairs.append(pair)
+    send({"id": req["id"], "event": "fitted", "data": {"pairs": pairs}})
+
+
 def main():
     send({"event": "ready", "build123d": build123d.__version__})
     for line in sys.stdin:
@@ -346,6 +403,8 @@ def main():
                 measure(req)
             elif req.get("cmd") == "inspect":
                 inspect(req)
+            elif req.get("cmd") == "fit":
+                fit(req)
             else:
                 send({"id": req.get("id"), "event": "error", "error": f"unknown cmd {req.get('cmd')}"})
         except Exception as e:

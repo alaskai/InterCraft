@@ -132,6 +132,8 @@ A fake `claude` binary in `claude_code_stress.rs` checks every one of these flag
 6. **The key stays in memory as plain text** while the app runs and is not cleared afterwards. Low impact.
 7. **Imported STEP files are parsed by OpenCascade** in the geometry worker. A malformed file can crash the worker, which then restarts, and parser bugs in large C++ libraries are a known class of problem. Imports are limited to `.step` and `.stp` files under 200 MB that the user picks, are copied into the project's `imports` folder, and are checked again by the worker. Only import files from people you trust.
 
+8. **Picture requests are files in the project folder.** The `view_model` tool asks the viewer for a picture by writing a small request file to `.intercraft/view`. The viewer checks each request (plain id, known view name, small size) and deletes anything else, and it only ever writes a PNG of the model back into that folder. A shared project could arrive with request files in it, which costs one render each and nothing more. Low impact.
+
 ## Checks you can repeat
 
 ```powershell

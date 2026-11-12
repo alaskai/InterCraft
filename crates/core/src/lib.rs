@@ -50,8 +50,39 @@ pub struct Part {
     /// An imported STEP file the part starts from, e.g. "imports/bracket.step".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Where the part sits in the assembly, in mm. Features are written in the
+    /// part's own frame and never see this.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub position: [f64; 3],
+    /// Rotation about X, Y and Z in degrees, applied before the move.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation: [f64; 3],
     #[serde(default)]
     pub features: Vec<Feature>,
+}
+
+fn is_zero(v: &[f64; 3]) -> bool {
+    v.iter().all(|x| *x == 0.0)
+}
+
+impl Part {
+    fn new(name: &str, source: Option<String>) -> Self {
+        Self {
+            name: name.to_owned(),
+            kind: PartKind::Design,
+            source,
+            position: [0.0; 3],
+            rotation: [0.0; 3],
+            features: Vec::new(),
+        }
+    }
+
+    /// Position and rotation as one list, or None when the part hasn't been moved.
+    pub fn placement(&self) -> Option<[f64; 6]> {
+        let [x, y, z] = self.position;
+        let [rx, ry, rz] = self.rotation;
+        (!is_zero(&self.position) || !is_zero(&self.rotation)).then_some([x, y, z, rx, ry, rz])
+    }
 }
 
 /// Largest STEP file accepted for import.
@@ -193,13 +224,82 @@ impl LoadedProject {
         if self.project.parts.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
             bail!("a part named '{name}' already exists");
         }
-        self.project.parts.push(Part {
-            name: name.to_owned(),
-            kind: PartKind::Design,
-            source: None,
-            features: Vec::new(),
-        });
+        self.project.parts.push(Part::new(name, None));
         Ok(())
+    }
+
+    /// Give a part a new name. Its snippets move to a folder with the new name.
+    pub fn rename_part(&mut self, old: &str, new: &str) -> Result<()> {
+        check_part_name(new)?;
+        if self.project.parts.iter().any(|p| p.name != old && p.name.eq_ignore_ascii_case(new)) {
+            bail!("a part named '{new}' already exists");
+        }
+        let dir = self.dir.clone();
+        let part = self.part_mut(old)?;
+        part.name = new.to_owned();
+        let prefix = format!("{old}/");
+        let mut left_behind = Vec::new();
+        for feature in &mut part.features {
+            if let Some(rest) = feature.file.strip_prefix(&prefix) {
+                let moved = format!("{new}/{rest}");
+                let before = std::mem::replace(&mut feature.file, moved);
+                left_behind.push(dir.join(before));
+            }
+        }
+        self.removed.extend(left_behind);
+        Ok(())
+    }
+
+    /// Copy a part, features and all. Returns the copy's name. The copy is always a
+    /// design part, so a locked reference can be copied and then changed.
+    pub fn duplicate_part(&mut self, name: &str, new_name: Option<&str>) -> Result<String> {
+        let original = self.part(name)?.clone();
+        let taken = |n: &str| self.project.parts.iter().any(|p| p.name.eq_ignore_ascii_case(n));
+        let new = match new_name {
+            Some(n) => {
+                check_part_name(n)?;
+                if taken(n) {
+                    bail!("a part named '{n}' already exists");
+                }
+                n.to_owned()
+            }
+            None => {
+                let base: String = original.name.chars().take(56).collect();
+                let mut n = format!("{base}_copy");
+                let mut i = 2;
+                while taken(&n) {
+                    n = format!("{base}_copy{i}");
+                    i += 1;
+                }
+                n
+            }
+        };
+        let mut copy = Part { name: new.clone(), kind: PartKind::Design, ..original };
+        let prefix = format!("{name}/");
+        for feature in &mut copy.features {
+            let rest = feature.file.strip_prefix(&prefix).unwrap_or(&feature.file);
+            // Flatten any odd path from a hand-written project into the copy's own folder.
+            let file_name = rest.rsplit('/').next().unwrap_or(rest);
+            feature.file = format!("{new}/{file_name}");
+        }
+        let at = self.project.parts.iter().position(|p| p.name == name).map_or(self.project.parts.len(), |i| i + 1);
+        self.project.parts.insert(at, copy);
+        Ok(new)
+    }
+
+    /// Move or turn a part in the assembly. Rotation is in degrees about X, Y and Z.
+    pub fn set_placement(&mut self, name: &str, position: [f64; 3], rotation: [f64; 3]) -> Result<()> {
+        if position.iter().chain(&rotation).any(|v| !v.is_finite() || v.abs() > 1e6) {
+            bail!("positions and rotations must be ordinary numbers");
+        }
+        let part = self.part_mut(name)?;
+        part.position = position;
+        part.rotation = rotation;
+        Ok(())
+    }
+
+    fn part_mut(&mut self, name: &str) -> Result<&mut Part> {
+        self.project.parts.iter_mut().find(|p| p.name == name).with_context(|| format!("no part named '{name}'"))
     }
 
     /// Copy a STEP file into the project's imports folder and add a part that starts
@@ -239,12 +339,7 @@ impl LoadedProject {
         let target = self.dir.join(&relative);
         std::fs::create_dir_all(self.dir.join("imports"))?;
         std::fs::copy(file, &target).with_context(|| format!("copying into {}", target.display()))?;
-        self.project.parts.push(Part {
-            name: name.clone(),
-            kind: PartKind::Design,
-            source: Some(relative),
-            features: Vec::new(),
-        });
+        self.project.parts.push(Part::new(&name, Some(relative)));
         Ok(name)
     }
 
@@ -662,6 +757,38 @@ mod tests {
             std::fs::write(p.dir.join("project.json"), json).unwrap();
             assert!(LoadedProject::load(&p.dir).is_err(), "accepted {source}");
         }
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn rename_duplicate_and_place() {
+        let mut p = temp_project("assembly");
+        p.add_part("Arm").unwrap();
+        p.add_feature("Arm", feature("Base", None)).unwrap();
+        p.save().unwrap();
+        let old_file = p.dir.join("Arm/010_base.py");
+        assert!(old_file.exists());
+
+        p.rename_part("Arm", "Lever").unwrap();
+        assert!(p.rename_part("Lever", "bad name").is_err());
+        let copy = p.duplicate_part("Lever", None).unwrap();
+        assert_eq!(copy, "Lever_copy");
+        assert_eq!(p.duplicate_part("Lever", None).unwrap(), "Lever_copy2");
+        assert!(p.duplicate_part("Lever", Some("lever")).is_err());
+        p.set_placement("Lever_copy", [10.0, 0.0, -5.0], [0.0, 0.0, 90.0]).unwrap();
+        assert!(p.set_placement("Lever", [f64::NAN, 0.0, 0.0], [0.0; 3]).is_err());
+        p.save().unwrap();
+
+        assert!(!old_file.exists() && !p.dir.join("Arm").exists(), "the old folder is gone");
+        let loaded = LoadedProject::load(&p.dir).unwrap();
+        let names: Vec<_> = loaded.project.parts.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Lever", "Lever_copy2", "Lever_copy"]);
+        assert_eq!(loaded.project.parts[2].features[0].file, "Lever_copy/010_base.py");
+        assert_eq!(loaded.project.parts[2].placement(), Some([10.0, 0.0, -5.0, 0.0, 0.0, 90.0]));
+        assert_eq!(loaded.project.parts[0].placement(), None);
+        // An unmoved part writes no placement at all.
+        let text = std::fs::read_to_string(p.dir.join("project.json")).unwrap();
+        assert_eq!(text.matches("\"position\"").count(), 1);
         std::fs::remove_dir_all(&p.dir).unwrap();
     }
 

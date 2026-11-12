@@ -310,3 +310,81 @@ fn undo_redo_and_delete_part_through_the_tools() {
     assert!(host.call("delete_part", &json!({ "part": "A" })).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn placed_parts_report_assembly_positions() {
+    if !worker_available() {
+        return;
+    }
+    let _one = one_at_a_time();
+    let (mut host, dir) = project("place");
+    host.call("add_part", &json!({ "name": "Block" })).unwrap();
+    add(&mut host, "Block", "Body", "part = Box(10, 10, 10)").unwrap();
+    let copy = host.call("duplicate_part", &json!({ "part": "Block", "new_name": "Twin" })).unwrap();
+    assert_eq!(copy["duplicated_as"], "Twin");
+
+    // Moving the copy changes where it is, not what it is.
+    let moved = host.call("place_part", &json!({ "part": "Twin", "position": [30, 0, 0] })).unwrap();
+    let body = &moved["features"][0];
+    assert_eq!(body["bbox_min"][0], 25.0, "{moved}");
+    assert_eq!(body["volume_mm3"], 1000.0);
+    assert_eq!(moved["position_mm"], json!([30.0, 0.0, 0.0]));
+
+    // Measuring works in assembly positions: the blocks are 20 mm apart.
+    let gap = host
+        .call("measure", &json!({ "a": { "part": "Block", "kind": "face", "index": 0 }, "b": { "point": [25, 0, 0] } }))
+        .unwrap();
+    assert!(gap["distance"].as_f64().is_some(), "{gap}");
+    // Inspecting stays in the part's own frame, where its features work.
+    let own = host.call("inspect_part", &json!({ "part": "Twin" })).unwrap();
+    assert_eq!(own["bbox_min"][0], -5.0, "{own}");
+    assert!(own["frame"].as_str().unwrap().contains("own frame"));
+
+    // A quarter turn about Z swaps a 20 x 10 footprint.
+    host.call("add_part", &json!({ "name": "Bar" })).unwrap();
+    add(&mut host, "Bar", "Body", "part = Box(20, 10, 4)").unwrap();
+    let turned = host.call("place_part", &json!({ "part": "Bar", "rotation": [0, 0, 90] })).unwrap();
+    assert_eq!(turned["features"][0]["size_mm"], json!([10.0, 20.0, 4.0]), "{turned}");
+
+    assert!(host.call("place_part", &json!({ "part": "Bar", "position": [1, 2] })).is_err());
+    host.call("rename_part", &json!({ "part": "Bar", "new_name": "Rail" })).unwrap();
+    assert!(dir.join("Rail").exists() && !dir.join("Bar").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_fit_finds_clashes_and_gaps() {
+    if !worker_available() {
+        return;
+    }
+    let _one = one_at_a_time();
+    let (mut host, dir) = project("fit");
+    for name in ["A", "B", "C"] {
+        host.call("add_part", &json!({ "name": name })).unwrap();
+        add(&mut host, name, "Body", "part = Box(10, 10, 10)").unwrap();
+    }
+    assert!(host.call("check_fit", &json!({ "parts": ["A"] })).is_err());
+    assert!(host.call("check_fit", &json!({ "parts": ["A", "Nope"] })).is_err());
+
+    // B overlaps A by 2 mm, C sits 20 mm clear of A.
+    host.call("place_part", &json!({ "part": "B", "position": [8, 0, 0] })).unwrap();
+    host.call("place_part", &json!({ "part": "C", "position": [-30, 0, 0] })).unwrap();
+    let fit = host.call("check_fit", &json!({})).unwrap();
+    let pair = |a: &str, b: &str| -> Value {
+        fit["pairs"].as_array().unwrap().iter().find(|p| p["a"] == a && p["b"] == b).cloned().unwrap()
+    };
+    let clash = pair("A", "B");
+    assert_eq!(clash["status"], "overlap", "{fit}");
+    assert!((clash["overlap_volume"].as_f64().unwrap() - 200.0).abs() < 0.01);
+    assert_eq!(clash["bbox_min"][0], 3.0);
+    assert!(clash.get("mesh").is_none(), "mesh paths are for the viewer only");
+    let gap = pair("A", "C");
+    assert_eq!(gap["status"], "clear");
+    assert_eq!(gap["clearance"], 20.0);
+
+    // Slide B until it just touches A.
+    host.call("place_part", &json!({ "part": "B", "position": [10, 0, 0] })).unwrap();
+    let fit = host.call("check_fit", &json!({ "parts": ["A", "B"] })).unwrap();
+    assert_eq!(fit["pairs"][0]["status"], "touching", "{fit}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -36,9 +36,112 @@ Imported parts and measuring:
 - Before editing an imported part, call inspect_part to find its faces, holes and their exact positions instead of guessing.
 - Use measure to check clearances, hole spacing and wall thickness after a change.
 
+Assemblies:
+- Each part has a placement (position and rotation) in the assembly, set with place_part. Features never see it: snippets always work in the part's own frame.
+- inspect_part answers in the part's own frame. Build reports and measure answer in assembly positions.
+- view_model shows you the model. Look after a change that is easy to get wrong by position or side, and before telling the user it is done.
+- check_fit finds clashes and clearances between parts. Parts that should mate must not overlap.
+
 Undo:
 - Every change is recorded. If an edit went wrong, or the user asks to go back, call undo instead of rebuilding by hand. redo steps forward again.
 - delete_part removes a whole part. Reference parts can only be removed by the user."#;
+
+/// A tool result carries a picture for the model under this key, as base64 PNG.
+/// The MCP server and the chat clients turn it into a real image block.
+pub const IMAGE_KEY: &str = "image_png_base64";
+
+/// How long `view_model` waits for the viewer to draw the picture.
+const VIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A picture the model asked for, waiting in the project's `.intercraft/view` folder
+/// for the viewer to draw it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewRequest {
+    pub id: String,
+    /// iso, front, back, left, right, top, bottom or current.
+    pub view: String,
+    pub part: Option<String>,
+    /// Cut the model open: (axis 0 to 2, position in mm, flip).
+    pub section: Option<(usize, f64, bool)>,
+    /// How long it has been waiting.
+    pub age: std::time::Duration,
+}
+
+pub const VIEWS: [&str; 8] = ["iso", "front", "back", "left", "right", "top", "bottom", "current"];
+
+fn view_dir(project: &Path) -> PathBuf {
+    project.join(".intercraft").join("view")
+}
+
+/// Requests waiting for the viewer, oldest first. Anything malformed is deleted:
+/// these files sit in the project folder, so they could have been put there by anyone.
+pub fn view_requests(project: &Path) -> Vec<ViewRequest> {
+    let Ok(entries) = std::fs::read_dir(view_dir(project)) else { return Vec::new() };
+    let mut requests = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_prefix("request-").and_then(|n| n.strip_suffix(".json")) else { continue };
+        let parsed = (|| {
+            if id.is_empty() || id.len() > 40 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return None;
+            }
+            if entry.metadata().ok()?.len() > 4096 {
+                return None;
+            }
+            let value: Value = serde_json::from_str(&std::fs::read_to_string(entry.path()).ok()?).ok()?;
+            let view = value["view"].as_str().filter(|v| VIEWS.contains(v))?.to_owned();
+            let section = match &value["section"] {
+                Value::Null => None,
+                s => Some((
+                    ["x", "y", "z"].iter().position(|a| s["axis"] == *a)?,
+                    s["offset"].as_f64().filter(|v| v.is_finite())?,
+                    s["flip"].as_bool().unwrap_or(false),
+                )),
+            };
+            let age = entry.metadata().ok()?.modified().ok()?.elapsed().unwrap_or_default();
+            Some(ViewRequest { id: id.to_owned(), view, part: value["part"].as_str().map(str::to_owned), section, age })
+        })();
+        match parsed {
+            Some(request) => requests.push(request),
+            None => {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    requests.sort_by_key(|r| std::cmp::Reverse(r.age));
+    requests
+}
+
+/// The viewer's answer: PNG bytes, or why it couldn't draw the picture.
+pub fn answer_view(project: &Path, id: &str, answer: std::result::Result<&[u8], &str>) {
+    let dir = view_dir(project);
+    let (ext, bytes) = match answer {
+        Ok(png) => ("png", png),
+        Err(error) => ("err", error.as_bytes()),
+    };
+    // Written under another name first, so the waiting tool never reads half a file.
+    let tmp = dir.join(format!("{id}.tmp"));
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join(format!("{id}.{ext}")));
+    }
+    let _ = std::fs::remove_file(dir.join(format!("request-{id}.json")));
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = u32::from(chunk[0]) << 16 | u32::from(*chunk.get(1).unwrap_or(&0)) << 8 | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
 
 /// Which project the tools edit.
 enum Target {
@@ -235,6 +338,37 @@ pub fn definitions() -> Value {
             },
         },
         {
+            "name": "place_part",
+            "description": "Move or turn a design part in the assembly without changing its features. Position is [x, y, z] in mm and rotation is [rx, ry, rz] in degrees about X, Y and Z, both absolute. Pass only the one you want to change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "part": part,
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                },
+                "required": ["part"],
+            },
+        },
+        {
+            "name": "duplicate_part",
+            "description": "Copy a part with all its features. The copy is a design part, so copying a reference part gives you something you can change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "part": part, "new_name": { "type": "string", "description": "Name for the copy. Omit for '<name>_copy'." } },
+                "required": ["part"],
+            },
+        },
+        {
+            "name": "rename_part",
+            "description": "Give a design part a new name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "part": part, "new_name": { "type": "string" } },
+                "required": ["part", "new_name"],
+            },
+        },
+        {
             "name": "delete_part",
             "description": "Remove a whole design part and its features. It can be brought back with undo.",
             "inputSchema": {
@@ -276,6 +410,37 @@ pub fn definitions() -> Value {
                     "b": { "type": "object", "description": "Second selection. Omit to describe 'a' alone." },
                 },
                 "required": ["a"],
+            },
+        },
+        {
+            "name": "view_model",
+            "description": "Look at the model: returns a picture from InterCraft's viewer. Use it to check that a shape looks right (a hole on the correct face, a fillet on the intended edges), which numbers alone can miss. Each part has its own colour and reference parts are grey. Pass a section to see inside. Pictures are for checking shape; take dimensions from build reports, inspect_part and measure.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "view": { "type": "string", "enum": VIEWS, "description": "Camera direction. 'current' is what the user is looking at. Default iso." },
+                    "part": { "type": "string", "description": "Show only this part. Omit to see the whole assembly." },
+                    "section": {
+                        "type": "object",
+                        "description": "Cut the model open with a plane across one axis.",
+                        "properties": {
+                            "axis": { "type": "string", "enum": ["x", "y", "z"] },
+                            "offset": { "type": "number", "description": "Where the plane sits on that axis, in mm (assembly position)." },
+                            "flip": { "type": "boolean", "description": "Cut away the other side. By default the side with larger coordinates is removed." },
+                        },
+                        "required": ["axis", "offset"],
+                    },
+                },
+            },
+        },
+        {
+            "name": "check_fit",
+            "description": "Check how parts fit together in the assembly. For every pair it reports either an overlap (the clashing volume in mm3 and where it is) or the clearance (smallest gap in mm and the two closest points). Run it after placing parts or changing mating features.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "parts": { "type": "array", "items": { "type": "string" }, "description": "Part names to check. Omit for all parts." },
+                },
             },
         },
         {
@@ -403,11 +568,33 @@ impl ToolHost {
                 project.save()?;
                 self.build_report(project.part(part)?, false)
             }
+            "rename_part" => {
+                let (old, new) = (text(args, "part")?, text(args, "new_name")?);
+                self.refuse_reference(&project, old)?;
+                project.rename_part(old, new)?;
+                project.save()?;
+                Ok(json!({ "renamed": old, "to": new }))
+            }
+            "duplicate_part" => {
+                let name = project.duplicate_part(text(args, "part")?, optional_text(args, "new_name"))?;
+                project.save()?;
+                let mut report = self.build_report(project.part(&name)?, false)?;
+                report["duplicated_as"] = name.into();
+                Ok(report)
+            }
+            "place_part" => {
+                let name = text(args, "part")?;
+                self.refuse_reference(&project, name)?;
+                let part = project.part(name)?;
+                let position = optional_triple(args, "position")?.unwrap_or(part.position);
+                let rotation = optional_triple(args, "rotation")?.unwrap_or(part.rotation);
+                project.set_placement(name, position, rotation)?;
+                project.save()?;
+                self.build_report(project.part(name)?, false)
+            }
             "delete_part" => {
                 let name = text(args, "part")?;
-                if project.part(name)?.kind == intercraft_core::PartKind::Reference {
-                    bail!("'{name}' is a reference part. Only the user can remove it");
-                }
+                self.refuse_reference(&project, name)?;
                 project.remove_part(name)?;
                 project.save()?;
                 Ok(json!({ "deleted_part": name, "undo": "call undo to bring it back" }))
@@ -416,8 +603,16 @@ impl ToolHost {
             "redo" => Ok(json!({ "redone": project.redo()? })),
             "inspect_part" => {
                 let part = project.part(text(args, "part")?)?.clone();
-                let key = self.built_key(&project.dir, &part, optional_text(args, "feature_id"))?;
+                // In the part's own frame: that is where its features work.
+                let key = self.built_key(&project.dir, &part, optional_text(args, "feature_id"), false)?;
                 let mut data = self.with_worker(|w| w.inspect_blocking(&key))?;
+                if part.placement().is_some() {
+                    data["frame"] = format!(
+                        "Positions are in the part's own frame, the one its features use. In the assembly the part is moved to {:?} mm and rotated {:?} degrees, and measure works in assembly positions.",
+                        part.position, part.rotation
+                    )
+                    .into();
+                }
                 data["part"] = part.name.into();
                 Ok(data)
             }
@@ -427,7 +622,7 @@ impl ToolHost {
                 let parts = project.project.parts.clone();
                 let mut key_for = |name: &str| -> Result<String> {
                     let part = parts.iter().find(|p| p.name == name).with_context(|| format!("no part named '{name}'"))?;
-                    self.built_key(&dir, part, None)
+                    self.built_key(&dir, part, None, true)
                 };
                 let a = selection(&mut key_for, default_part.as_deref(), args.get("a").context("missing 'a'")?)?;
                 let b = match args.get("b") {
@@ -435,6 +630,56 @@ impl ToolHost {
                     _ => None,
                 };
                 self.with_worker(|w| w.measure_blocking(a, b))
+            }
+            "view_model" => {
+                let view = optional_text(args, "view").unwrap_or("iso");
+                if !VIEWS.contains(&view) {
+                    bail!("unknown view '{view}'. Use one of: {}", VIEWS.join(", "));
+                }
+                if let Some(part) = optional_text(args, "part") {
+                    project.part(part)?;
+                }
+                let png = request_view(&project.dir, view, args)?;
+                let facing = match view {
+                    "iso" => "From the front right, above. Z is up.",
+                    "front" => "From the front (the -Y side), looking along +Y. X runs to the right, Z is up.",
+                    "back" => "From the back (the +Y side), looking along -Y. X runs to the left, Z is up.",
+                    "right" => "From the right (the +X side), looking along -X. Y runs to the right, Z is up.",
+                    "left" => "From the left (the -X side), looking along +X. Y runs to the left, Z is up.",
+                    "top" => "From above, looking down -Z. X runs to the right, Y is up the image.",
+                    "bottom" => "From below, looking up +Z. X runs to the right.",
+                    _ => "The user's own view, with whatever they have hidden or cut.",
+                };
+                Ok(json!({ "view": view, "facing": facing, IMAGE_KEY: base64(&png) }))
+            }
+            "check_fit" => {
+                let wanted: Option<Vec<&str>> =
+                    args.get("parts").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect());
+                let parts: Vec<Part> = project
+                    .project
+                    .parts
+                    .iter()
+                    .filter(|p| wanted.as_ref().is_none_or(|w| w.contains(&p.name.as_str())))
+                    .cloned()
+                    .collect();
+                if let Some(missing) = wanted.iter().flatten().find(|w| !parts.iter().any(|p| p.name == **w)) {
+                    bail!("no part named '{missing}'");
+                }
+                if parts.len() < 2 {
+                    bail!("a fit check needs at least two parts");
+                }
+                let mut keys = Vec::new();
+                for part in &parts {
+                    keys.push((part.name.clone(), self.built_key(&project.dir, part, None, true)?));
+                }
+                let mut data = self.with_worker(|w| w.fit_blocking(&keys))?;
+                // The mesh files are for the viewer.
+                for pair in data["pairs"].as_array_mut().into_iter().flatten() {
+                    if let Some(pair) = pair.as_object_mut() {
+                        pair.remove("mesh");
+                    }
+                }
+                Ok(data)
             }
             "export_part" => {
                 let part = project.part(text(args, "part")?)?;
@@ -459,6 +704,14 @@ impl ToolHost {
 
     /// Reads the project fresh on every call, because the user may have edited the files.
     /// Held for the whole call; released when the returned file is dropped.
+    /// Reference parts are the user's fixed surroundings: the model works around them.
+    fn refuse_reference(&self, project: &LoadedProject, name: &str) -> Result<()> {
+        if project.part(name)?.kind == intercraft_core::PartKind::Reference {
+            bail!("'{name}' is a reference part. Only the user can move, rename or remove it");
+        }
+        Ok(())
+    }
+
     fn lock_project(&self) -> Result<std::fs::File> {
         intercraft_core::lock(&self.project_dir()?)
     }
@@ -488,8 +741,8 @@ impl ToolHost {
 
     /// Builds a part and describes each feature's outcome in numbers.
     /// Build a part and return the cache key of its final shape (or of `feature_id`).
-    fn built_key(&mut self, dir: &Path, part: &Part, feature_id: Option<&str>) -> Result<String> {
-        let request = request_for(dir, part);
+    fn built_key(&mut self, dir: &Path, part: &Part, feature_id: Option<&str>, placed: bool) -> Result<String> {
+        let request = if placed { request_for(dir, part) } else { local_request(dir, part) };
         let results = self.with_worker(|w| w.build_blocking(request))?;
         let wanted = match feature_id {
             Some(id) => results.iter().find(|r| r.feature_id == id).with_context(|| format!("no step '{id}' in '{}'", part.name))?,
@@ -558,6 +811,10 @@ impl ToolHost {
         }
 
         let mut report = json!({ "part": part.name, "kind": part.kind, "ok": all_ok, "features": features });
+        if part.placement().is_some() {
+            report["position_mm"] = json!(part.position);
+            report["rotation_deg"] = json!(part.rotation);
+        }
         if let Some(source) = &part.source {
             report["imported_from"] = source.clone().into();
         }
@@ -572,12 +829,18 @@ impl ToolHost {
 /// Everything the worker needs to build a part: the imported file first, if any,
 /// then each feature. Shared by the viewer and the tools so both build the same thing.
 pub fn request_for(dir: &Path, part: &Part) -> RebuildRequest {
+    RebuildRequest { placement: part.placement(), ..local_request(dir, part) }
+}
+
+/// The part in its own frame, ignoring where it sits in the assembly. Features are
+/// written in this frame, so it's the one to inspect before editing.
+fn local_request(dir: &Path, part: &Part) -> RebuildRequest {
     let mut features = Vec::new();
     if let Some(source) = &part.source {
         features.push(FeatureInput::import(dir.join(source)));
     }
     features.extend(part.features.iter().map(|f| FeatureInput::snippet(&f.id, &f.code, &f.params)));
-    RebuildRequest { part: part.name.clone(), features }
+    RebuildRequest { part: part.name.clone(), features, placement: None }
 }
 
 /// One selection for `measure`, as the model writes it.
@@ -611,10 +874,114 @@ fn optional_text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)?.as_str()
 }
 
+/// Ask the viewer for a picture and wait for it. The viewer watches the project's
+/// `.intercraft/view` folder, so this works from another process (an MCP server) too.
+fn request_view(project: &Path, view: &str, args: &Value) -> Result<Vec<u8>> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let id = format!("{:x}x{n:x}x{nanos:x}", std::process::id());
+
+    let dir = view_dir(project);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let request = json!({ "view": view, "part": args.get("part"), "section": args.get("section") });
+    if let Some(section) = args.get("section").filter(|s| !s.is_null()) {
+        let axis_ok = ["x", "y", "z"].iter().any(|a| section["axis"] == *a);
+        if !axis_ok || !section["offset"].as_f64().is_some_and(f64::is_finite) {
+            bail!("'section' needs an axis (x, y or z) and an offset in mm");
+        }
+    }
+    let file = dir.join(format!("request-{id}.json"));
+    std::fs::write(&file, request.to_string()).context("writing the view request")?;
+
+    let (png, err) = (dir.join(format!("{id}.png")), dir.join(format!("{id}.err")));
+    let started = std::time::Instant::now();
+    let result = loop {
+        if let Ok(bytes) = std::fs::read(&png) {
+            break Ok(bytes);
+        }
+        if let Ok(error) = std::fs::read_to_string(&err) {
+            break Err(anyhow::anyhow!(error));
+        }
+        if started.elapsed() > VIEW_TIMEOUT {
+            break Err(anyhow::anyhow!(
+                "InterCraft's window didn't answer. A picture needs the viewer open on this project. Carry on with build reports, inspect_part and measure"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    };
+    for leftover in [&file, &png, &err] {
+        let _ = std::fs::remove_file(leftover);
+    }
+    result
+}
+
+/// Three numbers, e.g. a position.
+fn optional_triple(args: &Value, key: &str) -> Result<Option<[f64; 3]>> {
+    let Some(value) = args.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+    let numbers: Option<Vec<f64>> = value.as_array().map(|a| a.iter().filter_map(Value::as_f64).collect());
+    match numbers.as_deref() {
+        Some(&[x, y, z]) if value.as_array().is_some_and(|a| a.len() == 3) => Ok(Some([x, y, z])),
+        _ => bail!("'{key}' must be three numbers, like [10, 0, 5]"),
+    }
+}
+
 fn optional_params(args: &Value) -> Result<Option<Params>> {
     match args.get("params") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Object(map)) => Ok(Some(map.clone())),
         Some(_) => bail!("'params' must be an object"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_the_standard() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+    }
+
+    #[test]
+    fn view_model_asks_the_viewer_and_returns_its_picture() {
+        let dir = std::env::temp_dir().join(format!("intercraft-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut host = ToolHost::new(dir.clone());
+        host.call("add_part", &json!({ "name": "P" })).unwrap();
+
+        // Junk in the request folder is thrown away, not served.
+        let folder = view_dir(&dir);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("request-..evil.json"), r#"{"view":"iso"}"#).unwrap();
+        std::fs::write(folder.join("request-abc.json"), r#"{"view":"sideways"}"#).unwrap();
+        assert!(view_requests(&dir).is_empty());
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
+
+        // A stand-in for the viewer: answer the first request it sees.
+        let project = dir.clone();
+        let viewer = std::thread::spawn(move || loop {
+            if let Some(request) = view_requests(&project).into_iter().next() {
+                answer_view(&project, &request.id, Ok(b"PNG bytes"));
+                return request;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        });
+        let args = json!({ "view": "front", "part": "P", "section": { "axis": "z", "offset": 2.5 } });
+        let result = host.call("view_model", &args).unwrap();
+        let seen = viewer.join().unwrap();
+        assert_eq!((seen.view.as_str(), seen.part.as_deref(), seen.section), ("front", Some("P"), Some((2, 2.5, false))));
+        assert_eq!(result[IMAGE_KEY], base64(b"PNG bytes"));
+        assert!(result["facing"].as_str().unwrap().contains("-Y side"));
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "nothing is left behind");
+
+        assert!(host.call("view_model", &json!({ "view": "upside-down" })).is_err());
+        assert!(host.call("view_model", &json!({ "part": "Nope" })).is_err());
+        assert!(host.call("view_model", &json!({ "section": { "axis": "w", "offset": 1 } })).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

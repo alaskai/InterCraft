@@ -277,6 +277,15 @@ impl LoadedProject {
 /// A short description of what changed between two versions of a project.
 fn describe(before: &Content, after: &Content) -> String {
     let (old, new) = (&before.project, &after.project);
+    // Same parts in the same places with one name changed is a rename.
+    if old.parts.len() == new.parts.len() {
+        let mut renamed = old.parts.iter().zip(&new.parts).filter(|(a, b)| a.name != b.name);
+        if let (Some((a, b)), None) = (renamed.next(), renamed.next()) {
+            if !old.parts.iter().any(|p| p.name == b.name) {
+                return format!("Rename '{}' to '{}'", a.name, b.name);
+            }
+        }
+    }
     let mut changes = Vec::new();
     if old.name != new.name {
         changes.push(format!("Rename project to '{}'", new.name));
@@ -294,6 +303,9 @@ fn describe(before: &Content, after: &Content) -> String {
                 PartKind::Reference => format!("Lock '{}'", part.name),
                 PartKind::Design => format!("Unlock '{}'", part.name),
             });
+        }
+        if was.position != part.position || was.rotation != part.rotation {
+            changes.push(format!("Move '{}'", part.name));
         }
         for f in &part.features {
             let Some(w) = was.features.iter().find(|w| w.id == f.id) else {

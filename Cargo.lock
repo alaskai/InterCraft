@@ -1861,6 +1861,7 @@ dependencies = [
  "intercraft-llm",
  "intercraft-tools",
  "keyring",
+ "png",
  "rfd",
  "serde",
  "serde_json",

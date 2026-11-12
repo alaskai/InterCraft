@@ -24,6 +24,10 @@ pub struct ToolDef {
 }
 
 /// Runs tool calls on behalf of the model.
+/// A tool result may carry a picture under this key, as base64 PNG. It reaches the
+/// model as an image, not as text. Matches `intercraft_tools::IMAGE_KEY`.
+pub const IMAGE_KEY: &str = "image_png_base64";
+
 pub trait ToolExecutor {
     fn definitions(&self) -> Vec<ToolDef>;
     /// Ok is shown to the model as a normal result, Err as a tool error it can recover from.

@@ -381,7 +381,7 @@ fn drag_a_parameter_previews_then_saves_once() {
     h.hover_at(field.center() + egui::vec2(25.0, 0.0));
     h.step();
     let dragged = h.state().state.param_drag.clone().expect("dragging radius");
-    assert_eq!(dragged.name, "radius");
+    assert_eq!(dragged.field.label(), "radius");
     assert!(dragged.value > 3.0 && dragged.value.fract() == 0.0, "whole steps: {}", dragged.value);
 
     // The part rebuilds with the dragged value, but nothing is saved yet.
@@ -407,4 +407,161 @@ fn drag_a_parameter_previews_then_saves_once() {
     h.step();
     h.step();
     assert_eq!(saved_param(&project, 3, "radius"), 3);
+}
+
+#[test]
+fn section_view_cuts_the_model_open() {
+    let _one = one_at_a_time();
+    let project = example_project("section");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    click(&mut h, "Section");
+    let section = h.state().state.viewport.section.expect("section is on");
+    assert_eq!(section.axis, 1);
+    // The bracket is 30 mm deep, centred on the origin.
+    assert!(section.offset.abs() < 0.01, "starts through the middle: {}", section.offset);
+    shot(&mut h, "section_y");
+
+    click(&mut h, "X");
+    let flipped = h.state().state.viewport.section.unwrap().flip;
+    click(&mut h, "Flip");
+    let section = h.state().state.viewport.section.unwrap();
+    assert!(section.axis == 0 && section.flip != flipped);
+    shot(&mut h, "section_x_flipped");
+
+    // Nothing can be picked in the half that was cut away.
+    let centre = h.get_by_label("Section").rect().center() + egui::vec2(300.0, 300.0);
+    let state = &mut h.state_mut().state;
+    state.viewport.section = Some(viewport::Section { axis: 2, offset: -1000.0, flip: false });
+    assert!(state.viewport.pick(centre).is_none(), "everything is above the plane, so cut away");
+
+    click(&mut h, "Section");
+    assert!(h.state().state.viewport.section.is_none());
+}
+
+#[test]
+fn duplicate_rename_and_move_a_part() {
+    let _one = one_at_a_time();
+    let project = example_project("assembly");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    h.state_mut().state.duplicate_part("RodBracket");
+    wait_until(&mut h, "the copy to build", |app| built(app) && app.state.shown.len() == 2);
+    assert_eq!(part_names(&h), ["RodBracket", "RodBracket_copy"]);
+    assert_eq!(h.state().state.selected_part.as_deref(), Some("RodBracket_copy"));
+
+    // Rename through the window, with a bad name refused first.
+    h.state_mut().state.rename = Some(("RodBracket_copy".into(), "bad name!".into(), None));
+    h.step();
+    click(&mut h, "Rename");
+    assert_eq!(part_names(&h)[1], "RodBracket_copy", "a bad name changes nothing");
+    h.state_mut().state.rename = Some(("RodBracket_copy".into(), "Twin".into(), None));
+    h.step();
+    click(&mut h, "Rename");
+    assert_eq!(part_names(&h), ["RodBracket", "Twin"]);
+    assert!(h.state().state.rename.is_none());
+    wait_until(&mut h, "the renamed part to build", |app| built(app) && app.state.shown.contains_key("Twin"));
+
+    // Move it 60 mm along X with the Placement controls.
+    click(&mut h, "Placement");
+    let field = h.get_by_label("position X").rect();
+    h.drag_at(field.center());
+    h.step();
+    h.hover_at(field.center() + egui::vec2(120.0, 0.0));
+    h.step();
+    let moving = h.state().state.param_drag.clone().expect("dragging the position");
+    assert!(moving.value > 1.0);
+    h.drop_at(field.center() + egui::vec2(120.0, 0.0));
+    h.step();
+    h.step();
+    wait_until(&mut h, "the moved part", built);
+    let twin = h.state().state.project.as_ref().unwrap().part("Twin").unwrap().clone();
+    assert_eq!(twin.position[0], moving.value);
+    let bbox = h.state().state.results[&("Twin".to_owned(), "f040".to_owned())].result.report.clone().unwrap();
+    assert!((bbox.bbox_min[0] - (moving.value - 20.0)).abs() < 1e-6, "the mesh moved with it: {bbox:?}");
+    assert_eq!(h.state().state.history.undo_label(), Some("Move 'Twin'"));
+    h.state_mut().state.viewport.fit();
+    h.step();
+    shot(&mut h, "assembly_moved");
+
+    // The copy now overlaps the original, and the fit check says so.
+    click(&mut h, "Fit check");
+    wait_until(&mut h, "the fit check", |app| app.state.fit.as_ref().is_some_and(|f| f.clashes().is_some()));
+    assert_eq!(h.state().state.fit.as_ref().unwrap().clashes(), Some(1));
+    h.get_by_label_contains("RodBracket / Twin: overlap");
+    shot(&mut h, "fit_clash");
+
+    // Moving it clear runs the check again by itself.
+    h.state_mut().state.commit_param(params::ParamCommit {
+        part: "Twin".into(),
+        field: params::Field::Position(0),
+        value: 60.into(),
+    });
+    wait_until(&mut h, "the second fit check", |app| built(app) && app.state.fit.as_ref().is_some_and(|f| f.clashes() == Some(0)));
+    h.step();
+    h.get_by_label_contains("RodBracket / Twin: 20 mm clear");
+    h.state_mut().state.viewport.fit();
+    h.step();
+    shot(&mut h, "fit_clear");
+}
+
+/// Ask for a picture the way the model does, while the app keeps running.
+fn view_through_the_tool(h: &mut Harness<'static, App>, project: &Path, args: serde_json::Value) -> Vec<u8> {
+    let dir = project.to_path_buf();
+    let call = std::thread::spawn(move || intercraft_tools::ToolHost::new(dir).call("view_model", &args));
+    let started = Instant::now();
+    while !call.is_finished() {
+        assert!(started.elapsed() < Duration::from_secs(30), "the viewer never answered");
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let result = call.join().unwrap().expect("view_model works");
+    let data = result[intercraft_tools::IMAGE_KEY].as_str().expect("a picture");
+    // Decode the base64 by hand: the test has no decoder crate either.
+    let value = |c: u8| b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().position(|t| *t == c);
+    let mut bytes = Vec::new();
+    for chunk in data.as_bytes().chunks(4) {
+        let n = chunk.iter().fold(0u32, |n, c| n << 6 | value(*c).unwrap_or(0) as u32);
+        let keep = 3 - chunk.iter().filter(|c| **c == b'=').count();
+        bytes.extend_from_slice(&n.to_be_bytes()[1..1 + keep]);
+    }
+    bytes
+}
+
+#[test]
+fn the_model_can_look_at_the_part() {
+    let _one = one_at_a_time();
+    let project = example_project("view");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    assert_eq!(intercraft_tools::IMAGE_KEY, intercraft_llm::IMAGE_KEY);
+    let camera_before = h.state().state.viewport.section;
+
+    let out = std::env::temp_dir().join("intercraft-ui");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut pictures = Vec::new();
+    for (name, args) in [
+        ("view_iso", serde_json::json!({})),
+        ("view_front", serde_json::json!({ "view": "front", "part": "RodBracket" })),
+        ("view_cut", serde_json::json!({ "view": "iso", "section": { "axis": "x", "offset": 0, "flip": false } })),
+    ] {
+        let png = view_through_the_tool(&mut h, &project, args);
+        assert_eq!(&png[1..4], b"PNG");
+        std::fs::write(out.join(format!("{name}.png")), &png).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(&png)).read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!((info.width, info.height), (viewport::SHOT_SIZE, viewport::SHOT_SIZE));
+        // The part is in the picture: not every pixel is background.
+        let corner = pixels[..4].to_vec();
+        let drawn = pixels.as_chunks::<4>().0.iter().filter(|p| p.as_slice() != corner.as_slice()).count();
+        assert!(drawn > 20_000, "{name}: only {drawn} pixels differ from the background");
+        pictures.push(png);
+    }
+    assert_ne!(pictures[0], pictures[1]);
+    assert_ne!(pictures[0], pictures[2], "the section changes the picture");
+    assert_eq!(h.state().state.viewport.section, camera_before, "the user's own view is untouched");
+    assert!(intercraft_tools::view_requests(&project).is_empty());
 }

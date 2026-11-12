@@ -47,6 +47,11 @@ fn example_project(name: &str) -> PathBuf {
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap().flatten() {
+        // Undo history and locks left by running the app on the example locally
+        // would make tests behave differently here than on CI.
+        if entry.file_name().to_string_lossy().starts_with(".intercraft") {
+            continue;
+        }
         let target = to.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_dir(&entry.path(), &target);
@@ -900,4 +905,33 @@ fn first_run_choice_sets_up_a_beginner() {
     h.step();
     h.get_by_label("Code");
     assert!(h.state().state.chat.system_prompt().contains("The user knows CAD"));
+}
+
+#[test]
+fn the_caption_says_what_the_model_is_doing() {
+    let _one = one_at_a_time();
+    let project = example_project("caption");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    let input = serde_json::json!({ "part": "RodBracket", "label": "Rod bore", "why": "Sized for the 8 mm rod." });
+    let started = intercraft_llm::ChatEvent::ToolStarted { id: "t1".into(), name: "add_feature".into(), input };
+    h.state_mut().state.chat.inject(started);
+    h.step();
+    let (text, alpha) = h.state().state.chat.caption().map(|(t, a)| (t.to_owned(), a)).expect("a caption");
+    assert_eq!((text.as_str(), alpha), ("Adding Rod bore on RodBracket: Sized for the 8 mm rod.", 1.0));
+    shot(&mut h, "caption");
+
+    // After the reply it lingers, then goes.
+    h.state_mut().state.chat.inject(intercraft_llm::ChatEvent::Done);
+    h.step();
+    assert!(h.state().state.chat.caption().is_some());
+
+    // A change from outside the chat (say a Claude Code terminal) gets a caption too.
+    let edit = intercraft_core::FeatureEdit { label: Some("Rounded edges".into()), ..Default::default() };
+    let mut loaded = intercraft_core::LoadedProject::load(&project).unwrap();
+    loaded.edit_feature("RodBracket", "f040", edit).unwrap();
+    loaded.save().unwrap();
+    wait_until(&mut h, "the outside change", |app| app.state.outside_caption.shown().is_some());
+    assert_eq!(h.state().state.outside_caption.shown().unwrap().0, "Edit 'Rounded edges'");
 }

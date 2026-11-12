@@ -94,6 +94,8 @@ pub struct ChatPanel {
     /// A sketch waiting to go with the next message: base64 PNG and its written summary.
     sketch: Option<(String, String)>,
     usage: Usage,
+    /// What the model is doing right now, for the caption over the 3D view.
+    caption: crate::caption::Caption,
     ctx: egui::Context,
 }
 
@@ -124,6 +126,7 @@ impl ChatPanel {
             input: String::new(),
             sketch: None,
             usage: Usage::default(),
+            caption: Default::default(),
             ctx,
         };
         panel
@@ -269,6 +272,18 @@ impl ChatPanel {
     }
 
     /// A reply is being written, so nothing new can be sent or attached yet.
+    /// The caption for the 3D view, with its opacity.
+    pub fn caption(&self) -> Option<(&str, f32)> {
+        self.caption.shown()
+    }
+
+    /// Feed an event to the panel as if a reply had produced it, for tests.
+    #[cfg(test)]
+    pub fn inject(&mut self, event: ChatEvent) {
+        self.busy = !matches!(event, ChatEvent::Done);
+        self.apply_event(event);
+    }
+
     /// Whether a question can be sent right now: a provider is set up and no reply is running.
     pub fn can_ask(&self) -> bool {
         self.ready() && !self.busy
@@ -368,10 +383,12 @@ impl ChatPanel {
                 Reply::Failed(error) => {
                     self.messages.push(Message::Error(error));
                     self.busy = false;
+                    self.caption.finish();
                 }
                 Reply::Stopped => {
                     self.messages.push(Message::Notice("Stopped.".into()));
                     self.busy = false;
+                    self.caption.finish();
                 }
             }
         }
@@ -392,6 +409,7 @@ impl ChatPanel {
         }
         if let ChatEvent::Done = event {
             self.busy = false;
+            self.caption.finish();
             return None;
         }
         if let ChatEvent::Usage(usage) = event {
@@ -418,6 +436,9 @@ impl ChatPanel {
                 _ => items.push(Item::Note(text)),
             },
             ChatEvent::ToolStarted { id, name, input } => {
+                if let Some(text) = crate::caption::caption(&name, &input, self.settings.explain) {
+                    self.caption.set(text);
+                }
                 items.push(Item::Tool(ToolCall {
                     id,
                     name,

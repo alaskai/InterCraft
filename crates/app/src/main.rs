@@ -122,6 +122,9 @@ struct State {
     code_draft: Option<CodeDraft>,
     /// The simple layout: code, file paths and raw parameter names hidden.
     simple: bool,
+    /// Changes that arrive from outside the chat panel (a Claude Code terminal, an
+    /// edit in another program), captioned from their undo history label.
+    outside_caption: caption::Caption,
     /// The brief as typed in its tab, while editing.
     brief_draft: Option<String>,
     brief_markdown: egui_commonmark::CommonMarkCache,
@@ -178,6 +181,7 @@ impl App {
             rename: None,
             code_draft: None,
             simple,
+            outside_caption: Default::default(),
             brief_draft: None,
             brief_markdown: Default::default(),
             viewport: Viewport::new(render_state),
@@ -650,6 +654,7 @@ impl State {
 
         self.section_panel(ui, rect);
         self.fit_panel(ui, rect);
+        self.caption_ui(ui, rect);
 
         if !self.measure.active {
             return;
@@ -880,6 +885,22 @@ impl State {
         }
     }
 
+    /// What is being done to the model right now, at the bottom of the 3D view.
+    fn caption_ui(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let Some((text, alpha)) = self.chat.caption().or_else(|| self.outside_caption.shown()) else { return };
+        let painter = ui.painter_at(rect);
+        let width = (rect.width() - 80.0).clamp(120.0, 640.0);
+        let galley = painter.layout(text.to_owned(), egui::FontId::proportional(15.0), egui::Color32::WHITE.gamma_multiply(alpha), width);
+        let size = galley.size() + egui::vec2(24.0, 14.0);
+        let plate = egui::Rect::from_center_size(rect.center_bottom() - egui::vec2(0.0, 26.0 + size.y / 2.0), size);
+        painter.rect_filled(plate, 8.0, egui::Color32::from_black_alpha((200.0 * alpha) as u8));
+        painter.galley(plate.min + egui::vec2(12.0, 7.0), galley, egui::Color32::WHITE);
+        // Keep drawing while it fades.
+        if alpha < 1.0 {
+            ui.ctx().request_repaint();
+        }
+    }
+
     /// Controls for the section plane, in the top right corner of the viewport.
     fn section_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let (Some(mut section), Some((lo, hi))) = (self.viewport.section, self.viewport.visible_bounds()) else {
@@ -952,7 +973,17 @@ impl State {
             Ok(loaded) => {
                 self.last_mtime = loaded.latest_mtime();
                 self.project_error = None;
-                self.history = loaded.history();
+                let history = loaded.history();
+                // A new change that the chat panel didn't make: say what it was.
+                let newest = history.entries.iter().find(|e| Some(e.number) == history.head);
+                // Not on the first load, and not for history that was already there.
+                let reloading = self.project.is_some();
+                let fresh = reloading && newest.is_some_and(|e| self.history.head.is_none_or(|old| e.number > old));
+                if let (true, false, Some(entry)) = (fresh, self.chat.busy(), newest) {
+                    self.outside_caption.set(entry.label.clone());
+                    self.outside_caption.finish();
+                }
+                self.history = history;
                 self.project = Some(loaded);
                 // Picks point at shapes that are about to change.
                 self.measure.clear();

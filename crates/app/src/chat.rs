@@ -94,6 +94,11 @@ pub struct ChatPanel {
     /// A sketch waiting to go with the next message: base64 PNG and its written summary.
     sketch: Option<(String, String)>,
     usage: Usage,
+    /// Estimated dollars for the newest reply and for the whole conversation, and
+    /// whether any price was known at all.
+    reply_cost: f64,
+    chat_cost: f64,
+    cost_known: bool,
     /// What the model is doing right now, for the caption over the 3D view.
     caption: crate::caption::Caption,
     ctx: egui::Context,
@@ -126,6 +131,9 @@ impl ChatPanel {
             input: String::new(),
             sketch: None,
             usage: Usage::default(),
+            reply_cost: 0.0,
+            chat_cost: 0.0,
+            cost_known: false,
             caption: Default::default(),
             ctx,
         };
@@ -201,6 +209,8 @@ impl ChatPanel {
                 model: self.settings.openai_model.trim().to_owned(),
                 system: self.system_prompt(),
                 vision: self.settings.openai_vision,
+                price_input: self.settings.openai_price_input,
+                price_output: self.settings.openai_price_output,
             },
         }
     }
@@ -229,6 +239,8 @@ impl ChatPanel {
             s.openai_base_url = mine.openai_base_url.clone();
             s.openai_model = mine.openai_model.clone();
             s.openai_vision = mine.openai_vision;
+            s.openai_price_input = mine.openai_price_input;
+            s.openai_price_output = mine.openai_price_output;
         });
         if let Err(e) = saved {
             self.settings_error = Some(format!("Couldn't save settings: {e:#}"));
@@ -272,9 +284,39 @@ impl ChatPanel {
     }
 
     /// A reply is being written, so nothing new can be sent or attached yet.
+    /// The cost line under the chat, with its hover text. None when there's nothing to say.
+    pub fn cost_line(&self) -> Option<(String, &'static str)> {
+        let local = self.settings.provider == Provider::OpenAi
+            && intercraft_llm::completions_url(&self.settings.openai_base_url).is_ok_and(|url| url.starts_with("http://"));
+        if local && !self.cost_known {
+            return Some(("Free: the model runs on this computer".to_owned(), "Local models cost nothing per message."));
+        }
+        if !self.cost_known {
+            let hint = match self.settings.provider {
+                Provider::OpenAi => Some(("Enter the server's prices in Settings to see costs".to_owned(), "Prices are per million tokens, from the provider's pricing page.")),
+                _ => None,
+            };
+            return hint;
+        }
+        let text = format!("Reply ~{} · chat ~{}", money(self.reply_cost), money(self.chat_cost));
+        Some(match self.settings.provider {
+            Provider::ClaudeCode => (
+                format!("{text} (subscription)"),
+                "Claude Code's own estimate. On a Claude plan this counts toward your usage limits rather than being billed per message.",
+            ),
+            Provider::Anthropic => (text, "Worked out from Anthropic's list prices. Your Anthropic bill is the real figure."),
+            Provider::OpenAi => (text, "Worked out from the prices entered in Settings. The provider's bill is the real figure."),
+        })
+    }
+
     /// The caption for the 3D view, with its opacity.
     pub fn caption(&self) -> Option<(&str, f32)> {
         self.caption.shown()
+    }
+
+    #[cfg(test)]
+    pub fn use_provider(&mut self, provider: Provider) {
+        self.settings.provider = provider;
     }
 
     /// Feed an event to the panel as if a reply had produced it, for tests.
@@ -364,6 +406,7 @@ impl ChatPanel {
         }
         self.cancel.store(false, Ordering::Relaxed);
         self.busy = true;
+        self.reply_cost = 0.0;
         let _ = self.worker().send(Command::Send { text: full, images });
     }
 
@@ -414,6 +457,12 @@ impl ChatPanel {
         }
         if let ChatEvent::Usage(usage) = event {
             self.usage = usage;
+            return None;
+        }
+        if let ChatEvent::Cost(usd) = event {
+            self.reply_cost += usd;
+            self.chat_cost += usd;
+            self.cost_known = true;
             return None;
         }
         if let ChatEvent::Notice(text) = event {
@@ -506,6 +555,7 @@ impl ChatPanel {
                 if ui.add_enabled(!self.busy, egui::Button::new("New chat")).clicked() {
                     self.messages.clear();
                     self.usage = Usage::default();
+                    (self.reply_cost, self.chat_cost, self.cost_known) = (0.0, 0.0, false);
                     if self.worker.is_some() {
                         let _ = self.worker().send(Command::Reset);
                     }
@@ -526,6 +576,9 @@ impl ChatPanel {
                     self.usage.cache_read_tokens / 1000
                 ))
                 .on_hover_text("Size of the last request and how much of it came from the prompt cache.");
+            }
+            if let Some((text, hint)) = self.cost_line() {
+                ui.weak(text).on_hover_text(hint);
             }
             ui.add_space(4.0);
         });
@@ -762,6 +815,21 @@ impl ChatPanel {
         changed |= ui.add(model).lost_focus();
         ui.end_row();
 
+        ui.label("Prices");
+        ui.horizontal(|ui| {
+            fn price(value: &mut f64) -> egui::DragValue<'_> {
+                egui::DragValue::new(value).speed(0.05).range(0.0..=1000.0).prefix("$").max_decimals(3)
+            }
+            ui.label("in");
+            changed |= ui.add(price(&mut self.settings.openai_price_input)).changed();
+            ui.label("out");
+            changed |= ui.add(price(&mut self.settings.openai_price_output)).changed();
+            ui.weak("per million tokens");
+        })
+        .response
+        .on_hover_text("From the provider's pricing page. Leave at $0 to show tokens only.");
+        ui.end_row();
+
         ui.label("Images");
         changed |= ui
             .checkbox(&mut self.settings.openai_vision, "This model can read images")
@@ -809,6 +877,15 @@ impl ChatPanel {
             self.server_key = settings::load_server_key(&self.settings.openai_base_url);
         }
         changed | new_server
+    }
+}
+
+/// "$0.035", "$1.20", "<$0.01".
+fn money(usd: f64) -> String {
+    match usd {
+        u if u < 0.01 => "<$0.01".to_owned(),
+        u if u < 1.0 => format!("${u:.3}"),
+        u => format!("${u:.2}"),
     }
 }
 

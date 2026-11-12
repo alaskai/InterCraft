@@ -6,6 +6,7 @@
 mod anthropic;
 mod claude_code;
 mod openai;
+mod pricing;
 mod sse;
 
 use std::sync::atomic::AtomicBool;
@@ -16,6 +17,7 @@ use serde_json::Value;
 pub use anthropic::{AnthropicChat, AnthropicSettings, ANTHROPIC_MODELS};
 pub use claude_code::{claude_code_version, ClaudeCodeChat, ClaudeCodeSettings, CLAUDE_CODE_MODELS};
 pub use openai::{completions_url, OpenAiChat, OpenAiSettings, OPENAI_PRESETS};
+pub use pricing::{anthropic_price, cost, Price};
 
 /// A tool the model may call, in provider-neutral form.
 #[derive(Debug, Clone)]
@@ -47,6 +49,9 @@ pub enum ChatEvent {
     ToolStarted { id: String, name: String, input: Value },
     ToolFinished { id: String, ok: bool, output: Value },
     Usage(Usage),
+    /// Estimated US dollars for one request (API routes) or one reply (Claude Code).
+    /// Sent only when the price is known.
+    Cost(f64),
     /// The model declined or the reply was cut short. Shown to the user as is.
     Notice(String),
     Done,

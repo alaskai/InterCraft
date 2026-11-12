@@ -930,3 +930,35 @@ fn the_caption_says_what_the_model_is_doing() {
     wait_until(&mut h, "the outside change", |app| app.state.outside_caption.shown().is_some());
     assert_eq!(h.state().state.outside_caption.shown().unwrap().0, "Edit 'Rounded edges'");
 }
+
+#[test]
+fn the_chat_shows_what_replies_cost() {
+    let _one = one_at_a_time();
+    let project = example_project("cost");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let chat = &mut h.state_mut().state.chat;
+
+    // A local model is free, and says so.
+    chat.use_server("http://localhost:11434/v1", "qwen3");
+    assert_eq!(chat.cost_line().unwrap().0, "Free: the model runs on this computer");
+    // A hosted server without prices asks for them.
+    chat.use_server("https://openrouter.ai/api/v1", "some-model");
+    assert!(chat.cost_line().unwrap().0.contains("Enter the server's prices"));
+
+    // The API: costs add up per reply and per conversation.
+    chat.use_provider(settings::Provider::Anthropic);
+    assert!(chat.cost_line().is_none(), "nothing to say before a reply");
+    chat.inject(intercraft_llm::ChatEvent::Cost(0.0125));
+    chat.inject(intercraft_llm::ChatEvent::Cost(0.0225));
+    chat.inject(intercraft_llm::ChatEvent::Done);
+    assert_eq!(chat.cost_line().unwrap().0, "Reply ~$0.035 · chat ~$0.035");
+    chat.use_provider(settings::Provider::ClaudeCode);
+    assert!(chat.cost_line().unwrap().0.ends_with("(subscription)"));
+    // The panel sizes itself a frame after the line first appears.
+    for _ in 0..3 {
+        h.step();
+    }
+    h.get_by_label_contains("chat ~$0.035");
+    shot(&mut h, "cost_line");
+}

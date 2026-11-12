@@ -157,7 +157,13 @@ There are four ways in. All use the same tools, so the model behaves the same ei
    - **OpenAI-compatible server.** Set the server address (Pick lists OpenAI, OpenRouter, Ollama and LM Studio), type the model's id on that server, and save a key if the server needs one. Each server has its own saved key, so a key is never sent to a server it wasn't saved for. The address must be HTTPS unless the server runs on this computer. Tick "This model can read images" only for models that can, since that is what lets them use `view_model`. Small local models often struggle with tool calls, so expect better results from larger ones.
 3. Describe the part. Enter sends, Shift+Enter starts a new line, Stop ends the reply.
 
-While it works, a caption at the bottom of the 3D view says what it is doing in plain words (worded to your explanation level), and changes made from a Claude Code terminal get a caption too. In the chat you see its short notes between steps, each tool call with its result (green for built, red for failed), and the viewer follows the part being edited. Replies are formatted (headings, lists, tables, code). When a choice is genuinely yours, the model can ask with clickable options, and your pick goes back as your next message. The size of the last request and how much came from the prompt cache show under the buttons.
+While it works, a caption at the bottom of the 3D view says what it is doing in plain words (worded to your explanation level), and changes made from a Claude Code terminal get a caption too. In the chat you see its short notes between steps, each tool call with its result (green for built, red for failed), and the viewer follows the part being edited. Replies are formatted (headings, lists, tables, code). When a choice is genuinely yours, the model can ask with clickable options, and your pick goes back as your next message. The size of the last request and how much came from the prompt cache show under the buttons, with an estimate of what the last reply and the whole conversation cost:
+
+- **Anthropic API:** worked out from Anthropic's list prices.
+- **Claude Code:** Claude Code's own estimate, which on a Claude plan counts toward your usage limits rather than being billed per message.
+- **OpenAI-compatible server:** worked out from the prices you enter in Settings. A local server shows as free.
+
+These are estimates. Your provider's bill is the real figure.
 
 The Claude Code session is locked down: no built-in tools (no shell or file editing), no other MCP servers, and only the InterCraft tools allowed. It runs in the project folder with your personal hooks and settings left out. InterCraft never reads your Claude login; the unmodified `claude` program signs in by itself. The conversation is a normal Claude Code session, so `claude --resume` can pick it up in a terminal.
 

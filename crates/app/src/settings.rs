@@ -89,6 +89,9 @@ pub struct Settings {
     pub openai_model: String,
     /// That model can read images, so it gets `view_model` pictures.
     pub openai_vision: bool,
+    /// The server's prices in US dollars per million tokens, if the user entered them.
+    pub openai_price_input: f64,
+    pub openai_price_output: f64,
     /// Most recent first.
     pub recent_projects: Vec<String>,
     /// "system", "dark" or "light".
@@ -112,6 +115,8 @@ impl Default for Settings {
             openai_base_url: intercraft_llm::OPENAI_PRESETS[0].1.to_owned(),
             openai_model: String::new(),
             openai_vision: false,
+            openai_price_input: 0.0,
+            openai_price_output: 0.0,
             recent_projects: Vec::new(),
             theme: "system".to_owned(),
             explain: Explain::default(),

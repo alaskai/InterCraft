@@ -25,8 +25,11 @@ fn stream_text(text: &str, parent: Value) {
 }
 
 fn result(session: &str, ok: bool, text: &str) {
+    // Like Claude Code, the cost is a running total for the process: 2 cents a reply.
+    static REPLIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let replies = REPLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     out(json!({"type": "result", "subtype": if ok { "success" } else { "error_during_execution" },
-        "is_error": !ok, "result": text, "session_id": session,
+        "is_error": !ok, "result": text, "session_id": session, "total_cost_usd": 0.02 * f64::from(replies),
         "usage": {"input_tokens": 12, "cache_read_input_tokens": 3000, "output_tokens": 40}}));
 }
 

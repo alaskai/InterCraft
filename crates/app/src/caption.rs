@@ -64,6 +64,9 @@ pub fn tool_purpose(name: &str) -> &'static str {
         "inspect_part" => "Lists the part's faces and holes with exact sizes and positions, so nothing has to be guessed.",
         "measure" => "Measures a distance, angle or size exactly, using the CAD kernel rather than the picture.",
         "check_fit" => "Checks whether parts overlap, and how big the gap between them is.",
+        "fastener_info" => "Looks up the real sizes for a screw size in the ISO tables: hole sizes, head, nut and insert.",
+        "add_standard_part" => "Adds a real screw, nut, washer, insert or bearing with its true dimensions, to design around.",
+        "print_check" => "Checks the part for 3D printing: walls too thin, holes too small and overhangs that would need support.",
         "view_model" => "Takes a picture of the model to check that it looks right.",
         "export_part" => "Writes the part to a file: STEP to keep editing it, STL to 3D print it.",
         "update_brief" => "Updates the project's design brief: what it is for, decisions made and open questions.",
@@ -109,6 +112,9 @@ pub fn caption(name: &str, input: &Value, level: Explain) -> Option<String> {
         "inspect_part" => format!("Looking closely at {}", part.unwrap_or("the part")),
         "measure" => "Measuring".to_owned(),
         "check_fit" => "Checking how the parts fit together".to_owned(),
+        "fastener_info" => format!("Looking up real {} sizes", text("size").unwrap_or("screw")),
+        "add_standard_part" => format!("Adding a {} {}", text("size").unwrap_or(""), text("kind").unwrap_or("standard part")),
+        "print_check" => format!("Checking {} will print well", part.unwrap_or("the part")),
         "view_model" => "Taking a look at the model".to_owned(),
         "export_part" => format!("Exporting {}", part.unwrap_or("the part")),
         "update_brief" => format!("Updating the brief: {}", text("section").unwrap_or("notes")),
@@ -121,6 +127,7 @@ pub fn caption(name: &str, input: &Value, level: Explain) -> Option<String> {
         (Explain::Beginner, "measure") => " (exact numbers, not guesses from the picture)",
         (Explain::Beginner, "check_fit") => " (parts that should fit together must not overlap)",
         (Explain::Beginner, "inspect_part") => " (exact sizes before changing anything)",
+        (Explain::Beginner, "fastener_info") => " (from the standard tables, not from memory)",
         _ => "",
     };
     Some(format!("{line}{extra}"))

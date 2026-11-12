@@ -41,6 +41,74 @@ enum Target {
 pub struct ToolHost {
     target: Target,
     worker: Option<PythonWorker>,
+    /// Offer `ask_user`. Only InterCraft's own chat panel can show the question.
+    ask_user: bool,
+}
+
+/// The editing tools plus `ask_user`, for agents talking through InterCraft's chat panel.
+pub fn chat_panel_definitions() -> Value {
+    let mut tools = definitions();
+    if let Some(list) = tools.as_array_mut() {
+        list.push(json!({
+            "name": "ask_user",
+            "description": "Ask the user to choose when the decision is genuinely theirs: design intent, a trade-off, \
+or a dimension you can't measure or sensibly assume. The options appear as buttons in InterCraft's chat. \
+After calling this, end your reply without further tool calls; the answer arrives as the user's next message. \
+Don't use it for things you can work out from the project or the build reports.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "One clear question, ending with a question mark." },
+                    "options": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "description": "2 to 4 distinct choices. The user can also type their own answer.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string", "description": "Short choice, 1 to 6 words." },
+                                "description": { "type": "string", "description": "What picking it means, one sentence." }
+                            },
+                            "required": ["label"]
+                        }
+                    },
+                    "multi_select": { "type": "boolean", "description": "Let the user pick more than one option." }
+                },
+                "required": ["question", "options"]
+            },
+        }));
+    }
+    tools
+}
+
+/// Checks an `ask_user` call so the chat panel never has to draw nonsense.
+pub fn validate_question(args: &Value) -> Result<()> {
+    let question = text(args, "question")?.trim();
+    if question.is_empty() || question.chars().count() > 300 {
+        bail!("the question must be 1 to 300 characters");
+    }
+    let options = args.get("options").and_then(Value::as_array).context("'options' must be a list")?;
+    if !(2..=4).contains(&options.len()) {
+        bail!("give 2 to 4 options");
+    }
+    let mut labels = std::collections::HashSet::new();
+    for option in options {
+        let label = option["label"].as_str().map(str::trim).unwrap_or_default();
+        if label.is_empty() || label.chars().count() > 60 {
+            bail!("each option needs a label of 1 to 60 characters");
+        }
+        if !labels.insert(label.to_lowercase()) {
+            bail!("two options have the label '{label}'");
+        }
+        if option["description"].as_str().is_some_and(|d| d.chars().count() > 200) {
+            bail!("option descriptions are limited to 200 characters");
+        }
+    }
+    if args.get("multi_select").is_some_and(|m| !m.is_boolean()) {
+        bail!("'multi_select' must be true or false");
+    }
+    Ok(())
 }
 
 /// Small file where the viewer records the project it has open, so an MCP server
@@ -167,12 +235,18 @@ impl ToolHost {
     /// The geometry worker starts on the first tool call. Call `warm_up` to start it sooner.
     pub fn new(dir: PathBuf) -> Self {
         let dir = std::path::absolute(&dir).unwrap_or(dir);
-        Self { target: Target::Fixed(dir), worker: None }
+        Self { target: Target::Fixed(dir), worker: None, ask_user: false }
+    }
+
+    /// Also accept `ask_user` calls (InterCraft's chat panel shows them).
+    pub fn with_ask_user(mut self) -> Self {
+        self.ask_user = true;
+        self
     }
 
     /// Edit whichever project the viewer has open.
     pub fn follow_viewer() -> Self {
-        Self { target: Target::FollowViewer, worker: None }
+        Self { target: Target::FollowViewer, worker: None, ask_user: false }
     }
 
     /// Start the worker now so the first tool call doesn't wait for OpenCascade to load.
@@ -192,6 +266,13 @@ impl ToolHost {
     }
 
     pub fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        if name == "ask_user" && self.ask_user {
+            validate_question(args)?;
+            return Ok(json!({
+                "shown": true,
+                "next": "The question is on the user's screen. End your reply now without more tool calls. Their answer arrives as their next message.",
+            }));
+        }
         // One tool call at a time per project, across processes, so two agents
         // (say the chat panel and a Claude Code terminal) can't overwrite each other.
         let _lock = self.lock_project()?;

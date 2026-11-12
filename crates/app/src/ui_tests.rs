@@ -792,3 +792,26 @@ fn the_why_shows_on_the_timeline_and_in_the_inspector() {
     h.get_by_label_contains("Asked for: Round the vertical edges.");
     shot(&mut h, "step_why");
 }
+
+#[test]
+fn explain_buttons_ask_the_chat() {
+    let _one = one_at_a_time();
+    let project = example_project("explain");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    // No provider set up: the button is there but does nothing.
+    h.state_mut().state.chat.use_server("", "");
+    h.step();
+    h.get_by_label("Why is it like this?").click();
+    h.step();
+    assert!(h.state().state.chat.last_question().is_none());
+
+    // With a provider (a local address nothing answers on), it asks about the shown step.
+    h.state_mut().state.chat.use_server("http://127.0.0.1:9/v1", "test-model");
+    h.step();
+    click(&mut h, "Why is it like this?");
+    let asked = h.state().state.chat.last_question().unwrap_or_default().to_owned();
+    assert_eq!(asked, "Explain step 4, 'Edge fillets', of RodBracket: what it does and why it is designed this way. Keep it short and plain.");
+    shot(&mut h, "explain_asked");
+}

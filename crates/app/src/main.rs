@@ -715,6 +715,13 @@ impl State {
         encode_png(&pixels, viewport::SHOT_SIZE, viewport::SHOT_SIZE)
     }
 
+    /// Send a question to the chat for the user, and say so if it can't go yet.
+    pub(crate) fn ask_chat(&mut self, question: &str) {
+        if !self.chat.ask(question) {
+            self.worker_status = "The chat can't take a question right now. Set it up in Settings, or wait for the reply.".to_owned();
+        }
+    }
+
     /// Put a flat view of the model behind the sketch, or take it away.
     pub(crate) fn set_sketch_backdrop(&mut self, ctx: &egui::Context, view: Option<String>) {
         let Some(view) = view else {
@@ -1181,6 +1188,11 @@ impl State {
                     action = Some(PartAction::Rename(name.clone()));
                     ui.close();
                 }
+                let ready = self.chat.can_ask();
+                if ui.add_enabled(ready, egui::Button::new("Explain this part")).on_disabled_hover_text("Set up a chat provider in Settings first, or wait for the current reply").clicked() {
+                    action = Some(PartAction::Explain(name.clone()));
+                    ui.close();
+                }
                 if ui.button("Duplicate").clicked() {
                     action = Some(PartAction::Duplicate(name.clone()));
                     ui.close();
@@ -1232,6 +1244,7 @@ impl State {
             Some(PartAction::Delete(name)) => self.delete_part(&name),
             Some(PartAction::Rename(name)) => self.rename = Some((RenameTarget::Part(name.clone()), name, None)),
             Some(PartAction::Duplicate(name)) => self.duplicate_part(&name),
+            Some(PartAction::Explain(name)) => self.ask_chat(&explain_part(&name)),
             Some(PartAction::Import) => self.import_step_dialog(),
             None => {}
         }
@@ -1247,6 +1260,7 @@ impl State {
         match action {
             Some(InspectorAction::Param(commit)) => self.commit_param(commit),
             Some(InspectorAction::Code { part, feature, code }) => self.apply_code(&part, &feature, code),
+            Some(InspectorAction::Ask(question)) => self.ask_chat(&question),
             None => {}
         }
     }
@@ -1293,7 +1307,18 @@ impl State {
             steps.len(),
             if self.selected_step.is_none() { " (latest)" } else { "" }
         ));
-        ui.heading(&step.label);
+        ui.horizontal(|ui| {
+            ui.heading(&step.label);
+            let ready = self.chat.can_ask();
+            let hint = if ready {
+                "Ask the model what this step does and why it is designed this way"
+            } else {
+                "Set up a chat provider in Settings first, or wait for the current reply"
+            };
+            if ui.add_enabled(ready, egui::Button::new("Why is it like this?").small()).on_hover_text(hint).on_disabled_hover_text(hint).clicked() {
+                commit = Some(InspectorAction::Ask(explain_step(&part.name, index + 1, &step.label)));
+            }
+        });
         ui.weak(step.file);
         if !step.why.is_empty() {
             ui.add_space(4.0);
@@ -1490,6 +1515,17 @@ pub(crate) enum RenameTarget {
 enum InspectorAction {
     Param(params::ParamCommit),
     Code { part: String, feature: String, code: String },
+    /// A question for the chat, from an Explain button.
+    Ask(String),
+}
+
+/// What the Explain buttons ask. Plain and short, so the answer suits a beginner.
+fn explain_step(part: &str, number: usize, label: &str) -> String {
+    format!("Explain step {number}, '{label}', of {part}: what it does and why it is designed this way. Keep it short and plain.")
+}
+
+fn explain_part(part: &str) -> String {
+    format!("Explain the part '{part}': what it is for, how its steps build it up, and the main design choices. Keep it short and plain.")
 }
 
 /// A step's snippet as typed in the Inspector, until it is applied.
@@ -1589,6 +1625,7 @@ enum PartAction {
     Delete(String),
     Rename(String),
     Duplicate(String),
+    Explain(String),
     Import,
 }
 

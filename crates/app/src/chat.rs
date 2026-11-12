@@ -248,6 +248,27 @@ impl ChatPanel {
     }
 
     /// A reply is being written, so nothing new can be sent or attached yet.
+    /// Whether a question can be sent right now: a provider is set up and no reply is running.
+    pub fn can_ask(&self) -> bool {
+        self.ready() && !self.busy
+    }
+
+    /// Send a question on the user's behalf, as if they had typed it. Returns false
+    /// when it can't be sent yet.
+    pub fn ask(&mut self, text: &str) -> bool {
+        if !self.can_ask() {
+            return false;
+        }
+        self.send_text(text.to_owned(), None);
+        true
+    }
+
+    /// The newest message the user sent, for tests.
+    #[cfg(test)]
+    pub fn last_question(&self) -> Option<&str> {
+        self.messages.iter().rev().find_map(|m| if let Message::User(text, _) = m { Some(text.as_str()) } else { None })
+    }
+
     pub fn busy(&self) -> bool {
         self.busy
     }

@@ -18,6 +18,7 @@ pub type Params = serde_json::Map<String, serde_json::Value>;
 pub const MAX_CODE_CHARS: usize = 20_000;
 pub const MAX_LABEL_CHARS: usize = 80;
 pub const MAX_PROMPT_CHARS: usize = 4_000;
+pub const MAX_WHY_CHARS: usize = 600;
 pub const MAX_FEATURES_PER_PART: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +96,10 @@ pub struct Feature {
     /// The prompt that produced this feature, shown on the timeline.
     #[serde(default)]
     pub prompt: String,
+    /// The design reason behind the feature, in one plain sentence, for someone new
+    /// to CAD. Written by the model, shown on the timeline and in the Inspector.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
     /// Snippet path relative to the project folder.
     pub file: String,
     #[serde(default)]
@@ -111,6 +116,7 @@ pub struct NewFeature {
     pub code: String,
     pub params: Params,
     pub prompt: String,
+    pub why: String,
     /// Insert after this feature id. None appends to the end.
     pub after: Option<String>,
 }
@@ -122,6 +128,7 @@ pub struct FeatureEdit {
     pub code: Option<String>,
     pub params: Option<Params>,
     pub prompt: Option<String>,
+    pub why: Option<String>,
 }
 
 /// A project plus where it lives, so it can be reloaded when files change.
@@ -374,6 +381,7 @@ impl LoadedProject {
     /// Returns the new feature's id.
     pub fn add_feature(&mut self, part_name: &str, new: NewFeature) -> Result<String> {
         check_feature_text(Some(&new.label), Some(&new.code), Some(&new.prompt))?;
+        check_why(Some(&new.why))?;
         let part = self.design_part_mut(part_name)?;
         if part.features.len() >= MAX_FEATURES_PER_PART {
             bail!("'{part_name}' already has {MAX_FEATURES_PER_PART} features, the most a part can hold");
@@ -406,6 +414,7 @@ impl LoadedProject {
                 id: id.clone(),
                 label: new.label,
                 prompt: new.prompt,
+                why: new.why.trim().to_owned(),
                 file,
                 params: new.params,
                 code: ensure_trailing_newline(new.code),
@@ -416,6 +425,7 @@ impl LoadedProject {
 
     pub fn edit_feature(&mut self, part_name: &str, id: &str, edit: FeatureEdit) -> Result<()> {
         check_feature_text(edit.label.as_deref(), edit.code.as_deref(), edit.prompt.as_deref())?;
+        check_why(edit.why.as_deref())?;
         let feature = self.feature_mut(part_name, id)?;
         if let Some(label) = edit.label {
             feature.label = label;
@@ -428,6 +438,9 @@ impl LoadedProject {
         }
         if let Some(prompt) = edit.prompt {
             feature.prompt = prompt;
+        }
+        if let Some(why) = edit.why {
+            feature.why = why.trim().to_owned();
         }
         Ok(())
     }
@@ -614,6 +627,13 @@ fn check_feature_text(label: Option<&str>, code: Option<&str>, prompt: Option<&s
     }
     if prompt.is_some_and(|p| p.chars().count() > MAX_PROMPT_CHARS) {
         bail!("the prompt is limited to {MAX_PROMPT_CHARS} characters");
+    }
+    Ok(())
+}
+
+fn check_why(why: Option<&str>) -> Result<()> {
+    if why.is_some_and(|w| w.chars().count() > MAX_WHY_CHARS) {
+        bail!("keep the why to one or two sentences ({MAX_WHY_CHARS} characters at most)");
     }
     Ok(())
 }
@@ -811,6 +831,29 @@ mod tests {
         // An unmoved part writes no placement at all.
         let text = std::fs::read_to_string(p.dir.join("project.json")).unwrap();
         assert_eq!(text.matches("\"position\"").count(), 1);
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn the_why_is_kept_and_old_projects_still_load() {
+        let mut p = temp_project("why");
+        p.add_part("P").unwrap();
+        let mut new = feature("Bore", None);
+        new.why = " Sized for an 8 mm rod with 0.2 mm clearance so it slides in. ".into();
+        let id = p.add_feature("P", new).unwrap();
+        p.save().unwrap();
+        let loaded = LoadedProject::load(&p.dir).unwrap();
+        assert_eq!(loaded.project.parts[0].features[0].why, "Sized for an 8 mm rod with 0.2 mm clearance so it slides in.");
+
+        let edit = FeatureEdit { why: Some("x".repeat(MAX_WHY_CHARS + 1)), ..Default::default() };
+        assert!(p.edit_feature("P", &id, edit).is_err());
+        let edit = FeatureEdit { why: Some(String::new()), ..Default::default() };
+        p.edit_feature("P", &id, edit).unwrap();
+        p.save().unwrap();
+        // An empty why isn't written, so project files stay as they were before it existed.
+        let text = std::fs::read_to_string(p.dir.join("project.json")).unwrap();
+        assert!(!text.contains("\"why\""), "{text}");
+        assert!(LoadedProject::load(&p.dir).is_ok());
         std::fs::remove_dir_all(&p.dir).unwrap();
     }
 

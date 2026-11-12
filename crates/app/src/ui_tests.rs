@@ -774,3 +774,21 @@ fn a_sketch_over_the_model_goes_to_the_chat() {
     click(&mut h, "Remove");
     assert!(h.state().state.chat.attached_sketch().is_none());
 }
+
+#[test]
+fn the_why_shows_on_the_timeline_and_in_the_inspector() {
+    let _one = one_at_a_time();
+    let project = example_project("why");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let why = "Leaves 3 mm of material round the bore so the clamp stays stiff.";
+    let edit = intercraft_core::FeatureEdit { why: Some(why.into()), ..Default::default() };
+    h.state_mut().state.edit_project(|p| p.edit_feature("RodBracket", "f040", edit).and_then(|()| p.save())).unwrap();
+    h.step();
+    h.step();
+    // Once on the step card and once in the Inspector, which follows the latest step.
+    assert_eq!(h.get_all_by_label_contains("so the clamp stays stiff").count(), 2);
+    h.get_by_label("Why:");
+    h.get_by_label_contains("Asked for: Round the vertical edges.");
+    shot(&mut h, "step_why");
+}

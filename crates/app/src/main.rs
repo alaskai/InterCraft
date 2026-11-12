@@ -382,7 +382,7 @@ impl State {
     /// Change the project the same way the tools do: under the project lock and
     /// starting from the files as they are now, so a change the model made a moment
     /// ago is never overwritten. Reloads afterwards.
-    fn edit_project<T>(&mut self, change: impl FnOnce(&mut LoadedProject) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    pub(crate) fn edit_project<T>(&mut self, change: impl FnOnce(&mut LoadedProject) -> anyhow::Result<T>) -> anyhow::Result<T> {
         let lock = intercraft_core::try_lock(&self.project_dir)?;
         if lock.is_none() {
             anyhow::bail!("the model is changing this project right now. Try again when it has finished");
@@ -1295,9 +1295,16 @@ impl State {
         ));
         ui.heading(&step.label);
         ui.weak(step.file);
+        if !step.why.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Why:");
+                ui.label(step.why);
+            });
+        }
         if !step.prompt.is_empty() {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(step.prompt).italics());
+            ui.label(egui::RichText::new(format!("Asked for: {}", step.prompt)).italics().weak());
         }
 
         if let Some(params) = step.params.filter(|p| !p.is_empty()) {
@@ -1408,11 +1415,13 @@ impl State {
                         if let Some(text) = entry.and_then(|e| volume_delta(&e.result)) {
                             ui.weak(text);
                         }
-                        let prompt = if step.prompt.is_empty() { "(no prompt recorded)" } else { step.prompt };
-                        let text = egui::RichText::new(shorten(prompt, 90)).italics().weak();
+                        // The reason teaches more than the request, so it wins when there is one.
+                        let shown = [step.why, step.prompt].into_iter().find(|t| !t.is_empty()).unwrap_or("(no prompt recorded)");
+                        let text = egui::RichText::new(shorten(shown, 90)).italics().weak();
                         ui.add(egui::Label::new(text).wrap());
                     });
-                    let response = if step.prompt.is_empty() { response } else { response.on_hover_text(step.prompt) };
+                    let hover = [step.why, step.prompt].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
+                    let response = if hover.is_empty() { response } else { response.on_hover_text(hover) };
                     if response.clicked() {
                         clicked = Some(if selected { None } else { Some(step.id.to_owned()) });
                     }
@@ -1624,6 +1633,8 @@ struct Step<'a> {
     id: &'a str,
     label: String,
     prompt: &'a str,
+    /// The design reason, if the model gave one.
+    why: &'a str,
     file: &'a str,
     params: Option<&'a intercraft_core::Params>,
     /// The snippet. An imported shape has none.
@@ -1638,6 +1649,7 @@ fn steps(part: &Part) -> Vec<Step<'_>> {
             id: intercraft_geo::IMPORT_STEP_ID,
             label: format!("Imported {name}"),
             prompt: "Starting shape from an imported STEP file.",
+            why: "",
             file: source,
             params: None,
             code: None,
@@ -1647,6 +1659,7 @@ fn steps(part: &Part) -> Vec<Step<'_>> {
         id: &f.id,
         label: f.label.clone(),
         prompt: &f.prompt,
+        why: &f.why,
         file: &f.file,
         params: Some(&f.params),
         code: Some(&f.code),

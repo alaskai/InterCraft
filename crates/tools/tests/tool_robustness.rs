@@ -388,3 +388,23 @@ fn check_fit_finds_clashes_and_gaps() {
     assert_eq!(fit["pairs"][0]["status"], "touching", "{fit}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_why_travels_through_the_tools() {
+    if !worker_available() {
+        return;
+    }
+    let _one = one_at_a_time();
+    let (mut host, dir) = project("why");
+    host.call("add_part", &json!({ "name": "P" })).unwrap();
+    let why = "Thick enough to print strong walls.";
+    host.call("add_feature", &json!({ "part": "P", "label": "Body", "code": "part = Box(10, 10, 4)", "why": why })).unwrap();
+    let project = host.call("get_project", &json!({})).unwrap();
+    assert_eq!(project["parts"][0]["features"][0]["why"], why);
+    let long = "x".repeat(700);
+    assert!(host.call("edit_feature", &json!({ "part": "P", "feature_id": "f010", "why": long })).is_err());
+    host.call("edit_feature", &json!({ "part": "P", "feature_id": "f010", "why": "Changed." })).unwrap();
+    let project = host.call("get_project", &json!({})).unwrap();
+    assert_eq!(project["parts"][0]["features"][0]["why"], "Changed.");
+    let _ = std::fs::remove_dir_all(&dir);
+}

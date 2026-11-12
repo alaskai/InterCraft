@@ -969,6 +969,42 @@ fn the_chat_shows_what_replies_cost() {
 }
 
 #[test]
+fn several_questions_in_one_reply_are_answered_together() {
+    let _one = one_at_a_time();
+    let project = example_project("questions");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let chat = &mut h.state_mut().state.chat;
+    chat.use_server("http://127.0.0.1:9/v1", "test-model");
+
+    let ask = |id: &str, question: &str, a: &str, b: &str| {
+        let input = serde_json::json!({ "question": question, "options": [{ "label": a }, { "label": b }] });
+        intercraft_llm::ChatEvent::ToolStarted { id: id.into(), name: "ask_user".into(), input }
+    };
+    let shown = |id: &str| intercraft_llm::ChatEvent::ToolFinished {
+        id: id.into(),
+        ok: true,
+        output: serde_json::json!({ "shown": true }),
+    };
+    chat.inject(ask("q1", "What will hold it to the wall?", "Two screws", "Adhesive strip"));
+    chat.inject(shown("q1"));
+    chat.inject(ask("q2", "How will it be made?", "3D printed", "Cut from wood"));
+    chat.inject(shown("q2"));
+    chat.inject(intercraft_llm::ChatEvent::Done);
+    h.step();
+    h.step();
+
+    // One answer is not enough to send.
+    click(&mut h, "Two screws");
+    assert!(h.state().state.chat.last_question().is_none());
+    shot(&mut h, "two_questions");
+
+    click(&mut h, "3D printed");
+    let sent = h.state().state.chat.last_question().unwrap_or_default().to_owned();
+    assert_eq!(sent, "What will hold it to the wall? Two screws\nHow will it be made? 3D printed");
+}
+
+#[test]
 fn design_terms_and_parameter_names_are_explained() {
     let _one = one_at_a_time();
     let _restore = RestoreExperience;

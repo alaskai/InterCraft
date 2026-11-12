@@ -96,5 +96,29 @@ class SandboxTests(unittest.TestCase):
         self.assertAlmostEqual(part.volume, 21861.13, places=1)
 
 
+
+class StandardPartsStayInsideTheSandbox(unittest.TestCase):
+    """The parts library is reachable only through its two functions."""
+
+    def test_parts_build_and_tables_answer(self):
+        ns = sandbox.build_namespace()
+        shape = sandbox.run('part = standard_part("hex nut", "M4")', None, {}, ns, "t")
+        self.assertGreater(shape.volume, 0)
+        self.assertEqual(type(shape).__module__.split(".")[0], "build123d", "a plain build123d shape")
+        self.assertAlmostEqual(sandbox.run('part = Box(1, 1, clearance_hole("M3"))', None, {}, ns, "t").volume, 3.4)
+
+    def test_no_way_back_to_the_library(self):
+        ns = sandbox.build_namespace()
+        escapes = [
+            "part = standard_part.__globals__",
+            "part = clearance_hole.__code__",
+            "import bd_warehouse",
+            "part = standard_part('hex nut', 'M4').__class__",
+            "part = standard_part('hex nut', 'M4').export_step('x.step')",
+        ]
+        for code in escapes:
+            with self.assertRaises(sandbox.SnippetRejected, msg=code):
+                sandbox.check(code)
+
 if __name__ == "__main__":
     unittest.main()

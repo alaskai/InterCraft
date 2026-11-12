@@ -80,6 +80,8 @@ pub enum GeoEvent {
     Measured { id: u64, data: serde_json::Value },
     Inspected { id: u64, data: serde_json::Value },
     Fitted { id: u64, data: serde_json::Value },
+    /// An answer that isn't about a shape, such as fastener sizes.
+    Info { id: u64, data: serde_json::Value },
     Error {
         #[serde(default)]
         id: Option<u64>,
@@ -238,6 +240,7 @@ impl PythonWorker {
                 | GeoEvent::Measured { .. }
                 | GeoEvent::Inspected { .. }
                 | GeoEvent::Fitted { .. }
+                | GeoEvent::Info { .. }
                 | GeoEvent::Error { .. }
         ) {
             self.in_flight = self.in_flight.saturating_sub(1);
@@ -328,12 +331,21 @@ impl PythonWorker {
         self.wait_for(id)
     }
 
+    /// Real sizes for a metric screw size ("M4"): clearance holes, tap drill, head,
+    /// nut and heat-set insert, from the ISO tables in bd_warehouse.
+    pub fn fastener_info_blocking(&mut self, size: &str) -> Result<serde_json::Value> {
+        let id = self.next_id;
+        self.send(serde_json::json!({ "cmd": "fastener_info", "size": size }))?;
+        self.wait_for(id)
+    }
+
     fn wait_for(&mut self, id: u64) -> Result<serde_json::Value> {
         loop {
             match self.recv_blocking()? {
                 GeoEvent::Measured { id: got, data }
                 | GeoEvent::Inspected { id: got, data }
                 | GeoEvent::Fitted { id: got, data }
+                | GeoEvent::Info { id: got, data }
                     if got == id =>
                 {
                     return Ok(data)

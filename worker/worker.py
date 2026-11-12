@@ -22,6 +22,7 @@ sys.stdout = sys.stderr
 import numpy as np
 import build123d
 
+import parts_library
 import sandbox
 
 LINEAR_TOL = 0.05  # mm
@@ -405,6 +406,8 @@ def main():
                 inspect(req)
             elif req.get("cmd") == "fit":
                 fit(req)
+            elif req.get("cmd") == "fastener_info":
+                send({"id": req["id"], "event": "info", "data": parts_library.fastener_info(str(req["size"]))})
             else:
                 send({"id": req.get("id"), "event": "error", "error": f"unknown cmd {req.get('cmd')}"})
         except Exception as e:

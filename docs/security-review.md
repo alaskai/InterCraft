@@ -25,7 +25,7 @@ Grading scale: **A** no known weakness worth fixing, **B** weaknesses with limit
 | Chat clients (reliability) | C | A | None found in 34 stress scenarios |
 | MCP server | C | A- | Trusts any local process that can start it |
 | Chat display (Markdown) | B | A- | Links open in the browser when clicked |
-| Repository and dependencies | B | B | No automated dependency audit |
+| Repository and dependencies | B | B+ | Advisories still need acting on when CI reports them |
 
 ## Findings
 
@@ -127,7 +127,7 @@ A fake `claude` binary in `claude_code_stress.rs` checks every one of these flag
 1. **The sandbox runs inside Python.** It blocks every escape tested, but CPython was not designed as a security boundary, and the worker still runs as the user with network access. The next step is OS-level isolation: run the worker under a restricted token or AppContainer on Windows (or a separate low-privilege account), and block its network access.
 2. **The memory cap and the stuck-build watchdog are Windows only.** macOS and Linux need equivalents (`setrlimit`, cgroups) before release there.
 3. **Prompt injection.** Labels, prompts and code from a shared project reach the model. The worst a manipulated model can do is edit or delete features and design parts in the open project. Since PR #6 every change is recorded in an undo history (the last 200 changes), so the damage can be undone from Edit > History. The model can't delete reference parts. History snapshots are checked like `project.json` before they are restored, so a crafted snapshot can't write outside the project.
-4. **No dependency audit.** `cargo audit` and `pip-audit` have not been run, and there is no CI. Only build123d and numpy are pinned on the Python side, not their own dependencies. Adding CI with both audits and a Python lock file is the fix.
+4. **Dependency advisories.** Addressed: CI now runs `cargo audit` and `pip-audit` on every push, on every pull request and once a week, and `worker/requirements.lock` pins every Python package, not only build123d and numpy. What remains is acting on an advisory when one appears.
 5. **Local files can be changed by local programs.** Any program running as the user can edit `active_project.txt` to point an MCP client at another folder, or read the credential store. This needs local access already, so it is rated low.
 6. **The key stays in memory as plain text** while the app runs and is not cleared afterwards. Low impact.
 7. **Imported STEP files are parsed by OpenCascade** in the geometry worker. A malformed file can crash the worker, which then restarts, and parser bugs in large C++ libraries are a known class of problem. Imports are limited to `.step` and `.stp` files under 200 MB that the user picks, are copied into the project's `imports` folder, and are checked again by the worker. Only import files from people you trust.

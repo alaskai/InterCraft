@@ -1,0 +1,91 @@
+# Runs the test suites and audits the dependencies.
+# Windows, because the worker limits and the credential store are Windows code paths.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Mondays 06:00 UTC, so new advisories show up even when nothing is pushed.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: worker/requirements.lock
+      - name: Install the geometry worker's packages
+        run: python -m pip install -r worker/requirements.lock
+      - name: Point the tests at this Python
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          "INTERCRAFT_PYTHON=$python" >> $env:GITHUB_ENV
+      - name: Rust tests
+        run: cargo test --workspace --locked
+      - name: Sandbox escape tests
+        run: python -m unittest worker/test_sandbox.py
+      - name: Collect the UI screenshots when a test fails
+        if: failure()
+        shell: pwsh
+        run: |
+          $shots = Join-Path $env:TEMP "intercraft-ui"
+          if (Test-Path $shots) { Copy-Item $shots -Destination ui-screenshots -Recurse }
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ui-screenshots
+          path: ui-screenshots
+          if-no-files-found: ignore
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Rust advisories
+        run: cargo audit
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Python advisories
+        run: |
+          python -m pip install pip-audit
+          pip-audit --requirement worker/requirements.lock --no-deps --disable-pip
+
+  history:
+    name: Commit messages
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: No tool attribution lines
+        run: |
+          range="origin/${{ github.base_ref }}..HEAD"
+          if git log --format=%B "$range" | grep -inE "co-authored-by:.*(claude|anthropic)|generated with"; then
+            echo "A commit message carries an attribution trailer. Reword it."
+            exit 1
+          fi

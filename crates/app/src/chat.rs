@@ -232,6 +232,19 @@ impl ChatPanel {
         self.settings.openai_model = model.to_owned();
     }
 
+    /// Put text in the message box (after anything already typed) for the user to send.
+    pub fn add_to_input(&mut self, text: &str) {
+        if !self.input.is_empty() && !self.input.ends_with('\n') {
+            self.input.push('\n');
+        }
+        self.input.push_str(text);
+    }
+
+    #[cfg(test)]
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
     /// One line describing the chat setup, for the panel header.
     pub fn summary(&self) -> String {
         match self.settings.provider {

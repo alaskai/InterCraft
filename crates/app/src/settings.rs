@@ -21,6 +21,8 @@ pub enum Provider {
     Anthropic,
     /// The user's own Claude Code install, signed in with their subscription.
     ClaudeCode,
+    /// Any server with an OpenAI-style API: OpenAI, OpenRouter, Ollama, LM Studio.
+    OpenAi,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,11 @@ pub struct Settings {
     pub effort: String,
     /// Alias for Claude Code's --model, empty for the user's own default.
     pub claude_code_model: String,
+    /// Server address for the OpenAI-compatible route, up to and including /v1.
+    pub openai_base_url: String,
+    pub openai_model: String,
+    /// That model can read images, so it gets `view_model` pictures.
+    pub openai_vision: bool,
     /// Most recent first.
     pub recent_projects: Vec<String>,
     /// "system", "dark" or "light".
@@ -47,6 +54,9 @@ impl Default for Settings {
             // Multi-step tool work does better above the model's default effort.
             effort: "high".to_owned(),
             claude_code_model: String::new(),
+            openai_base_url: intercraft_llm::OPENAI_PRESETS[0].1.to_owned(),
+            openai_model: String::new(),
+            openai_vision: false,
             recent_projects: Vec::new(),
             theme: "system".to_owned(),
         }
@@ -131,5 +141,55 @@ pub fn clear_api_key() -> anyhow::Result<()> {
     match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Credential store entry for an OpenAI-compatible server. Each server gets its own
+/// entry, so the key saved for one service is never sent to another.
+fn server_key_user(base_url: &str) -> String {
+    let rest = base_url.trim().split_once("://").map_or(base_url.trim(), |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default().to_ascii_lowercase();
+    format!("api-key:{host}")
+}
+
+pub fn load_server_key(base_url: &str) -> String {
+    keyring::Entry::new(KEYRING_SERVICE, &server_key_user(base_url))
+        .and_then(|e| e.get_password())
+        .map(|key| key.trim().to_owned())
+        .unwrap_or_default()
+}
+
+pub fn save_server_key(base_url: &str, key: &str) -> anyhow::Result<()> {
+    keyring::Entry::new(KEYRING_SERVICE, &server_key_user(base_url))?.set_password(key.trim())?;
+    Ok(())
+}
+
+pub fn clear_server_key(base_url: &str) -> anyhow::Result<()> {
+    match keyring::Entry::new(KEYRING_SERVICE, &server_key_user(base_url))?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_server_has_its_own_key_entry() {
+        assert_eq!(server_key_user("https://api.openai.com/v1"), "api-key:api.openai.com");
+        assert_eq!(server_key_user(" https://API.OpenAI.com/v1/ "), "api-key:api.openai.com");
+        assert_eq!(server_key_user("http://localhost:11434/v1"), "api-key:localhost:11434");
+        assert_ne!(server_key_user("https://openrouter.ai/api/v1"), server_key_user("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn old_settings_files_still_load() {
+        let old = r#"{"provider":"claude_code","model":"claude-opus-5-5","effort":"high"}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(settings.provider, Provider::ClaudeCode);
+        assert_eq!(settings.openai_base_url, "https://api.openai.com/v1");
+        let new: Settings = serde_json::from_str(r#"{"provider":"open_ai"}"#).unwrap();
+        assert_eq!(new.provider, Provider::OpenAi);
     }
 }

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use eframe::egui;
 use intercraft_llm::{
     claude_code_version, AnthropicChat, AnthropicSettings, Cancelled, ChatEvent, ChatSession,
-    ClaudeCodeChat, ClaudeCodeSettings, ToolDef, ToolExecutor, Usage, ANTHROPIC_MODELS,
-    CLAUDE_CODE_MODELS,
+    ClaudeCodeChat, ClaudeCodeSettings, OpenAiChat, OpenAiSettings, ToolDef, ToolExecutor, Usage,
+    ANTHROPIC_MODELS, CLAUDE_CODE_MODELS, OPENAI_PRESETS,
 };
 use intercraft_tools::ToolHost;
 use serde_json::Value;
@@ -30,6 +30,7 @@ struct Config {
     provider: Provider,
     anthropic: AnthropicSettings,
     claude_code: ClaudeCodeSettings,
+    openai: OpenAiSettings,
 }
 
 /// Said to the model in Claude Code sessions, on top of the MCP server's own guide.
@@ -75,6 +76,8 @@ pub struct ChatPanel {
     api_key: String,
     key_source: KeySource,
     key_input: String,
+    /// Key for the OpenAI-compatible server currently set, if one is saved.
+    server_key: String,
     /// Set when the user asks for the Settings window from the chat panel.
     pub wants_settings: bool,
     settings_error: Option<String>,
@@ -95,6 +98,10 @@ impl ChatPanel {
     pub fn new(ctx: egui::Context, project_dir: PathBuf) -> Self {
         let (api_key, key_source) = settings::load_api_key();
         let settings = Settings::load();
+        let server_key = match settings.provider {
+            Provider::OpenAi => settings::load_server_key(&settings.openai_base_url),
+            _ => String::new(),
+        };
         let claude_code = (settings.provider == Provider::ClaudeCode).then(claude_code_version);
         let panel = Self {
             project_dir,
@@ -103,6 +110,7 @@ impl ChatPanel {
             api_key,
             key_source,
             key_input: String::new(),
+            server_key,
             settings_error: None,
             claude_code,
             worker: None,
@@ -122,6 +130,11 @@ impl ChatPanel {
         match self.settings.provider {
             Provider::Anthropic => !self.api_key.is_empty(),
             Provider::ClaudeCode => matches!(self.claude_code, Some(Some(_))),
+            // A local server needs no key, so the address and model are enough.
+            Provider::OpenAi => {
+                intercraft_llm::completions_url(&self.settings.openai_base_url).is_ok()
+                    && !self.settings.openai_model.trim().is_empty()
+            }
         }
     }
 
@@ -149,6 +162,18 @@ impl ChatPanel {
                 model: self.settings.claude_code_model.clone(),
                 extra_prompt: CLAUDE_CODE_PROMPT.to_owned(),
             },
+            openai: OpenAiSettings {
+                base_url: self.settings.openai_base_url.clone(),
+                // Looked up for this exact address every time, so a key can never go
+                // to a server other than the one it was saved for.
+                api_key: match self.settings.provider {
+                    Provider::OpenAi => settings::load_server_key(&self.settings.openai_base_url),
+                    _ => String::new(),
+                },
+                model: self.settings.openai_model.trim().to_owned(),
+                system: intercraft_tools::GUIDE.to_owned(),
+                vision: self.settings.openai_vision,
+            },
         }
     }
 
@@ -173,6 +198,9 @@ impl ChatPanel {
             s.model = mine.model.clone();
             s.effort = mine.effort.clone();
             s.claude_code_model = mine.claude_code_model.clone();
+            s.openai_base_url = mine.openai_base_url.clone();
+            s.openai_model = mine.openai_model.clone();
+            s.openai_vision = mine.openai_vision;
         });
         if let Err(e) = saved {
             self.settings_error = Some(format!("Couldn't save settings: {e:#}"));
@@ -197,6 +225,13 @@ impl ChatPanel {
         self.messages.push(Message::Notice(format!("Opened {name}. This is a new conversation.")));
     }
 
+    #[cfg(test)]
+    pub fn use_server(&mut self, base_url: &str, model: &str) {
+        self.settings.provider = Provider::OpenAi;
+        self.settings.openai_base_url = base_url.to_owned();
+        self.settings.openai_model = model.to_owned();
+    }
+
     /// One line describing the chat setup, for the panel header.
     pub fn summary(&self) -> String {
         match self.settings.provider {
@@ -211,6 +246,14 @@ impl ChatPanel {
                 "" => "Claude Code · default model".to_owned(),
                 alias => format!("Claude Code · {}", claude_code_model_name(alias)),
             },
+            Provider::OpenAi => {
+                let url = &self.settings.openai_base_url;
+                let server = OPENAI_PRESETS.iter().find(|(_, preset)| preset == url).map_or(url.as_str(), |(name, _)| name);
+                match self.settings.openai_model.trim() {
+                    "" => format!("{server} · no model chosen"),
+                    model => format!("{model} · {server}"),
+                }
+            }
         }
     }
 
@@ -395,6 +438,8 @@ impl ChatPanel {
                 if self.messages.is_empty() {
                     if self.settings.provider == Provider::Anthropic && !self.ready() {
                         subscription_help(ui);
+                    } else if self.settings.provider == Provider::OpenAi && !self.ready() {
+                        ui.weak("Open Settings and set the server address and a model. Local servers (Ollama, LM Studio) need no API key.");
                     } else {
                         ui.weak("Ask for a part, for example: \"Make a 60 x 40 x 5 mm plate with four M4 holes 6 mm in from the corners.\"");
                     }
@@ -460,7 +505,7 @@ impl ChatPanel {
                     egui::ComboBox::from_id_salt("provider")
                         .selected_text(provider_name(self.settings.provider))
                         .show_ui(ui, |ui| {
-                            for provider in [Provider::Anthropic, Provider::ClaudeCode] {
+                            for provider in [Provider::Anthropic, Provider::ClaudeCode, Provider::OpenAi] {
                                 ui.selectable_value(&mut self.settings.provider, provider, provider_name(provider));
                             }
                         });
@@ -469,6 +514,9 @@ impl ChatPanel {
                         changed = true;
                         if self.settings.provider == Provider::ClaudeCode {
                             self.claude_code = Some(claude_code_version());
+                        }
+                        if self.settings.provider == Provider::OpenAi {
+                            self.server_key = settings::load_server_key(&self.settings.openai_base_url);
                         }
                         self.messages.push(Message::Notice(format!(
                             "Now using {}. It starts its own conversation and doesn't see the messages above.",
@@ -507,6 +555,11 @@ impl ChatPanel {
                             }
                         });
                         ui.end_row();
+                        return;
+                    }
+
+                    if self.settings.provider == Provider::OpenAi {
+                        changed |= self.server_settings(ui);
                         return;
                     }
 
@@ -574,10 +627,100 @@ impl ChatPanel {
     }
 }
 
+impl ChatPanel {
+    /// Settings rows for an OpenAI-compatible server. Returns true when something changed.
+    fn server_settings(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let mut new_server = false;
+
+        ui.label("Server");
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                let field = egui::TextEdit::singleline(&mut self.settings.openai_base_url)
+                    .hint_text("https://api.openai.com/v1")
+                    .desired_width((ui.available_width() - 70.0).max(60.0));
+                // Saved when the box is left, not on every key press.
+                new_server |= ui.add(field).lost_focus();
+                egui::ComboBox::from_id_salt("server_presets").selected_text("Pick").width(50.0).show_ui(ui, |ui| {
+                    for (name, url) in OPENAI_PRESETS {
+                        if ui.selectable_label(self.settings.openai_base_url == *url, *name).clicked() {
+                            self.settings.openai_base_url = (*url).to_owned();
+                            new_server = true;
+                        }
+                    }
+                });
+            });
+            if let Err(e) = intercraft_llm::completions_url(&self.settings.openai_base_url) {
+                ui.colored_label(ui.visuals().error_fg_color, capitalise(&format!("{e:#}")));
+            }
+        });
+        ui.end_row();
+
+        ui.label("Model");
+        let model = egui::TextEdit::singleline(&mut self.settings.openai_model).hint_text("The model's id on that server, e.g. gpt-5 or qwen3:14b");
+        changed |= ui.add(model).lost_focus();
+        ui.end_row();
+
+        ui.label("Images");
+        changed |= ui
+            .checkbox(&mut self.settings.openai_vision, "This model can read images")
+            .on_hover_text("Lets the model look at the part with view_model. Leave it off for text-only models.")
+            .changed();
+        ui.end_row();
+
+        ui.label("API key");
+        ui.vertical(|ui| {
+            ui.weak(if self.server_key.is_empty() {
+                "None saved for this server. Local servers don't need one."
+            } else {
+                "Saved for this server in the system credential store."
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.key_input)
+                        .password(true)
+                        .hint_text("sk-...")
+                        .desired_width((ui.available_width() - 70.0).max(60.0)),
+                );
+                let url = self.settings.openai_base_url.clone();
+                if ui.add_enabled(!self.key_input.trim().is_empty(), egui::Button::new("Save")).clicked() {
+                    match settings::save_server_key(&url, &self.key_input) {
+                        Ok(()) => {
+                            self.key_input.clear();
+                            self.settings_error = None;
+                            new_server = true;
+                        }
+                        Err(e) => self.settings_error = Some(format!("Couldn't save the key: {e:#}")),
+                    }
+                }
+                if !self.server_key.is_empty() && ui.button("Remove").clicked() {
+                    if let Err(e) = settings::clear_server_key(&url) {
+                        self.settings_error = Some(format!("Couldn't remove the key: {e:#}"));
+                    }
+                    new_server = true;
+                }
+            });
+        });
+        ui.end_row();
+
+        if new_server {
+            // Each server has its own key, so a key is never sent to a server it wasn't saved for.
+            self.server_key = settings::load_server_key(&self.settings.openai_base_url);
+        }
+        changed | new_server
+    }
+}
+
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
+
 fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Anthropic => "Anthropic API key",
         Provider::ClaudeCode => "Claude Code (your subscription)",
+        Provider::OpenAi => "OpenAI-compatible server",
     }
 }
 
@@ -870,13 +1013,14 @@ fn run_worker(
 ) {
     // Claude Code runs the tools itself, so only the API route needs a warm tool host.
     let mut host = ToolHost::new(dir).with_ask_user();
-    if config.provider == Provider::Anthropic {
+    if config.provider != Provider::ClaudeCode {
         host.warm_up();
     }
     let mut tools = HostTools(host);
     let mut provider = config.provider;
     let mut anthropic = AnthropicChat::new(config.anthropic);
     let mut claude_code = ClaudeCodeChat::new(config.claude_code);
+    let mut openai = OpenAiChat::new(config.openai);
 
     for command in commands {
         match command {
@@ -888,6 +1032,7 @@ fn run_worker(
                 let chat: &mut dyn ChatSession = match provider {
                     Provider::Anthropic => &mut anthropic,
                     Provider::ClaudeCode => &mut claude_code,
+                    Provider::OpenAi => &mut openai,
                 };
                 let reply = match chat.send(&text, &mut tools, &mut on_event, &cancel) {
                     Ok(()) => None,
@@ -902,11 +1047,13 @@ fn run_worker(
             Command::Reset => {
                 anthropic.reset();
                 claude_code.reset();
+                openai.reset();
             }
             Command::Configure(config) => {
                 provider = config.provider;
                 anthropic.update_settings(config.anthropic);
                 claude_code.update_settings(config.claude_code);
+                openai.update_settings(config.openai);
             }
         }
     }

@@ -160,7 +160,7 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `place_part` | Moves or turns a design part in the assembly |
 | `duplicate_part`, `rename_part` | Copies or renames a part |
 | `check_fit` | Clashes (with volume) and clearances between parts |
-| `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing one part |
+| `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing one part. The six side views are drawn flat, like a drawing |
 | `undo`, `redo` | Step back or forward through the project history |
 | `inspect_part` | Faces, holes and circular edges of a part with exact sizes and positions |
 | `measure` | Exact distance, angle, length or diameter between faces, edges, corners and points |

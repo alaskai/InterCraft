@@ -418,7 +418,7 @@ pub fn definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "view": { "type": "string", "enum": VIEWS, "description": "Camera direction. 'current' is what the user is looking at. Default iso." },
+                    "view": { "type": "string", "enum": VIEWS, "description": "Camera direction. The six side views are flat like a drawing, iso has perspective, and 'current' is what the user is looking at. Default iso." },
                     "part": { "type": "string", "description": "Show only this part. Omit to see the whole assembly." },
                     "section": {
                         "type": "object",
@@ -650,7 +650,11 @@ impl ToolHost {
                     "bottom" => "From below, looking up +Z. X runs to the right.",
                     _ => "The user's own view, with whatever they have hidden or cut.",
                 };
-                Ok(json!({ "view": view, "facing": facing, IMAGE_KEY: base64(&png) }))
+                let mut result = json!({ "view": view, "facing": facing, IMAGE_KEY: base64(&png) });
+                if !matches!(view, "iso" | "current") {
+                    result["projection"] = "Flat, without perspective: shapes keep their true proportions and you can't see the walls of a hole that runs straight through.".into();
+                }
+                Ok(result)
             }
             "check_fit" => {
                 let wanted: Option<Vec<&str>> =

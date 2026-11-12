@@ -658,7 +658,9 @@ impl State {
             _ => None,
         };
         let section = request.section.map(|(axis, offset, flip)| viewport::Section { axis, offset: offset as f32, flip });
-        let shot = viewport::Shot { direction, only: request.part.clone(), section };
+        // Side views are drawn flat, like a drawing. The angled ones keep perspective.
+        let flat = direction.is_some() && request.view != "iso";
+        let shot = viewport::Shot { direction, only: request.part.clone(), section, flat };
         let pixels = self.viewport.snapshot(&shot)?;
 
         let mut bytes = Vec::new();

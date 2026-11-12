@@ -5,6 +5,7 @@
 
 mod anthropic;
 mod claude_code;
+mod openai;
 mod sse;
 
 use std::sync::atomic::AtomicBool;
@@ -14,6 +15,7 @@ use serde_json::Value;
 
 pub use anthropic::{AnthropicChat, AnthropicSettings, ANTHROPIC_MODELS};
 pub use claude_code::{claude_code_version, ClaudeCodeChat, ClaudeCodeSettings, CLAUDE_CODE_MODELS};
+pub use openai::{completions_url, OpenAiChat, OpenAiSettings, OPENAI_PRESETS};
 
 /// A tool the model may call, in provider-neutral form.
 #[derive(Debug, Clone)]

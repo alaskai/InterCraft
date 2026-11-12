@@ -29,6 +29,8 @@ py -3.11 -m venv "$env:LOCALAPPDATA\InterCraft\venv"
 
 Set `INTERCRAFT_PYTHON` if you want to use a different interpreter.
 
+`workerequirements.lock` lists the exact version of every package in that environment. Install from it instead when you want the same versions CI tests and audits.
+
 If the repo sits in a synced folder (OneDrive, Dropbox), keep Cargo's build output outside it with a local `.cargo/config.toml` (not tracked by Git):
 
 ```toml
@@ -256,6 +258,8 @@ cargo test --workspace
 ```
 
 The suites include stress tests for both chat routes (a fake Messages API and a fake `claude`), sandbox escape attempts, and tool tests that use the real geometry worker. Those skip themselves when the Python environment isn't set up.
+
+Every push and pull request runs both suites on Windows in GitHub Actions, together with `cargo audit` and `pip-audit` on the dependencies. The audits also run every Monday.
 
 ## Roadmap
 

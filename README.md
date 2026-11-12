@@ -240,16 +240,22 @@ The suites include stress tests for both chat routes (a fake Messages API and a 
 
 ## Roadmap
 
-1. Viewer with live rebuild from files (done)
-2. Tool API and MCP server so an LLM can drive it (done)
-3. Built-in chat panel with the Anthropic API or your own Claude Code (done)
-4. Menus, project navigation, rich text and choice questions (done)
-5. STEP import, edge display, measuring tool, and inspect and measure tools for the model (done)
-6. OS-level isolation for the geometry worker
-8. Undo and history, hiding and deleting parts and steps (done)
-9. Editing parameters in the Inspector with a live preview (done)
-10. Section view, part placement, rename and duplicate, fit check, and pictures for the model (done)
-11. Reordering, renaming and editing the code of steps, and CI (done)
-12. OpenAI-compatible chat (OpenAI, OpenRouter, Ollama, LM Studio) (done)
-13. Sketch panel
-14. Before and after overlay
+Done:
+
+1. Viewer with live rebuild from files
+2. Tool API and MCP server so an LLM can drive it
+3. Built-in chat panel with the Anthropic API or your own Claude Code
+4. Menus, project navigation, rich text and choice questions
+5. STEP import, edge display, measuring tool, and inspect and measure tools for the model
+6. Undo and history, hiding and deleting parts and steps
+7. Editing parameters in the Inspector with a live preview
+8. Section view, part placement, rename and duplicate, fit check, and pictures for the model
+9. Reordering, renaming and editing the code of steps, and CI
+10. OpenAI-compatible chat (OpenAI, OpenRouter, Ollama, LM Studio)
+
+Next:
+
+- Sketch panel
+- OS-level isolation for the geometry worker
+- Memory cap and stuck-build watchdog on macOS and Linux
+- Before and after overlay

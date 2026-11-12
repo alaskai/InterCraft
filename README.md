@@ -56,6 +56,7 @@ To see the live update, leave the app open and change a value in `examples/brack
 |---|---|
 | Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it, click the eye to hide or show it, and right-click for Show only this, Show all, Rename, Duplicate, Lock, Unlock and Delete. Delete removes the selected part while the pointer is over the list. |
 | Timeline | The steps of the selected part, oldest first. Each card shows why the step is there (the design reason the model gave), or the prompt that made it. Click a step to see the part as it was then, or Latest to go back. Right-click a step to move it earlier or later, rename it or delete it. |
+| Brief | The project's design brief: what it is, how it will be made, key dimensions, decisions and open items. The model asks you about it for a new project and keeps it up to date. Edit brief changes it yourself. |
 | Sketch | A drawing pad for rough, annotated sketches that go to the model with a chat message, in a tab beside the 3D view. See Sketching below. |
 | Inspector | The selected step's design reason ("Why"), prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. "Why is it like this?" asks the model to explain the step in plain words, and right-clicking a part offers "Explain this part". Placement, at the top, moves and turns the selected part in the assembly the same way. Code shows the step's snippet. Edit it and press Apply (Ctrl+Enter) to save and rebuild, or Revert to drop the edit. |
 
@@ -179,6 +180,7 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `set_param` | Changes one dimension |
 | `move_feature` | Changes the order of a part's features |
 | `delete_feature` | Removes a feature |
+| `update_brief` | Replaces one section of the design brief |
 | `delete_part` | Removes a design part (reference parts can only be removed by you) |
 | `place_part` | Moves or turns a design part in the assembly |
 | `duplicate_part`, `rename_part` | Copies or renames a part |
@@ -200,6 +202,7 @@ A project is a folder with a `project.json` and one Python snippet per feature.
 ```
 examples/bracket/
   project.json            parts, feature order, labels, prompts, parameters
+  brief.md                the design brief, in Markdown
   .intercraft/history/    undo snapshots (not needed to share the project)
   .intercraft/view/       picture requests from the model, removed once answered
   RodBracket/

@@ -408,3 +408,22 @@ fn the_why_travels_through_the_tools() {
     assert_eq!(project["parts"][0]["features"][0]["why"], "Changed.");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_brief_is_read_and_updated_through_the_tools() {
+    if !worker_available() {
+        return;
+    }
+    let _one = one_at_a_time();
+    let (mut host, dir) = project("brief");
+    host.call("add_part", &json!({ "name": "P" })).unwrap();
+    let project = host.call("get_project", &json!({})).unwrap();
+    assert!(project["brief"].as_str().unwrap().contains("## Open items"), "a new project has the template");
+    let updated = host.call("update_brief", &json!({ "section": "Decisions", "text": "- 3 mm walls, for stiffness." })).unwrap();
+    assert!(updated["brief"].as_str().unwrap().contains("## Decisions\n\n- 3 mm walls, for stiffness."));
+    assert!(host.call("update_brief", &json!({ "section": "Decisions" })).is_err());
+    assert!(host.call("update_brief", &json!({ "section": "X", "text": "## Y" })).is_err());
+    let undone = host.call("undo", &json!({})).unwrap();
+    assert_eq!(undone["undone"], "Update the brief");
+    let _ = std::fs::remove_dir_all(&dir);
+}

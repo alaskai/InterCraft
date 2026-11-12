@@ -23,6 +23,11 @@ Writing a feature:
     part = part - Pos(0, 0, 5) * Cylinder(p["hole_d"] / 2, 50)
     part = fillet(part.edges().filter_by(Axis.Z), p["radius"])
 
+Design brief:
+- Every project has a brief (brief.md): what it is, how it will be made, key dimensions, decisions and open items. get_project includes it. Read it before designing.
+- If the brief is empty or still the blank template, start by asking the user about it with ask_user (2 to 4 short questions at a time: what it is for, what it attaches to or holds, rough size, how it will be made). Record the answers with update_brief.
+- Keep it current as you work: add each decision with its reason, record measured versus assumed dimensions, and keep a short list of open items. Update one section at a time.
+
 Working method:
 - Call get_project first. It returns every part, feature, snippet and current build numbers.
 - Every edit returns a build report. Check it before moving on: a cut must lower the volume, an addition must raise it, and the size must be what you intended.
@@ -354,6 +359,18 @@ pub fn definitions() -> Value {
             },
         },
         {
+            "name": "update_brief",
+            "description": "Replace one section of the project's design brief, or add it if missing. Sections are '## ' headings: What it is, How it will be made, Key dimensions, Decisions, Open items, or your own. Pass the section's full new text without its heading.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": { "type": "string", "description": "Heading of the section, e.g. 'Decisions'." },
+                    "text": { "type": "string", "description": "The section's new text, in Markdown. No '## ' headings inside it." },
+                },
+                "required": ["section", "text"],
+            },
+        },
+        {
             "name": "place_part",
             "description": "Move or turn a design part in the assembly without changing its features. Position is [x, y, z] in mm and rotation is [rx, ry, rz] in degrees about X, Y and Z, both absolute. Pass only the one you want to change.",
             "inputSchema": {
@@ -530,6 +547,7 @@ impl ToolHost {
                     "name": project.project.name,
                     "units": project.project.units,
                     "folder": project.dir,
+                    "brief": project.brief,
                     "parts": parts,
                 }))
             }
@@ -591,6 +609,11 @@ impl ToolHost {
                 project.delete_feature(part, text(args, "feature_id")?)?;
                 project.save()?;
                 self.build_report(project.part(part)?, false)
+            }
+            "update_brief" => {
+                project.update_brief_section(text(args, "section")?, text(args, "text")?)?;
+                project.save()?;
+                Ok(json!({ "brief": project.brief }))
             }
             "rename_part" => {
                 let (old, new) = (text(args, "part")?, text(args, "new_name")?);

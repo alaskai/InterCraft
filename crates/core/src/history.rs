@@ -64,6 +64,9 @@ pub(crate) struct Content {
     project: Project,
     /// Snippet file -> code.
     code: BTreeMap<String, String>,
+    /// Left out when empty, so snapshots from before briefs existed still match.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    brief: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -154,7 +157,7 @@ impl LoadedProject {
             .flat_map(|p| &p.features)
             .map(|f| (f.file.clone(), f.code.clone()))
             .collect();
-        Content { project: self.project.clone(), code }
+        Content { project: self.project.clone(), code, brief: self.brief.clone() }
     }
 
     pub(crate) fn content_key(&self) -> String {
@@ -264,7 +267,11 @@ impl LoadedProject {
             .filter(|f| !keep.contains(f.file.as_str()))
             .map(|f| dir.join(&f.file))
             .collect();
+        if snapshot.content.brief.chars().count() > crate::MAX_BRIEF_CHARS {
+            bail!("history entry {number} has an oversized brief");
+        }
         self.project = project;
+        self.brief = snapshot.content.brief;
         self.removed.extend(gone);
         self.write_files()?;
         self.remove_deleted();
@@ -287,6 +294,9 @@ fn describe(before: &Content, after: &Content) -> String {
         }
     }
     let mut changes = Vec::new();
+    if before.brief != after.brief {
+        changes.push("Update the brief".to_owned());
+    }
     if old.name != new.name {
         changes.push(format!("Rename project to '{}'", new.name));
     }

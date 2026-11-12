@@ -25,7 +25,7 @@ pub fn default_dock() -> DockState<Tab> {
     let tree = dock.main_surface_mut();
     let [centre, _right] = tree.split_right(NodeIndex::root(), 0.76, vec![Tab::Chat]);
     let [centre, left] = tree.split_left(centre, 0.22, vec![Tab::Parts]);
-    tree.split_below(left, 0.5, vec![Tab::Inspector]);
+    tree.split_below(left, 0.5, vec![Tab::Inspector, Tab::Brief]);
     tree.split_below(centre, 0.80, vec![Tab::Timeline]);
     dock
 }
@@ -255,6 +255,7 @@ impl App {
         for (tab, name) in [
             (Tab::Parts, "Parts"),
             (Tab::Inspector, "Inspector"),
+            (Tab::Brief, "Brief"),
             (Tab::Timeline, "Timeline"),
             (Tab::Chat, "Chat"),
             (Tab::Sketch, "Sketch"),

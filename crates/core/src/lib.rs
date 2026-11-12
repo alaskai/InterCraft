@@ -19,6 +19,27 @@ pub const MAX_CODE_CHARS: usize = 20_000;
 pub const MAX_LABEL_CHARS: usize = 80;
 pub const MAX_PROMPT_CHARS: usize = 4_000;
 pub const MAX_WHY_CHARS: usize = 600;
+/// The design brief is notes, not a document. A brief this long has stopped being useful.
+pub const MAX_BRIEF_CHARS: usize = 20_000;
+
+pub const BRIEF_FILE: &str = "brief.md";
+
+/// What a new project's brief starts as. The model fills it in with the user.
+pub const BRIEF_TEMPLATE: &str = "# Brief
+
+## What it is
+
+## How it will be made
+
+## Key dimensions
+
+| Feature | Value | Source |
+|---|---|---|
+
+## Decisions
+
+## Open items
+";
 pub const MAX_FEATURES_PER_PART: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +161,9 @@ pub struct LoadedProject {
     removed: Vec<PathBuf>,
     /// The project as last loaded or saved (JSON), to tell what a save changed.
     baseline: String,
+    /// The design brief (`brief.md`): what the project is for, how it will be made,
+    /// key dimensions, decisions and open items. Empty when there isn't one.
+    pub brief: String,
 }
 
 impl LoadedProject {
@@ -156,21 +180,71 @@ impl LoadedProject {
             feature.code =
                 std::fs::read_to_string(&path).with_context(|| format!("reading snippet {}", path.display()))?;
         }
-        Ok(Self::from_project(dir, project))
+        let brief = read_brief(dir)?;
+        Ok(Self::from_project(dir, project, brief))
     }
 
-    fn from_project(dir: &Path, project: Project) -> Self {
-        let mut loaded = Self { dir: dir.to_path_buf(), project, removed: Vec::new(), baseline: String::new() };
+    fn from_project(dir: &Path, project: Project, brief: String) -> Self {
+        let mut loaded = Self { dir: dir.to_path_buf(), project, removed: Vec::new(), baseline: String::new(), brief };
         loaded.baseline = loaded.content_key();
         loaded
     }
 
-    /// Start an empty project in `dir` and write it to disk.
+    /// Start an empty project in `dir`, with a blank brief, and write it to disk.
     pub fn create(dir: &Path, name: &str) -> Result<Self> {
         let project = Project { name: name.to_owned(), units: default_units(), parts: Vec::new() };
-        let loaded = Self::from_project(dir, project);
+        let loaded = Self::from_project(dir, project, BRIEF_TEMPLATE.to_owned());
         loaded.write_files()?;
         Ok(loaded)
+    }
+
+    /// Replace the text under one `## heading` of the brief, or add the section at the
+    /// end if it isn't there. The heading match ignores case. Call `save` afterwards.
+    pub fn update_brief_section(&mut self, heading: &str, body: &str) -> Result<()> {
+        let heading = heading.trim().trim_start_matches('#').trim();
+        if heading.is_empty() || heading.chars().count() > 80 || heading.contains('\n') {
+            bail!("a brief section heading must be one line of 1 to 80 characters");
+        }
+        let body = body.trim();
+        if body.lines().any(|line| line.starts_with("## ")) {
+            bail!("the section text can't contain its own '## ' headings; update one section at a time");
+        }
+        let mut brief = if self.brief.trim().is_empty() { BRIEF_TEMPLATE.to_owned() } else { self.brief.clone() };
+        let lines: Vec<&str> = brief.lines().collect();
+        let is_heading = |line: &str| line.strip_prefix("## ").is_some_and(|h| h.trim().eq_ignore_ascii_case(heading));
+        let section = |heading: &str| if body.is_empty() { format!("## {heading}\n") } else { format!("## {heading}\n\n{body}\n") };
+        brief = match lines.iter().position(|l| is_heading(l)) {
+            Some(start) => {
+                // Keep the heading as it was written, whatever case the caller used.
+                let existing = lines[start].trim_start_matches("## ").trim();
+                let end = lines[start + 1..].iter().position(|l| l.starts_with("## ")).map_or(lines.len(), |i| start + 1 + i);
+                let before = lines[..start].join("\n");
+                let after = lines[end..].join("\n");
+                let mut text = String::new();
+                if !before.is_empty() {
+                    text += &before;
+                    text += "\n";
+                }
+                text += &section(existing);
+                if !after.is_empty() {
+                    text += "\n";
+                    text += &after;
+                    text += "\n";
+                }
+                text
+            }
+            None => format!("{}\n\n{}", brief.trim_end(), section(heading)),
+        };
+        self.set_brief(brief)
+    }
+
+    /// Replace the whole brief. Call `save` afterwards.
+    pub fn set_brief(&mut self, text: String) -> Result<()> {
+        if text.chars().count() > MAX_BRIEF_CHARS {
+            bail!("the brief is limited to {MAX_BRIEF_CHARS} characters; keep it to notes");
+        }
+        self.brief = text;
+        Ok(())
     }
 
     /// Write changed snippets first, then project.json, then remove deleted snippets.
@@ -200,6 +274,11 @@ impl LoadedProject {
             for feature in &part.features {
                 write_if_changed(&self.dir.join(&feature.file), &feature.code)?;
             }
+        }
+        // No brief and no file: nothing to write. A brief that was cleared is kept as an empty file.
+        let brief_path = self.dir.join(BRIEF_FILE);
+        if !self.brief.is_empty() || brief_path.exists() {
+            write_if_changed(&brief_path, &self.brief)?;
         }
         let manifest = serde_json::to_string_pretty(&self.project)? + "\n";
         write_if_changed(&self.dir.join("project.json"), &manifest)
@@ -501,7 +580,7 @@ impl LoadedProject {
 
     /// Every file that should trigger a rebuild when it changes.
     pub fn watched_files(&self) -> Vec<PathBuf> {
-        let mut files = vec![self.dir.join("project.json")];
+        let mut files = vec![self.dir.join("project.json"), self.dir.join(BRIEF_FILE)];
         for part in &self.project.parts {
             if let Some(source) = &part.source {
                 files.push(self.dir.join(source));
@@ -520,6 +599,17 @@ impl LoadedProject {
             .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
             .max()
     }
+}
+
+/// The project's brief, or an empty string when it has none.
+fn read_brief(dir: &Path) -> Result<String> {
+    let path = dir.join(BRIEF_FILE);
+    let Ok(meta) = std::fs::metadata(&path) else { return Ok(String::new()) };
+    // Four bytes a character at most, so this is a safe upper bound before reading.
+    if meta.len() > (MAX_BRIEF_CHARS * 4) as u64 {
+        bail!("{} is too large to be a brief", path.display());
+    }
+    std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
 }
 
 /// Hold the returned file while changing a project, so the viewer and MCP clients
@@ -854,6 +944,46 @@ mod tests {
         let text = std::fs::read_to_string(p.dir.join("project.json")).unwrap();
         assert!(!text.contains("\"why\""), "{text}");
         assert!(LoadedProject::load(&p.dir).is_ok());
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn the_brief_is_written_updated_by_section_and_reloaded() {
+        let mut p = temp_project("brief");
+        assert_eq!(std::fs::read_to_string(p.dir.join(BRIEF_FILE)).unwrap(), BRIEF_TEMPLATE, "new projects get the template");
+
+        p.update_brief_section("What it is", "A wall mount for a 25 mm broom handle.").unwrap();
+        p.update_brief_section("open ITEMS", "- Wall screw size not confirmed").unwrap();
+        p.update_brief_section("Print settings", "0.2 mm layers, PLA").unwrap();
+        p.save().unwrap();
+        let loaded = LoadedProject::load(&p.dir).unwrap();
+        let brief = &loaded.brief;
+        assert!(brief.contains("## What it is\n\nA wall mount for a 25 mm broom handle.\n\n## How it will be made"), "{brief}");
+        assert!(brief.contains("## Open items\n\n- Wall screw size not confirmed\n"), "{brief}");
+        assert!(brief.trim_end().ends_with("## Print settings\n\n0.2 mm layers, PLA"), "{brief}");
+        assert_eq!(brief.matches("## What it is").count(), 1);
+
+        assert!(p.update_brief_section("", "x").is_err());
+        assert!(p.update_brief_section("Decisions", "## Sneaky\nmore").is_err());
+        assert!(p.set_brief("x".repeat(MAX_BRIEF_CHARS + 1)).is_err());
+
+        // The brief is part of the undo history.
+        let mut q = LoadedProject::load(&p.dir).unwrap();
+        q.undo().unwrap();
+        let back = LoadedProject::load(&p.dir).unwrap();
+        assert!(!back.brief.contains("broom"), "{}", back.brief);
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn a_project_without_a_brief_gets_no_file() {
+        let p = temp_project("nobrief");
+        std::fs::remove_file(p.dir.join(BRIEF_FILE)).unwrap();
+        let mut loaded = LoadedProject::load(&p.dir).unwrap();
+        assert!(loaded.brief.is_empty());
+        loaded.add_part("A").unwrap();
+        loaded.save().unwrap();
+        assert!(!p.dir.join(BRIEF_FILE).exists());
         std::fs::remove_dir_all(&p.dir).unwrap();
     }
 

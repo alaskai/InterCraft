@@ -25,6 +25,57 @@ pub enum Provider {
     OpenAi,
 }
 
+/// How much the app and the model explain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Explain {
+    /// New to CAD: every action and term explained in plain words.
+    Beginner,
+    #[default]
+    Standard,
+    /// Knows CAD: numbers and decisions, no explanations of the basics.
+    Expert,
+}
+
+impl Explain {
+    pub const ALL: [Explain; 3] = [Explain::Beginner, Explain::Standard, Explain::Expert];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Explain::Beginner => "Beginner",
+            Explain::Standard => "Standard",
+            Explain::Expert => "Expert",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Explain::Beginner => "Every action and design term explained in plain words",
+            Explain::Standard => "Short explanations of design choices",
+            Explain::Expert => "Terse: numbers and decisions only",
+        }
+    }
+
+    /// Added to the model's instructions.
+    pub fn model_note(self) -> &'static str {
+        match self {
+            Explain::Beginner => "The user is new to CAD. As you work, explain each step in plain words, and briefly explain any design term (fillet, clearance, boss and so on) the first time you use it. Keep explanations short.",
+            Explain::Standard => "Explain design choices briefly as you go.",
+            Explain::Expert => "The user knows CAD. Be terse: give the numbers and decisions, and skip explanations of basic terms.",
+        }
+    }
+}
+
+/// How much of the interface shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Layout {
+    /// Chat and the 3D view first. Code, file paths and raw parameter names hidden.
+    Simple,
+    #[default]
+    Advanced,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -42,6 +93,10 @@ pub struct Settings {
     pub recent_projects: Vec<String>,
     /// "system", "dark" or "light".
     pub theme: String,
+    pub explain: Explain,
+    pub layout: Layout,
+    /// The first-run question ("new to CAD or not?") has been answered.
+    pub onboarded: bool,
 }
 
 const MAX_RECENT: usize = 8;
@@ -59,6 +114,9 @@ impl Default for Settings {
             openai_vision: false,
             recent_projects: Vec::new(),
             theme: "system".to_owned(),
+            explain: Explain::default(),
+            layout: Layout::default(),
+            onboarded: false,
         }
     }
 }
@@ -181,6 +239,16 @@ mod tests {
         assert_eq!(server_key_user(" https://API.OpenAI.com/v1/ "), "api-key:api.openai.com");
         assert_eq!(server_key_user("http://localhost:11434/v1"), "api-key:localhost:11434");
         assert_ne!(server_key_user("https://openrouter.ai/api/v1"), server_key_user("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn levels_default_sensibly_and_each_tells_the_model_something_different() {
+        let old: Settings = serde_json::from_str(r#"{"provider":"anthropic"}"#).unwrap();
+        assert_eq!((old.explain, old.layout, old.onboarded), (Explain::Standard, Layout::Advanced, false));
+        let new: Settings = serde_json::from_str(r#"{"explain":"beginner","layout":"simple","onboarded":true}"#).unwrap();
+        assert_eq!((new.explain, new.layout), (Explain::Beginner, Layout::Simple));
+        let notes: std::collections::HashSet<_> = Explain::ALL.iter().map(|e| e.model_note()).collect();
+        assert_eq!(notes.len(), 3);
     }
 
     #[test]

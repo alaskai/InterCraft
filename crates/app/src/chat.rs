@@ -16,7 +16,7 @@ use intercraft_llm::{
 use intercraft_tools::ToolHost;
 use serde_json::Value;
 
-use crate::settings::{self, KeySource, Provider, Settings, EFFORTS};
+use crate::settings::{self, Explain, KeySource, Provider, Settings, EFFORTS};
 
 enum Command {
     Send { text: String, images: Vec<String> },
@@ -142,6 +142,27 @@ impl ChatPanel {
         }
     }
 
+    /// The model's instructions: the tool guide plus a line for the explanation level.
+    pub(crate) fn system_prompt(&self) -> String {
+        format!("{}\n\nExplanation level:\n- {}", intercraft_tools::GUIDE, self.settings.explain.model_note())
+    }
+
+    /// Change the explanation level. Takes effect from the next message.
+    pub fn set_explain(&mut self, explain: Explain) {
+        if self.settings.explain == explain {
+            return;
+        }
+        self.settings.explain = explain;
+        if self.worker.is_some() {
+            let config = self.config();
+            let _ = self.worker().send(Command::Configure(config));
+        }
+    }
+
+    pub fn explain(&self) -> Explain {
+        self.settings.explain
+    }
+
     fn config(&self) -> Config {
         // The Claude Code session starts its own InterCraft MCP server, pinned to this project.
         let launcher = std::path::absolute(concat!(env!("CARGO_MANIFEST_DIR"), "/../../dev/mcp_launcher.py"))
@@ -152,7 +173,7 @@ impl ChatPanel {
                 api_key: self.api_key.clone(),
                 model: self.settings.model.clone(),
                 effort: self.settings.effort.clone(),
-                system: intercraft_tools::GUIDE.to_owned(),
+                system: self.system_prompt(),
             },
             claude_code: ClaudeCodeSettings {
                 project_dir: self.project_dir.clone(),
@@ -164,7 +185,7 @@ impl ChatPanel {
                     "--chat-panel".to_owned(),
                 ],
                 model: self.settings.claude_code_model.clone(),
-                extra_prompt: CLAUDE_CODE_PROMPT.to_owned(),
+                extra_prompt: format!("{CLAUDE_CODE_PROMPT}\n{}", self.settings.explain.model_note()),
             },
             openai: OpenAiSettings {
                 base_url: self.settings.openai_base_url.clone(),
@@ -175,7 +196,7 @@ impl ChatPanel {
                     _ => String::new(),
                 },
                 model: self.settings.openai_model.trim().to_owned(),
-                system: intercraft_tools::GUIDE.to_owned(),
+                system: self.system_prompt(),
                 vision: self.settings.openai_vision,
             },
         }
@@ -489,6 +510,7 @@ impl ChatPanel {
         });
 
         let mut answered = false;
+        let explain = self.settings.explain;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
@@ -508,7 +530,7 @@ impl ChatPanel {
                     !self.busy && !self.messages[i + 1..].iter().any(|m| matches!(m, Message::User(..)))
                 });
                 for (i, message) in self.messages.iter_mut().enumerate() {
-                    answered |= message_ui(ui, message, &mut self.markdown, open == Some(i));
+                    answered |= message_ui(ui, message, &mut self.markdown, open == Some(i), explain);
                     ui.add_space(6.0);
                 }
             });
@@ -833,6 +855,7 @@ fn message_ui(
     message: &mut Message,
     markdown: &mut egui_commonmark::CommonMarkCache,
     open: bool,
+    explain: Explain,
 ) -> bool {
     let mut answered = false;
     match message {
@@ -864,7 +887,7 @@ fn message_ui(
                         ui.label(egui::RichText::new(text.trim()).italics().weak());
                     }
                     Item::Tool(call) if is_question(call) => answered |= question_ui(ui, call, open),
-                    Item::Tool(call) => tool_ui(ui, call),
+                    Item::Tool(call) => tool_ui(ui, call, explain),
                 }
             }
         }
@@ -970,7 +993,7 @@ fn question_ui(ui: &mut egui::Ui, call: &mut ToolCall, open: bool) -> bool {
     }
 }
 
-fn tool_ui(ui: &mut egui::Ui, call: &ToolCall) {
+fn tool_ui(ui: &mut egui::Ui, call: &ToolCall, explain: Explain) {
     let green = egui::Color32::from_rgb(70, 170, 90);
     let (color, outcome) = match &call.result {
         None => (ui.visuals().weak_text_color(), "running".to_owned()),
@@ -1004,6 +1027,15 @@ fn tool_ui(ui: &mut egui::Ui, call: &ToolCall) {
         .response;
     response.on_hover_ui(|ui| {
         ui.set_max_width(420.0);
+        // A plain description first, unless the user asked for the terse version.
+        let purpose = crate::caption::tool_purpose(&call.name);
+        if explain != Explain::Expert && !purpose.is_empty() {
+            ui.label(purpose);
+            if explain == Explain::Beginner {
+                ui.weak("Below is exactly what the model sent.");
+            }
+            ui.separator();
+        }
         ui.monospace(serde_json::to_string_pretty(&call.input).unwrap_or_default());
     });
 }

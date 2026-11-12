@@ -71,8 +71,13 @@ pub fn param_row(
     value: &Value,
     editable: bool,
     drag: &mut Option<ParamDrag>,
+    simple: bool,
 ) -> Option<ParamCommit> {
-    ui.label(name);
+    if simple {
+        ui.label(friendly(name)).on_hover_text(format!("Called {name} in the step's code"));
+    } else {
+        ui.label(name);
+    }
     let field = Field::Param { feature: feature.to_owned(), name: name.to_owned() };
 
     if let Some(mut on) = value.as_bool() {
@@ -171,6 +176,13 @@ fn number_cell(
     None
 }
 
+/// "bore_d" reads as "Bore d": the raw name, made a little friendlier.
+pub fn friendly(name: &str) -> String {
+    let spaced = name.replace(['_', '-'], " ");
+    let mut chars = spaced.trim().chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
+
 /// Drag steps: whole units for whole numbers, tenths otherwise.
 fn snap(value: f64, whole: bool) -> f64 {
     if whole { value.round() } else { (value * 10.0).round() / 10.0 }
@@ -187,6 +199,13 @@ fn number(value: f64, whole: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_read_as_words() {
+        assert_eq!(friendly("bore_d"), "Bore d");
+        assert_eq!(friendly("past_centre"), "Past centre");
+        assert_eq!(friendly("radius"), "Radius");
+    }
 
     #[test]
     fn drag_steps_and_json_types() {

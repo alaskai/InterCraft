@@ -2,6 +2,7 @@
 // eframe/egui 0.36.2 (wgpu 30), egui_dock 0.21.1, egui_commonmark 0.25, rfd 0.18, glam 0.34, bytemuck 1, png 0.18
 // Worker: Python 3.11, build123d 0.13.0, numpy 2.4.6
 
+mod caption;
 mod chat;
 mod fit;
 mod measure;
@@ -80,6 +81,8 @@ struct App {
     was_focused: bool,
     /// The window title needs the new project's name.
     title_dirty: bool,
+    /// The "new to CAD?" question hasn't been answered yet.
+    first_run: bool,
 }
 
 /// Latest result for one feature. `stale` means a rebuild is running and
@@ -117,6 +120,8 @@ struct State {
     rename: Option<(RenameTarget, String, Option<String>)>,
     /// A step's code being edited in the Inspector, not applied yet.
     code_draft: Option<CodeDraft>,
+    /// The simple layout: code, file paths and raw parameter names hidden.
+    simple: bool,
     /// The brief as typed in its tab, while editing.
     brief_draft: Option<String>,
     brief_markdown: egui_commonmark::CommonMarkCache,
@@ -149,8 +154,10 @@ impl App {
             Err(e) => (None, format!("Worker failed to start: {e:#}")),
         };
 
-        let dock = menus::default_dock();
-        cc.egui_ctx.set_theme(settings::Settings::load().theme_preference());
+        let saved = settings::Settings::load();
+        let simple = saved.layout == settings::Layout::Simple;
+        let dock = menus::default_dock(simple);
+        cc.egui_ctx.set_theme(saved.theme_preference());
 
         let mut state = State {
             project_dir: project_dir.clone(),
@@ -170,6 +177,7 @@ impl App {
             param_drag: None,
             rename: None,
             code_draft: None,
+            simple,
             brief_draft: None,
             brief_markdown: Default::default(),
             viewport: Viewport::new(render_state),
@@ -188,7 +196,8 @@ impl App {
         }
         let _ = settings::Settings::remember_project(&state.project_dir);
         state.reload_project();
-        Ok(Self { dock, state, settings_open: false, new_project: None, was_focused: true, title_dirty: true })
+        let first_run = !saved.onboarded;
+        Ok(Self { dock, state, settings_open: false, new_project: None, was_focused: true, title_dirty: true, first_run })
     }
 
     /// Switch to another project folder.
@@ -270,6 +279,7 @@ impl eframe::App for App {
             });
         });
         self.settings_window(&ctx);
+        self.first_run_window(&ctx);
         self.new_project_window(&ctx);
         DockArea::new(&mut self.dock)
             .show_close_buttons(false)
@@ -1337,9 +1347,11 @@ impl State {
         };
         let mut commit = None;
         // Where the part sits in the assembly. Open by itself once the part has been moved.
-        egui::CollapsingHeader::new("Placement")
+        // In the simple layout moving a part is tucked away until asked for.
+        let (title, open) = if self.simple { ("Move part", false) } else { ("Placement", part.placement().is_some()) };
+        egui::CollapsingHeader::new(title)
             .id_salt(("placement", &part.name))
-            .default_open(part.placement().is_some())
+            .default_open(open)
             .show(ui, |ui| {
                 egui::Grid::new("placement").num_columns(2).show(ui, |ui| {
                     commit = params::placement_rows(ui, part, drag).map(InspectorAction::Param);
@@ -1378,7 +1390,9 @@ impl State {
                 commit = Some(InspectorAction::Ask(explain_step(&part.name, index + 1, &step.label)));
             }
         });
-        ui.weak(step.file);
+        if !self.simple {
+            ui.weak(step.file);
+        }
         if !step.why.is_empty() {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -1397,7 +1411,7 @@ impl State {
             egui::Grid::new("params").num_columns(2).show(ui, |ui| {
                 for (name, value) in params {
                     let key = (part.name.as_str(), step.id);
-                    if let Some(edit) = params::param_row(ui, key, name, value, editable, drag) {
+                    if let Some(edit) = params::param_row(ui, key, name, value, editable, drag, self.simple) {
                         commit = Some(InspectorAction::Param(edit));
                     }
                 }
@@ -1407,7 +1421,7 @@ impl State {
             }
         }
 
-        if let Some(code) = step.code {
+        if let Some(code) = step.code.filter(|_| !self.simple) {
             let editable = part.kind == PartKind::Design;
             egui::CollapsingHeader::new("Code").id_salt("step code").show(ui, |ui| {
                 if let Some(code) = code_editor(ui, draft, (&part.name, step.id), code, editable) {

@@ -23,6 +23,8 @@ fn sandbox_dirs() -> PathBuf {
         std::env::set_var("INTERCRAFT_CONFIG_DIR", root.join("config"));
         std::env::set_var("INTERCRAFT_PROJECTS_DIR", root.join("projects"));
         std::env::remove_var("ANTHROPIC_API_KEY");
+        // Tests start past the first-run question, in the advanced layout.
+        std::fs::write(root.join("config/settings.json"), r#"{"onboarded": true}"#).unwrap();
     });
     root
 }
@@ -846,4 +848,56 @@ A clamp for an 8 mm rod.
     h.get_by_label_contains("A clamp for an 8 mm rod.");
     assert_eq!(h.state().state.history.undo_label(), Some("Update the brief"));
     shot(&mut h, "brief_tab");
+}
+
+/// Puts the explanation level and layout back when a test that changes them ends,
+/// even if it fails, so the tests after it see the usual advanced layout.
+struct RestoreExperience;
+
+impl Drop for RestoreExperience {
+    fn drop(&mut self) {
+        let _ = settings::Settings::update(|s| {
+            s.explain = settings::Explain::Standard;
+            s.layout = settings::Layout::Advanced;
+            s.onboarded = true;
+        });
+    }
+}
+
+#[test]
+fn first_run_choice_sets_up_a_beginner() {
+    let _one = one_at_a_time();
+    let _restore = RestoreExperience;
+    let project = example_project("first-run");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    h.state_mut().first_run = true;
+    // A new window takes a few frames to size itself and settle.
+    for _ in 0..4 {
+        h.step();
+    }
+    shot(&mut h, "first_run");
+    click(&mut h, "I'm new to CAD");
+    assert!(!h.state().first_run);
+    assert!(h.state().state.simple);
+    assert_eq!(h.state().state.chat.explain(), settings::Explain::Beginner);
+    let saved = settings::Settings::load();
+    assert_eq!((saved.explain, saved.layout, saved.onboarded), (settings::Explain::Beginner, settings::Layout::Simple, true));
+    assert!(h.state().state.chat.system_prompt().contains("The user is new to CAD"));
+
+    // The simple layout hides the code and the file path, and names parameters in words.
+    h.step();
+    h.step();
+    assert_eq!(h.query_all_by_label("Code").count(), 0, "no Code section");
+    assert_eq!(h.query_all_by_label_contains("040_fillet.py").count(), 0, "no file path");
+    h.get_by_label("Radius");
+    h.get_by_label("Move part");
+    shot(&mut h, "simple_layout");
+
+    // Back to expert and advanced from Settings.
+    h.state_mut().set_experience(settings::Explain::Expert, false);
+    h.step();
+    h.step();
+    h.get_by_label("Code");
+    assert!(h.state().state.chat.system_prompt().contains("The user knows CAD"));
 }

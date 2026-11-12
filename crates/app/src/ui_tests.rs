@@ -453,11 +453,11 @@ fn duplicate_rename_and_move_a_part() {
     assert_eq!(h.state().state.selected_part.as_deref(), Some("RodBracket_copy"));
 
     // Rename through the window, with a bad name refused first.
-    h.state_mut().state.rename = Some(("RodBracket_copy".into(), "bad name!".into(), None));
+    h.state_mut().state.rename = Some((RenameTarget::Part("RodBracket_copy".into()), "bad name!".into(), None));
     h.step();
     click(&mut h, "Rename");
     assert_eq!(part_names(&h)[1], "RodBracket_copy", "a bad name changes nothing");
-    h.state_mut().state.rename = Some(("RodBracket_copy".into(), "Twin".into(), None));
+    h.state_mut().state.rename = Some((RenameTarget::Part("RodBracket_copy".into()), "Twin".into(), None));
     h.step();
     click(&mut h, "Rename");
     assert_eq!(part_names(&h), ["RodBracket", "Twin"]);
@@ -564,4 +564,66 @@ fn the_model_can_look_at_the_part() {
     assert_ne!(pictures[0], pictures[2], "the section changes the picture");
     assert_eq!(h.state().state.viewport.section, camera_before, "the user's own view is untouched");
     assert!(intercraft_tools::view_requests(&project).is_empty());
+}
+
+fn step_labels(h: &Harness<'static, App>) -> Vec<String> {
+    let project = h.state().state.project.as_ref().expect("a project is loaded");
+    project.project.parts[0].features.iter().map(|f| f.label.clone()).collect()
+}
+
+#[test]
+fn steps_can_be_moved_renamed_and_recoded() {
+    let _one = one_at_a_time();
+    let project = example_project("steps");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    // Reorder: the slit before the bore, then back with undo.
+    h.state_mut().state.move_step("RodBracket", "f030", -1);
+    assert_eq!(step_labels(&h), ["Base block", "Clamp slit", "Rod bore", "Edge fillets"]);
+    assert_eq!(h.state().state.history.undo_label(), Some("Reorder RodBracket"));
+    h.state_mut().state.move_step("RodBracket", "f010", -1);
+    assert!(h.state().state.worker_status.contains("already at that end"));
+    h.state_mut().state.undo();
+    assert_eq!(step_labels(&h)[1], "Rod bore");
+
+    // Rename a step through the window.
+    let target = RenameTarget::Step { part: "RodBracket".into(), feature: "f020".into(), label: "Rod bore".into() };
+    h.state_mut().state.rename = Some((target, "Shaft bore".into(), None));
+    h.step();
+    h.step();
+    click(&mut h, "Rename");
+    assert_eq!(step_labels(&h)[1], "Shaft bore");
+
+    // Edit the code of the fillet step in the Inspector: double the radius.
+    wait_until(&mut h, "the rebuild", built);
+    let before = latest_volume(h.state(), "RodBracket", "f040").unwrap();
+    click(&mut h, "Code");
+    h.get_by_label("Step code");
+    let draft = h.state_mut().state.code_draft.as_mut().expect("the code box is open");
+    assert!(draft.text.contains("fillet"));
+    draft.text = draft.text.replace(r#"p["radius"]"#, r#"p["radius"] * 2"#);
+    h.step();
+    h.get_by_label("Not applied yet");
+    shot(&mut h, "step_code");
+    click(&mut h, "Apply");
+    wait_until(&mut h, "the edited step to build", |app| {
+        built(app) && latest_volume(app, "RodBracket", "f040").is_some_and(|v| (v - before).abs() > 1.0)
+    });
+    assert!(latest_volume(h.state(), "RodBracket", "f040").unwrap() < before, "a bigger fillet removes more");
+    let saved = std::fs::read_to_string(project.join("RodBracket/040_fillet.py")).unwrap();
+    assert!(saved.contains(r#"p["radius"] * 2"#));
+    assert_eq!(h.state().state.history.undo_label(), Some("Edit 'Edge fillets'"));
+
+    // Code the sandbox refuses is saved like any edit and shows as a failed step.
+    let draft = h.state_mut().state.code_draft.as_mut().unwrap();
+    draft.text = "import os\npart = part\n".to_owned();
+    h.step();
+    click(&mut h, "Apply");
+    wait_until(&mut h, "the refused step", |app| {
+        app.state.building.is_empty()
+            && app.state.results.get(&("RodBracket".to_owned(), "f040".to_owned())).is_some_and(|e| !e.stale && !e.result.ok)
+    });
+    h.state_mut().state.undo();
+    wait_until(&mut h, "the undo to rebuild", built);
 }

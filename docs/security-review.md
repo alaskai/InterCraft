@@ -134,6 +134,8 @@ A fake `claude` binary in `claude_code_stress.rs` checks every one of these flag
 
 8. **Picture requests are files in the project folder.** The `view_model` tool asks the viewer for a picture by writing a small request file to `.intercraft/view`. The viewer checks each request (plain id, known view name, small size) and deletes anything else, and it only ever writes a PNG of the model back into that folder. A shared project could arrive with request files in it, which costs one render each and nothing more. Low impact.
 
+9. **OpenAI-compatible servers are chosen by the user.** That route sends the conversation, and a key if one is saved, to whatever address is set. Three rules limit the damage of a wrong setting: the address must be HTTPS unless it is on this computer, each server has its own key entry in the credential store (looked up for the exact address at send time, so the OpenAI key can't go to another host), and the key never appears in errors or debug output. The client has 12 stress scenarios, and it was tested against a scripted server, not against a real service. A local model is also more easily manipulated than a hosted one, but it only reaches the same sandboxed tools.
+
 ## Checks you can repeat
 
 ```powershell

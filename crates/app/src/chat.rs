@@ -75,7 +75,8 @@ pub struct ChatPanel {
     api_key: String,
     key_source: KeySource,
     key_input: String,
-    settings_open: bool,
+    /// Set when the user asks for the Settings window from the chat panel.
+    pub wants_settings: bool,
     settings_error: Option<String>,
     /// Result of `claude --version`, checked when Claude Code is chosen.
     claude_code: Option<Option<String>>,
@@ -95,10 +96,10 @@ impl ChatPanel {
         let (api_key, key_source) = settings::load_api_key();
         let settings = Settings::load();
         let claude_code = (settings.provider == Provider::ClaudeCode).then(claude_code_version);
-        let mut panel = Self {
+        let panel = Self {
             project_dir,
             settings,
-            settings_open: false,
+            wants_settings: false,
             api_key,
             key_source,
             key_input: String::new(),
@@ -113,8 +114,6 @@ impl ChatPanel {
             usage: Usage::default(),
             ctx,
         };
-        // Open the settings straight away when the chosen provider isn't usable yet.
-        panel.settings_open = !panel.ready();
         panel
     }
 
@@ -168,12 +167,50 @@ impl ChatPanel {
     }
 
     fn push_settings(&mut self) {
-        if let Err(e) = self.settings.save() {
+        let mine = self.settings.clone();
+        let saved = Settings::update(|s| {
+            s.provider = mine.provider;
+            s.model = mine.model.clone();
+            s.effort = mine.effort.clone();
+            s.claude_code_model = mine.claude_code_model.clone();
+        });
+        if let Err(e) = saved {
             self.settings_error = Some(format!("Couldn't save settings: {e:#}"));
         }
         if self.worker.is_some() {
             let config = self.config();
             let _ = self.worker().send(Command::Configure(config));
+        }
+    }
+
+    /// Start fresh on another project: stop any reply, forget the conversation, and
+    /// point the tools at the new folder.
+    pub fn set_project(&mut self, dir: PathBuf, name: &str) {
+        self.cancel.store(true, Ordering::Relaxed);
+        // The old worker thread ends once its reply stops and its channel closes.
+        self.worker = None;
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.busy = false;
+        self.project_dir = dir;
+        self.messages.clear();
+        self.usage = Usage::default();
+        self.messages.push(Message::Notice(format!("Opened {name}. This is a new conversation.")));
+    }
+
+    /// One line describing the chat setup, for the panel header.
+    pub fn summary(&self) -> String {
+        match self.settings.provider {
+            Provider::Anthropic => {
+                let model = ANTHROPIC_MODELS
+                    .iter()
+                    .find(|(id, _)| *id == self.settings.model)
+                    .map_or(self.settings.model.as_str(), |(_, name)| name);
+                format!("{model} · effort {}", self.settings.effort)
+            }
+            Provider::ClaudeCode => match self.settings.claude_code_model.as_str() {
+                "" => "Claude Code · default model".to_owned(),
+                alias => format!("Claude Code · {}", claude_code_model_name(alias)),
+            },
         }
     }
 
@@ -294,7 +331,14 @@ impl ChatPanel {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, context: Option<String>) {
-        self.settings_ui(ui);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(self.summary()).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Settings").clicked() {
+                    self.wants_settings = true;
+                }
+            });
+        });
         ui.separator();
 
         // Input sits at the bottom, the transcript fills the rest.
@@ -401,22 +445,14 @@ impl ChatPanel {
         Some(lines.join("\n"))
     }
 
-    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+    /// The chat part of the Settings window.
+    pub fn settings_contents(&mut self, ui: &mut egui::Ui) {
         let model_name = ANTHROPIC_MODELS
             .iter()
             .find(|(id, _)| *id == self.settings.model)
             .map_or(self.settings.model.clone(), |(_, name)| (*name).to_owned());
-        let header = match self.settings.provider {
-            Provider::Anthropic => format!("{model_name} · effort {}", self.settings.effort),
-            Provider::ClaudeCode => match self.settings.claude_code_model.as_str() {
-                "" => "Claude Code · default model".to_owned(),
-                _ => format!("Claude Code · {}", claude_code_model_name(&self.settings.claude_code_model)),
-            },
-        };
-        let response = egui::CollapsingHeader::new(header)
-            .id_salt("chat_settings")
-            .open(self.settings_open.then_some(true))
-            .show(ui, |ui| {
+        {
+            {
                 let mut changed = false;
                 egui::Grid::new("chat_settings_grid").num_columns(2).show(ui, |ui| {
                     ui.label("Use");
@@ -533,10 +569,7 @@ impl ChatPanel {
                     (self.api_key, self.key_source) = settings::load_api_key();
                     self.push_settings();
                 }
-            });
-        // Opened automatically while the provider isn't usable; after that the user decides.
-        if response.header_response.clicked() || self.ready() {
-            self.settings_open = false;
+            }
         }
     }
 }
@@ -574,7 +607,7 @@ fn subscription_help(ui: &mut egui::Ui) {
             ui.set_max_width(ui.available_width());
             ui.strong("Using a Claude Pro or Max subscription?");
             ui.label(concat!(
-                "Set \"Use\" in the settings above to Claude Code. It runs your own Claude Code ",
+                "Open Settings and set \"Use\" to Claude Code. It runs your own Claude Code ",
                 "in the background with your sign-in, and you chat here as normal."
             ));
             ui.add_space(4.0);
@@ -588,7 +621,7 @@ fn subscription_help(ui: &mut egui::Ui) {
             ui.add_space(4.0);
             ui.weak(concat!(
                 "Other agent apps that support MCP (Codex CLI, Gemini CLI, Cursor) work the same way. ",
-                "Or add an API key in the settings above to chat here."
+                "Or add an API key in Settings to chat here."
             ));
         });
 }

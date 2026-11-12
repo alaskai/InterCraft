@@ -1,8 +1,9 @@
 // InterCraft: watch an LLM (or you) edit a parametric model, one feature at a time.
-// eframe/egui 0.36.2 (wgpu 30), egui_dock 0.21.1, glam 0.34, bytemuck 1
+// eframe/egui 0.36.2 (wgpu 30), egui_dock 0.21.1, egui_commonmark 0.25, rfd 0.18, glam 0.34, bytemuck 1
 // Worker: Python 3.11, build123d 0.13.0, numpy 2.4.6
 
 mod chat;
+mod menus;
 mod settings;
 mod viewport;
 
@@ -11,11 +12,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
-use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
+use egui_dock::{DockArea, DockState, TabViewer};
 use intercraft_core::{LoadedProject, Part, PartKind};
 use intercraft_geo::{
-    FeatureInput, FeatureResult, GeoEvent, GeometryBackend, Mesh, PythonWorker, RebuildRequest,
-    Report,
+    ExportFormat, FeatureInput, FeatureResult, GeoEvent, GeometryBackend, Mesh, PythonWorker,
+    RebuildRequest, Report,
 };
 use viewport::Viewport;
 
@@ -32,8 +33,14 @@ const PART_COLORS: [[f32; 3]; 4] = [
 const REFERENCE_COLOR: [f32; 3] = [0.45, 0.45, 0.47];
 
 fn main() -> eframe::Result {
+    // A folder on the command line wins, then the most recent project, then the example.
     let project_dir = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/bracket"))
+        settings::Settings::load()
+            .recent_projects
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.join("project.json").exists())
+            .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/bracket")))
     });
 
     let options = eframe::NativeOptions {
@@ -63,6 +70,12 @@ enum Tab {
 struct App {
     dock: DockState<Tab>,
     state: State,
+    settings_open: bool,
+    new_project: Option<menus::NewProjectDialog>,
+    /// Window focus last frame, to notice when the user comes back to this window.
+    was_focused: bool,
+    /// The window title needs the new project's name.
+    title_dirty: bool,
 }
 
 /// Latest result for one feature. `stale` means a rebuild is running and
@@ -95,6 +108,13 @@ struct State {
 
     viewport: Viewport,
     chat: chat::ChatPanel,
+
+    exports_pending: usize,
+    exported: Vec<String>,
+    /// Project name currently in the window title.
+    shown_name: Option<String>,
+    /// Folder of the last finished export, for the "Show" button.
+    export_dir: Option<PathBuf>,
 }
 
 impl App {
@@ -110,13 +130,8 @@ impl App {
             Err(e) => (None, format!("Worker failed to start: {e:#}")),
         };
 
-        // Viewport in the middle, parts list on the left, chat on the right, timeline below.
-        let mut dock = DockState::new(vec![Tab::Viewport]);
-        let tree = dock.main_surface_mut();
-        let [centre, _right] = tree.split_right(NodeIndex::root(), 0.76, vec![Tab::Chat, Tab::Sketch]);
-        let [centre, left] = tree.split_left(centre, 0.24, vec![Tab::Parts]);
-        tree.split_below(left, 0.5, vec![Tab::Inspector]);
-        tree.split_below(centre, 0.82, vec![Tab::Timeline]);
+        let dock = menus::default_dock();
+        cc.egui_ctx.set_theme(settings::Settings::load().theme_preference());
 
         let mut state = State {
             project_dir: project_dir.clone(),
@@ -134,18 +149,50 @@ impl App {
             hidden: HashSet::new(),
             viewport: Viewport::new(render_state),
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
+            exports_pending: 0,
+            exported: Vec::new(),
+            shown_name: None,
+            export_dir: None,
         };
         // Lets an MCP server started by another app (Claude Code, Cursor...) edit this project.
         if let Err(e) = intercraft_tools::record_active_project(&state.project_dir) {
             state.worker_status = format!("{} (couldn't record the open project: {e:#})", state.worker_status);
         }
+        let _ = settings::Settings::remember_project(&state.project_dir);
         state.reload_project();
-        Ok(Self { dock, state })
+        Ok(Self { dock, state, settings_open: false, new_project: None, was_focused: true, title_dirty: true })
+    }
+
+    /// Switch to another project folder.
+    pub(crate) fn open(&mut self, dir: PathBuf) {
+        match self.state.open_project(dir) {
+            Ok(()) => self.title_dirty = true,
+            Err(e) => self.state.worker_status = format!("Couldn't open that project: {e:#}"),
+        }
+    }
+
+    fn update_title(&self, ctx: &egui::Context) {
+        let name = self.state.project.as_ref().map(|p| p.project.name.clone());
+        let title = match name {
+            Some(name) => format!("{name} - InterCraft"),
+            None => "InterCraft".to_owned(),
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The window the user last came back to decides which project an MCP client
+        // (a Claude Code terminal) edits, not the window that happened to open last.
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.was_focused {
+            let _ = intercraft_tools::record_active_project(&self.state.project_dir);
+        }
+        self.was_focused = focused;
+        if std::mem::take(&mut self.state.chat.wants_settings) {
+            self.settings_open = true;
+        }
         self.state.drain_worker_events();
         // Follow the part the chat model is editing, so its steps show as they land.
         if let Some(part) = self.state.chat.poll() {
@@ -155,22 +202,36 @@ impl eframe::App for App {
         self.state.poll_files();
         self.state.fix_selection();
         self.state.sync_meshes();
+        // The project name can also change on disk, so check it after each reload.
+        if std::mem::take(&mut self.title_dirty) || self.state.project_renamed() {
+            self.update_title(ctx);
+        }
         // Keeps the file polling ticking while nothing else is happening.
         ctx.request_repaint_after(POLL_INTERVAL);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.shortcuts(&ctx);
+        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if !self.state.building.is_empty() {
+                if !self.state.building.is_empty() || self.state.exports_pending > 0 {
                     ui.spinner();
                 }
                 ui.label(&self.state.worker_status);
+                if let Some(dir) = &self.state.export_dir {
+                    if ui.small_button("Show files").clicked() {
+                        menus::reveal(dir);
+                    }
+                }
                 if let Some(err) = &self.state.project_error {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 }
             });
         });
+        self.settings_window(&ctx);
+        self.new_project_window(&ctx);
         DockArea::new(&mut self.dock)
             .show_close_buttons(false)
             .show_leaf_close_all_buttons(false)
@@ -180,6 +241,77 @@ impl eframe::App for App {
 }
 
 impl State {
+    /// Load another project, clearing everything from the current one. The current
+    /// project stays open if the new one can't be loaded.
+    fn open_project(&mut self, dir: PathBuf) -> anyhow::Result<()> {
+        let loaded = LoadedProject::load(&dir)?;
+        // Results from builds still running for the old project would land on the new one.
+        if !self.building.is_empty() {
+            if let Some(worker) = self.worker.as_mut() {
+                worker.restart()?;
+            }
+        }
+        self.project_dir = dir.clone();
+        self.results.clear();
+        self.building.clear();
+        self.shown.clear();
+        self.hidden.clear();
+        self.selected_part = None;
+        self.selected_step = None;
+        self.export_dir = None;
+        self.viewport.retain_meshes(|_| false);
+        let _ = intercraft_tools::record_active_project(&dir);
+        let _ = settings::Settings::remember_project(&dir);
+        self.chat.set_project(dir, &loaded.project.name);
+        self.worker_status = format!("Opened {}", loaded.project.name);
+        self.last_mtime = loaded.latest_mtime();
+        self.project_error = None;
+        self.project = Some(loaded);
+        self.rebuild_all();
+        Ok(())
+    }
+
+    /// Write parts to the project's exports folder, using the viewer's own worker.
+    fn export(&mut self, parts: &[String], format: ExportFormat) {
+        let (Some(loaded), Some(worker)) = (&self.project, &mut self.worker) else {
+            self.worker_status = "Export needs the geometry worker, which isn't running.".to_owned();
+            return;
+        };
+        let dir = loaded.dir.join("exports");
+        let ext = if format == ExportFormat::Step { "step" } else { "stl" };
+        if self.exports_pending == 0 {
+            self.exported.clear();
+        }
+        for name in parts {
+            let Ok(part) = loaded.part(name) else { continue };
+            let request = RebuildRequest {
+                part: part.name.clone(),
+                features: part
+                    .features
+                    .iter()
+                    .map(|f| FeatureInput { id: f.id.clone(), code: f.code.clone(), params: f.params.clone() })
+                    .collect(),
+            };
+            match worker.request_export(request, format, &dir.join(format!("{}.{ext}", part.name))) {
+                Ok(()) => self.exports_pending += 1,
+                Err(e) => self.worker_status = format!("Export failed: {e:#}"),
+            }
+        }
+        if self.exports_pending > 0 {
+            self.worker_status = format!("Exporting {}...", plural(self.exports_pending, "file"));
+        }
+    }
+
+    /// True once after the loaded project's name changes.
+    fn project_renamed(&mut self) -> bool {
+        let name = self.project.as_ref().map(|p| p.project.name.clone());
+        if name != self.shown_name {
+            self.shown_name = name;
+            return true;
+        }
+        false
+    }
+
     fn reload_project(&mut self) {
         match LoadedProject::load(&self.project_dir) {
             Ok(loaded) => {
@@ -270,9 +402,22 @@ impl State {
                     // Anything still stale was removed from the project or sits after a failure.
                     self.results.retain(|(p, _), e| p != &part || !e.stale);
                 }
+                GeoEvent::Error { error } if self.exports_pending > 0 => {
+                    self.exports_pending -= 1;
+                    let first = error.lines().next().unwrap_or_default();
+                    self.worker_status = format!("Export failed: {first}");
+                }
                 GeoEvent::Error { error } => self.worker_status = format!("Worker error: {error}"),
-                // Exports are only requested by the MCP server, never by the app.
-                GeoEvent::Exported { .. } => {}
+                GeoEvent::Exported { path } => {
+                    self.exports_pending = self.exports_pending.saturating_sub(1);
+                    if let Some(name) = path.file_name() {
+                        self.exported.push(name.to_string_lossy().into_owned());
+                    }
+                    if self.exports_pending == 0 {
+                        self.worker_status = format!("Exported {}", self.exported.join(", "));
+                        self.export_dir = path.parent().map(PathBuf::from);
+                    }
+                }
                 GeoEvent::Exited => {
                     self.worker_status = "Geometry worker stopped".to_owned();
                     self.building.clear();

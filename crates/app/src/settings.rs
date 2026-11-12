@@ -24,15 +24,20 @@ pub enum Provider {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
-    #[serde(default)]
     pub provider: Provider,
     pub model: String,
     pub effort: String,
     /// Alias for Claude Code's --model, empty for the user's own default.
-    #[serde(default)]
     pub claude_code_model: String,
+    /// Most recent first.
+    pub recent_projects: Vec<String>,
+    /// "system", "dark" or "light".
+    pub theme: String,
 }
+
+const MAX_RECENT: usize = 8;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -42,6 +47,8 @@ impl Default for Settings {
             // Multi-step tool work does better above the model's default effort.
             effort: "high".to_owned(),
             claude_code_model: String::new(),
+            recent_projects: Vec::new(),
+            theme: "system".to_owned(),
         }
     }
 }
@@ -56,6 +63,33 @@ impl Settings {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default()
+    }
+
+    /// Change some fields and save. Reads the file first, so the chat panel and the
+    /// rest of the app never overwrite each other's settings.
+    pub fn update(change: impl FnOnce(&mut Settings)) -> anyhow::Result<Settings> {
+        let mut settings = Settings::load();
+        change(&mut settings);
+        settings.save()?;
+        Ok(settings)
+    }
+
+    pub fn remember_project(dir: &std::path::Path) -> anyhow::Result<Settings> {
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let dir = dir.to_string_lossy().into_owned();
+        Settings::update(|s| {
+            s.recent_projects.retain(|p| !p.eq_ignore_ascii_case(&dir));
+            s.recent_projects.insert(0, dir);
+            s.recent_projects.truncate(MAX_RECENT);
+        })
+    }
+
+    pub fn theme_preference(&self) -> eframe::egui::ThemePreference {
+        match self.theme.as_str() {
+            "dark" => eframe::egui::ThemePreference::Dark,
+            "light" => eframe::egui::ThemePreference::Light,
+            _ => eframe::egui::ThemePreference::System,
+        }
     }
 
     pub fn save(&self) -> anyhow::Result<()> {

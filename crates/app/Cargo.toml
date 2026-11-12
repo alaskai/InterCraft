@@ -17,5 +17,6 @@ keyring = "4.2"
 # Default features load images from file paths; a model reply must not be able to do that.
 egui_commonmark = { version = "=0.25.0", default-features = false, features = ["pulldown_cmark"] }
 dirs = "7"
+rfd = "0.18"
 serde.workspace = true
 serde_json.workspace = true

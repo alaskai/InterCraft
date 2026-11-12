@@ -212,3 +212,21 @@ fn ask_user_is_checked_and_only_offered_to_the_chat_panel() {
     assert!(!intercraft_tools::definitions().to_string().contains("ask_user"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn export_writes_step_and_stl_files() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    let (mut host, dir) = project("export");
+    host.call("add_part", &json!({ "name": "Block" })).unwrap();
+    add(&mut host, "Block", "Base", "part = Box(20, 10, 5)").unwrap();
+    let result = host.call("export_part", &json!({ "part": "Block" })).unwrap();
+    assert_eq!(result["exported"].as_array().unwrap().len(), 2);
+    let step = std::fs::read_to_string(dir.join("exports/Block.step")).unwrap();
+    assert!(step.starts_with("ISO-10303-21"), "not a STEP file");
+    let stl = std::fs::metadata(dir.join("exports/Block.stl")).unwrap();
+    assert!(stl.len() > 84, "STL is empty");
+    std::fs::remove_dir_all(dir).unwrap();
+}

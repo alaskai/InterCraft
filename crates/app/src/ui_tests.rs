@@ -47,6 +47,11 @@ fn example_project(name: &str) -> PathBuf {
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap().flatten() {
+        // Undo history and locks left by running the app on the example locally
+        // would make tests behave differently here than on CI.
+        if entry.file_name().to_string_lossy().starts_with(".intercraft") {
+            continue;
+        }
         let target = to.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_dir(&entry.path(), &target);

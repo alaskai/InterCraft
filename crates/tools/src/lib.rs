@@ -329,6 +329,19 @@ pub fn definitions() -> Value {
             },
         },
         {
+            "name": "move_feature",
+            "description": "Change the order of a part's features and rebuild. Order matters: a fillet added before a cut rounds different edges than one added after.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "part": part,
+                    "feature_id": feature_id,
+                    "after": { "type": "string", "description": "Put it straight after this feature id. Omit to make it the first feature." },
+                },
+                "required": ["part", "feature_id"],
+            },
+        },
+        {
             "name": "delete_feature",
             "description": "Remove a feature and rebuild the features after it.",
             "inputSchema": {
@@ -559,6 +572,12 @@ impl ToolHost {
                 let part = text(args, "part")?;
                 let value = args.get("value").cloned().context("missing 'value'")?;
                 project.set_param(part, text(args, "feature_id")?, text(args, "name")?, value)?;
+                project.save()?;
+                self.build_report(project.part(part)?, false)
+            }
+            "move_feature" => {
+                let part = text(args, "part")?;
+                project.move_feature(part, text(args, "feature_id")?, optional_text(args, "after"))?;
                 project.save()?;
                 self.build_report(project.part(part)?, false)
             }

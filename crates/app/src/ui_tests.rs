@@ -351,3 +351,60 @@ fn hide_delete_and_undo_a_part() {
     // In the history list, as "Redo: ..." in the Edit menu, and in the status bar.
     assert_eq!(h.get_all_by_label_contains("Delete part 'RodBracket'").count(), 3);
 }
+
+fn latest_volume(app: &App, part: &str, feature: &str) -> Option<f64> {
+    let entry = app.state.results.get(&(part.to_owned(), feature.to_owned()))?;
+    if entry.stale {
+        return None;
+    }
+    Some(entry.result.report.as_ref()?.volume)
+}
+
+fn saved_param(project: &Path, feature: usize, name: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(project.join("project.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    json["parts"][0]["features"][feature]["params"][name].clone()
+}
+
+#[test]
+fn drag_a_parameter_previews_then_saves_once() {
+    let _one = one_at_a_time();
+    let project = example_project("params");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let before = latest_volume(h.state(), "RodBracket", "f040").unwrap();
+
+    // The Inspector follows the latest step, the fillet, whose only parameter is radius = 3.
+    let field = h.get_by_role(egui::accesskit::Role::SpinButton).rect();
+    h.drag_at(field.center());
+    h.step();
+    h.hover_at(field.center() + egui::vec2(25.0, 0.0));
+    h.step();
+    let dragged = h.state().state.param_drag.clone().expect("dragging radius");
+    assert_eq!(dragged.name, "radius");
+    assert!(dragged.value > 3.0 && dragged.value.fract() == 0.0, "whole steps: {}", dragged.value);
+
+    // The part rebuilds with the dragged value, but nothing is saved yet.
+    wait_until(&mut h, "the preview build", |app| {
+        let s = &app.state;
+        s.building.is_empty() && s.param_drag.as_ref().is_some_and(|d| d.sent == Some(d.value))
+    });
+    let preview = latest_volume(h.state(), "RodBracket", "f040").unwrap();
+    assert!(preview < before, "a bigger fillet removes material ({preview} vs {before})");
+    assert_eq!(saved_param(&project, 3, "radius"), 3);
+    shot(&mut h, "param_drag");
+
+    // Letting go saves it once, as one undo step.
+    h.drop_at(field.center() + egui::vec2(25.0, 0.0));
+    h.step();
+    h.step();
+    assert!(h.state().state.param_drag.is_none());
+    assert_eq!(saved_param(&project, 3, "radius"), dragged.value as i64);
+    let undo = h.state().state.history.undo_label().unwrap_or_default().to_owned();
+    assert_eq!(undo, format!("Set radius = {} on 'Edge fillets'", dragged.value as i64));
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.step();
+    h.step();
+    assert_eq!(saved_param(&project, 3, "radius"), 3);
+}

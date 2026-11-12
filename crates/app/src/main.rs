@@ -5,6 +5,7 @@
 mod chat;
 mod measure;
 mod menus;
+mod params;
 mod settings;
 #[cfg(test)]
 mod ui_tests;
@@ -107,6 +108,8 @@ struct State {
     hidden: HashSet<String>,
     /// Undo history of the open project, refreshed on every reload.
     history: HistoryInfo,
+    /// A parameter being dragged in the Inspector, previewed but not saved yet.
+    param_drag: Option<params::ParamDrag>,
 
     viewport: Viewport,
     chat: chat::ChatPanel,
@@ -151,6 +154,7 @@ impl App {
             shown: HashMap::new(),
             hidden: HashSet::new(),
             history: HistoryInfo::default(),
+            param_drag: None,
             viewport: Viewport::new(render_state),
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
             measure: measure::MeasureTool::default(),
@@ -205,6 +209,7 @@ impl eframe::App for App {
             self.state.selected_step = None;
         }
         self.state.poll_files();
+        self.state.send_preview();
         self.state.fix_selection();
         self.state.sync_meshes();
         // The project name can also change on disk, so check it after each reload.
@@ -364,6 +369,40 @@ impl State {
         drop(lock);
         self.reload_project();
         result
+    }
+
+    /// Save a parameter edited in the Inspector. One edit, one undo step.
+    pub(crate) fn commit_param(&mut self, edit: params::ParamCommit) {
+        let params::ParamCommit { part, feature, name, value } = edit;
+        let shown = value.to_string();
+        match self.edit_project(|p| p.set_param(&part, &feature, &name, value).and_then(|()| p.save())) {
+            Ok(()) => self.worker_status = format!("Set {name} = {shown}. Ctrl+Z undoes it."),
+            Err(e) => self.worker_status = format!("Couldn't change {name}: {e:#}"),
+        }
+    }
+
+    /// While a parameter is dragged, rebuild the part with the dragged value without
+    /// saving it. A new preview goes out only when the last one has finished, so a
+    /// fast drag never queues up a backlog of builds.
+    fn send_preview(&mut self) {
+        let Some(drag) = &mut self.param_drag else { return };
+        if drag.sent == Some(drag.value) || self.building.contains(&drag.part) {
+            return;
+        }
+        let (Some(loaded), Some(worker)) = (&self.project, &mut self.worker) else { return };
+        let Ok(part) = loaded.part(&drag.part) else { return };
+        let mut part = part.clone();
+        let Some(feature) = part.features.iter_mut().find(|f| f.id == drag.feature) else { return };
+        feature.params.insert(drag.name.clone(), drag.json());
+        if worker.rebuild(intercraft_tools::request_for(&loaded.dir, &part)).is_ok() {
+            for ((name, _), entry) in self.results.iter_mut() {
+                if *name == part.name {
+                    entry.stale = true;
+                }
+            }
+            self.building.insert(part.name);
+            drag.sent = Some(drag.value);
+        }
     }
 
     fn set_visible(&mut self, name: &str, visible: bool) {
@@ -860,9 +899,19 @@ impl State {
     }
 
     fn inspector_ui(&mut self, ui: &mut egui::Ui) {
+        let mut drag = self.param_drag.take();
+        let commit = self.inspector_contents(ui, &mut drag);
+        self.param_drag = drag;
+        if let Some(commit) = commit {
+            self.commit_param(commit);
+        }
+    }
+
+    /// Draws the Inspector. Returns a parameter edit to save, if there was one.
+    fn inspector_contents(&self, ui: &mut egui::Ui, drag: &mut Option<params::ParamDrag>) -> Option<params::ParamCommit> {
         let Some((_, part)) = self.selected_part() else {
             ui.weak("Select a part to see its steps.");
-            return;
+            return None;
         };
         // Follow the latest step unless one is picked on the timeline.
         let steps = steps(part);
@@ -872,7 +921,7 @@ impl State {
         };
         let Some(index) = index else {
             ui.weak("This part has no steps yet.");
-            return;
+            return None;
         };
         let step = &steps[index];
 
@@ -890,21 +939,27 @@ impl State {
             ui.label(egui::RichText::new(step.prompt).italics());
         }
 
+        let mut commit = None;
         if let Some(params) = step.params.filter(|p| !p.is_empty()) {
             ui.separator();
+            let editable = part.kind == PartKind::Design;
             egui::Grid::new("params").num_columns(2).show(ui, |ui| {
                 for (name, value) in params {
-                    ui.label(name);
-                    ui.monospace(value.to_string());
-                    ui.end_row();
+                    let key = (part.name.as_str(), step.id);
+                    if let Some(edit) = params::param_row(ui, key, name, value, editable, drag) {
+                        commit = Some(edit);
+                    }
                 }
             });
+            if drag.as_ref().is_some_and(|d| d.part == part.name) {
+                ui.weak("Previewing. Let go to save.");
+            }
         }
 
         ui.separator();
         let Some(entry) = self.results.get(&(part.name.clone(), step.id.to_owned())) else {
             ui.weak("Not built yet.");
-            return;
+            return commit;
         };
         let result = &entry.result;
         if let Some(error) = &result.error {
@@ -944,6 +999,7 @@ impl State {
                 ui.end_row();
             });
         }
+        commit
     }
 
     /// One card per step of the selected part, oldest on the left.

@@ -53,7 +53,7 @@ To see the live update, leave the app open and change a value in `examples/brack
 |---|---|
 | Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it, click the eye to hide or show it, and right-click for Show only this, Show all, Lock, Unlock and Delete. Delete removes the selected part while the pointer is over the list. |
 | Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. Right-click a step to delete it. |
-| Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). |
+| Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. |
 
 ### Menus
 
@@ -228,6 +228,6 @@ The suites include stress tests for both chat routes (a fake Messages API and a 
 6. OS-level isolation for the geometry worker
 7. OpenAI-compatible client (OpenAI, OpenRouter, local models through Ollama or LM Studio)
 8. Undo and history, hiding and deleting parts and steps (done)
-9. Editing steps from the timeline and Inspector
+9. Editing parameters in the Inspector with a live preview (done)
 10. Sketch panel
 11. Fit checks, section view, before and after overlay

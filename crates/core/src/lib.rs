@@ -125,6 +125,10 @@ pub struct Feature {
     pub file: String,
     #[serde(default)]
     pub params: Params,
+    /// Plain names for the parameters, e.g. "bore_d" -> "Bore diameter", shown in
+    /// place of the code names in the simple layout.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
     /// Snippet source. Read from `file` on load, not stored in project.json.
     #[serde(skip)]
     pub code: String,
@@ -138,6 +142,7 @@ pub struct NewFeature {
     pub params: Params,
     pub prompt: String,
     pub why: String,
+    pub labels: std::collections::BTreeMap<String, String>,
     /// Insert after this feature id. None appends to the end.
     pub after: Option<String>,
 }
@@ -150,6 +155,8 @@ pub struct FeatureEdit {
     pub params: Option<Params>,
     pub prompt: Option<String>,
     pub why: Option<String>,
+    /// Replaces all the parameter labels.
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A project plus where it lives, so it can be reloaded when files change.
@@ -461,6 +468,7 @@ impl LoadedProject {
     pub fn add_feature(&mut self, part_name: &str, new: NewFeature) -> Result<String> {
         check_feature_text(Some(&new.label), Some(&new.code), Some(&new.prompt))?;
         check_why(Some(&new.why))?;
+        check_labels(Some(&new.labels))?;
         let part = self.design_part_mut(part_name)?;
         if part.features.len() >= MAX_FEATURES_PER_PART {
             bail!("'{part_name}' already has {MAX_FEATURES_PER_PART} features, the most a part can hold");
@@ -494,6 +502,7 @@ impl LoadedProject {
                 label: new.label,
                 prompt: new.prompt,
                 why: new.why.trim().to_owned(),
+                labels: new.labels,
                 file,
                 params: new.params,
                 code: ensure_trailing_newline(new.code),
@@ -505,6 +514,7 @@ impl LoadedProject {
     pub fn edit_feature(&mut self, part_name: &str, id: &str, edit: FeatureEdit) -> Result<()> {
         check_feature_text(edit.label.as_deref(), edit.code.as_deref(), edit.prompt.as_deref())?;
         check_why(edit.why.as_deref())?;
+        check_labels(edit.labels.as_ref())?;
         let feature = self.feature_mut(part_name, id)?;
         if let Some(label) = edit.label {
             feature.label = label;
@@ -520,6 +530,9 @@ impl LoadedProject {
         }
         if let Some(why) = edit.why {
             feature.why = why.trim().to_owned();
+        }
+        if let Some(labels) = edit.labels {
+            feature.labels = labels;
         }
         Ok(())
     }
@@ -717,6 +730,19 @@ fn check_feature_text(label: Option<&str>, code: Option<&str>, prompt: Option<&s
     }
     if prompt.is_some_and(|p| p.chars().count() > MAX_PROMPT_CHARS) {
         bail!("the prompt is limited to {MAX_PROMPT_CHARS} characters");
+    }
+    Ok(())
+}
+
+fn check_labels(labels: Option<&std::collections::BTreeMap<String, String>>) -> Result<()> {
+    let Some(labels) = labels else { return Ok(()) };
+    if labels.len() > 50 {
+        bail!("give at most 50 parameter labels");
+    }
+    for (name, label) in labels {
+        if name.is_empty() || name.len() > 64 || label.trim().is_empty() || label.chars().count() > 40 {
+            bail!("each parameter label must be 1 to 40 characters, for a parameter name of 1 to 64");
+        }
     }
     Ok(())
 }
@@ -921,6 +947,21 @@ mod tests {
         // An unmoved part writes no placement at all.
         let text = std::fs::read_to_string(p.dir.join("project.json")).unwrap();
         assert_eq!(text.matches("\"position\"").count(), 1);
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn parameter_labels_are_kept_and_checked() {
+        let mut p = temp_project("labels");
+        p.add_part("P").unwrap();
+        let mut new = feature("Bore", None);
+        new.labels.insert("bore_d".into(), "Bore diameter".into());
+        let id = p.add_feature("P", new).unwrap();
+        p.save().unwrap();
+        let loaded = LoadedProject::load(&p.dir).unwrap();
+        assert_eq!(loaded.project.parts[0].features[0].labels["bore_d"], "Bore diameter");
+        let too_long = [("x".to_owned(), "y".repeat(41))].into_iter().collect();
+        assert!(p.edit_feature("P", &id, FeatureEdit { labels: Some(too_long), ..Default::default() }).is_err());
         std::fs::remove_dir_all(&p.dir).unwrap();
     }
 

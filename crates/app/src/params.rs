@@ -72,12 +72,16 @@ pub fn param_row(
     editable: bool,
     drag: &mut Option<ParamDrag>,
     simple: bool,
+    label: Option<&str>,
 ) -> Option<ParamCommit> {
-    if simple {
-        ui.label(friendly(name)).on_hover_text(format!("Called {name} in the step's code"));
-    } else {
-        ui.label(name);
-    }
+    // Simple shows the plain name (the model's label, or the code name made readable).
+    // Advanced shows the code name, with the plain name on hover.
+    match (simple, label) {
+        (true, Some(label)) => ui.label(label).on_hover_text(format!("Called {name} in the step's code")),
+        (true, None) => ui.label(friendly(name)).on_hover_text(format!("Called {name} in the step's code")),
+        (false, Some(label)) => ui.label(name).on_hover_text(label),
+        (false, None) => ui.label(name),
+    };
     let field = Field::Param { feature: feature.to_owned(), name: name.to_owned() };
 
     if let Some(mut on) = value.as_bool() {

@@ -962,3 +962,34 @@ fn the_chat_shows_what_replies_cost() {
     h.get_by_label_contains("chat ~$0.035");
     shot(&mut h, "cost_line");
 }
+
+#[test]
+fn design_terms_and_parameter_names_are_explained() {
+    let _one = one_at_a_time();
+    let _restore = RestoreExperience;
+    let project = example_project("glossary");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let labels = [("radius".to_owned(), "Corner rounding".to_owned())].into_iter().collect();
+    let edit = intercraft_core::FeatureEdit {
+        why: Some("A fillet takes the sharp corner off so it is nicer to hold.".into()),
+        labels: Some(labels),
+        ..Default::default()
+    };
+    h.state_mut().state.edit_project(|p| p.edit_feature("RodBracket", "f040", edit).and_then(|()| p.save())).unwrap();
+    h.step();
+
+    // The step's terms come with a plain explanation, unless the user chose Expert.
+    let tip = h.state().state.glossary_tip("Edge fillets").expect("fillet is explained");
+    assert!(tip.starts_with("Fillet: A rounded edge."));
+    h.state_mut().set_experience(settings::Explain::Expert, false);
+    assert!(h.state().state.glossary_tip("Edge fillets").is_none());
+
+    // The simple layout uses the model's plain name for the parameter.
+    h.state_mut().set_experience(settings::Explain::Beginner, true);
+    h.step();
+    h.step();
+    h.get_by_label("Corner rounding");
+    // Not the code name made readable ("Radius"): the model's label wins.
+    assert_eq!(h.query_all_by_label("Radius").count(), 0);
+}

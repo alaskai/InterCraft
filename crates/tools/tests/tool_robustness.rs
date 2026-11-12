@@ -230,3 +230,47 @@ fn export_writes_step_and_stl_files() {
     assert!(stl.len() > 84, "STL is empty");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn imported_part_can_be_inspected_measured_and_edited() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    // Make a STEP file to import: a 40 x 30 x 20 block with an 8.2 mm bore along Y.
+    let (mut maker, maker_dir) = project("import-src");
+    maker.call("add_part", &json!({ "name": "Block" })).unwrap();
+    add(&mut maker, "Block", "Body", "part = Box(40, 30, 20) - Rot(90, 0, 0) * Cylinder(4.1, 100)").unwrap();
+    maker.call("export_part", &json!({ "part": "Block", "format": "step" })).unwrap();
+
+    let (mut host, dir) = project("import-dst");
+    let mut loaded = intercraft_core::LoadedProject::create(&dir, "Imports").unwrap();
+    let name = loaded.import_step(&maker_dir.join("exports/Block.step")).unwrap();
+    loaded.save().unwrap();
+
+    let info = host.call("inspect_part", &json!({ "part": name })).unwrap();
+    let holes = info["cylindrical_faces"].as_array().unwrap();
+    assert_eq!(holes.len(), 1, "{info}");
+    assert!((holes[0]["diameter"].as_f64().unwrap() - 8.2).abs() < 1e-6);
+
+    // The bore's circular edges are 30 mm apart (the block's depth).
+    let circles: Vec<u64> = info["circle_edge_diameters"]["8.2"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+    let gap = host
+        .call("measure", &json!({ "part": name, "a": { "kind": "edge", "index": circles[0] }, "b": { "kind": "edge", "index": circles[1] } }))
+        .unwrap();
+    assert!((gap["distance"].as_f64().unwrap() - 30.0).abs() < 1e-6, "{gap}");
+    let single = host.call("measure", &json!({ "part": name, "a": { "kind": "edge", "index": circles[0] } })).unwrap();
+    assert_eq!(single["a"]["diameter"].as_f64().unwrap(), 8.2);
+    assert!(host.call("measure", &json!({ "part": name, "a": { "kind": "edge", "index": 9999 } })).is_err());
+    assert!(host.call("measure", &json!({ "part": name, "a": { "kind": "solid", "index": 0 } })).is_err());
+
+    // The model edits the imported shape like any other part.
+    let report = add(&mut host, &name, "Pocket", "part = part - Pos(0, 0, 10) * Box(10, 10, 4)").unwrap();
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["features"][0]["id"], "import");
+    let change = report["features"][1]["volume_change_mm3"].as_f64().unwrap();
+    assert!((change + 200.0).abs() < 1e-3, "the pocket should remove 200 mm³, removed {change}");
+
+    std::fs::remove_dir_all(maker_dir).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

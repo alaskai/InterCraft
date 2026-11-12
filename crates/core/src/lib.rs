@@ -43,9 +43,15 @@ pub struct Part {
     pub name: String,
     #[serde(default)]
     pub kind: PartKind,
+    /// An imported STEP file the part starts from, e.g. "imports/bracket.step".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(default)]
     pub features: Vec<Feature>,
 }
+
+/// Largest STEP file accepted for import.
+pub const MAX_IMPORT_BYTES: u64 = 200 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Feature {
@@ -104,6 +110,9 @@ impl LoadedProject {
         let mut part_names = HashSet::new();
         for part in &mut project.parts {
             check_part_name(&part.name)?;
+            if let Some(source) = &part.source {
+                check_import_path(source)?;
+            }
             if !part_names.insert(part.name.to_ascii_lowercase()) {
                 bail!("project.json lists the part '{}' twice", part.name);
             }
@@ -178,8 +187,67 @@ impl LoadedProject {
         self.project.parts.push(Part {
             name: name.to_owned(),
             kind: PartKind::Design,
+            source: None,
             features: Vec::new(),
         });
+        Ok(())
+    }
+
+    /// Copy a STEP file into the project's imports folder and add a part that starts
+    /// from it. Returns the new part's name. Call `save` afterwards.
+    pub fn import_step(&mut self, file: &Path) -> Result<String> {
+        let ext = file.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if ext != "step" && ext != "stp" {
+            bail!("only .step and .stp files can be imported");
+        }
+        let size = std::fs::metadata(file).with_context(|| format!("reading {}", file.display()))?.len();
+        if size > MAX_IMPORT_BYTES {
+            bail!("that file is {} MB; the limit is {} MB", size >> 20, MAX_IMPORT_BYTES >> 20);
+        }
+
+        // A part name from the file name, made safe and unique.
+        let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut base: String = stem
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect::<String>()
+            .trim_matches('_')
+            .chars()
+            .take(48)
+            .collect();
+        if base.is_empty() || check_part_name(&base).is_err() {
+            base = "Imported".to_owned();
+        }
+        let taken = |name: &str| self.project.parts.iter().any(|p| p.name.eq_ignore_ascii_case(name));
+        let mut name = base.clone();
+        let mut n = 2;
+        while taken(&name) || self.dir.join("imports").join(format!("{name}.{ext}")).exists() {
+            name = format!("{base}_{n}");
+            n += 1;
+        }
+
+        let relative = format!("imports/{name}.{ext}");
+        let target = self.dir.join(&relative);
+        std::fs::create_dir_all(self.dir.join("imports"))?;
+        std::fs::copy(file, &target).with_context(|| format!("copying into {}", target.display()))?;
+        self.project.parts.push(Part {
+            name: name.clone(),
+            kind: PartKind::Design,
+            source: Some(relative),
+            features: Vec::new(),
+        });
+        Ok(name)
+    }
+
+    /// Lock a part (reference) or unlock it (design).
+    pub fn set_kind(&mut self, part_name: &str, kind: PartKind) -> Result<()> {
+        let part = self
+            .project
+            .parts
+            .iter_mut()
+            .find(|p| p.name == part_name)
+            .with_context(|| format!("no part named '{part_name}'"))?;
+        part.kind = kind;
         Ok(())
     }
 
@@ -280,6 +348,9 @@ impl LoadedProject {
     pub fn watched_files(&self) -> Vec<PathBuf> {
         let mut files = vec![self.dir.join("project.json")];
         for part in &self.project.parts {
+            if let Some(source) = &part.source {
+                files.push(self.dir.join(source));
+            }
             for feature in &part.features {
                 files.push(self.dir.join(&feature.file));
             }
@@ -322,6 +393,20 @@ fn check_snippet_path(file: &str) -> Result<()> {
     let plain = path.components().all(|c| matches!(c, Component::Normal(_)));
     if file.is_empty() || !plain || path.extension().is_none_or(|e| e != "py") {
         bail!("snippet path '{file}' must be a .py file inside the project folder");
+    }
+    Ok(())
+}
+
+/// An imported file must sit directly in the project's imports folder.
+fn check_import_path(source: &str) -> Result<()> {
+    let path = Path::new(source);
+    let parts: Vec<_> = path.components().collect();
+    let in_imports = parts.len() == 2
+        && matches!(parts[0], Component::Normal(first) if first == "imports")
+        && matches!(parts[1], Component::Normal(_));
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
+    if !in_imports || !matches!(ext.as_deref(), Some("step") | Some("stp")) {
+        bail!("imported file '{source}' must be a .step or .stp file in the project's imports folder");
     }
     Ok(())
 }
@@ -473,6 +558,35 @@ mod tests {
         assert!(p.add_feature("Bracket", big).is_err());
         assert!(p.add_feature("Bracket", feature(&"L".repeat(200), None)).is_err());
         assert!(p.add_feature("Bracket", feature("   ", None)).is_err());
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn import_copies_the_file_and_names_the_part() {
+        let mut p = temp_project("import");
+        let src = p.dir.join("Corner Bracket v2 (final).STEP");
+        std::fs::write(&src, "ISO-10303-21;").unwrap();
+        let first = p.import_step(&src).unwrap();
+        let second = p.import_step(&src).unwrap();
+        assert_eq!(first, "Corner_Bracket_v2__final");
+        assert_eq!(second, "Corner_Bracket_v2__final_2");
+        p.save().unwrap();
+        let loaded = LoadedProject::load(&p.dir).unwrap();
+        let source = loaded.project.parts[0].source.clone().unwrap();
+        assert_eq!(source, "imports/Corner_Bracket_v2__final.step");
+        assert!(p.dir.join(&source).exists());
+        assert!(p.import_step(&p.dir.join("notes.txt")).is_err());
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn load_refuses_imports_outside_the_imports_folder() {
+        let p = temp_project("import-paths");
+        for source in ["../x.step", "C:/x.step", "imports/../../x.step", "imports/x.txt", "x.step", "imports/a/b.step"] {
+            let json = format!(r#"{{"name":"T","parts":[{{"name":"P","source":"{source}","features":[]}}]}}"#);
+            std::fs::write(p.dir.join("project.json"), json).unwrap();
+            assert!(LoadedProject::load(&p.dir).is_err(), "accepted {source}");
+        }
         std::fs::remove_dir_all(&p.dir).unwrap();
     }
 

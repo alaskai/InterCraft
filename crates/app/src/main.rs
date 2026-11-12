@@ -3,8 +3,11 @@
 // Worker: Python 3.11, build123d 0.13.0, numpy 2.4.6
 
 mod chat;
+mod measure;
 mod menus;
 mod settings;
+#[cfg(test)]
+mod ui_tests;
 mod viewport;
 
 use std::collections::{HashMap, HashSet};
@@ -14,10 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui;
 use egui_dock::{DockArea, DockState, TabViewer};
 use intercraft_core::{LoadedProject, Part, PartKind};
-use intercraft_geo::{
-    ExportFormat, FeatureInput, FeatureResult, GeoEvent, GeometryBackend, Mesh, PythonWorker,
-    RebuildRequest, Report,
-};
+use intercraft_geo::{ExportFormat, FeatureResult, GeoEvent, GeometryBackend, Mesh, PythonWorker, Report};
 use viewport::Viewport;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -108,6 +108,7 @@ struct State {
 
     viewport: Viewport,
     chat: chat::ChatPanel,
+    measure: measure::MeasureTool,
 
     exports_pending: usize,
     exported: Vec<String>,
@@ -149,6 +150,7 @@ impl App {
             hidden: HashSet::new(),
             viewport: Viewport::new(render_state),
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
+            measure: measure::MeasureTool::default(),
             exports_pending: 0,
             exported: Vec::new(),
             shown_name: None,
@@ -271,6 +273,133 @@ impl State {
         Ok(())
     }
 
+    /// Pick a STEP file and add it to the project as a new part.
+    fn import_step_dialog(&mut self) {
+        let Some(file) = rfd::FileDialog::new()
+            .set_title("Import a STEP file")
+            .add_filter("STEP", &["step", "stp", "STEP", "STP"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.import_step(&file);
+    }
+
+    fn import_step(&mut self, file: &std::path::Path) {
+        let Some(loaded) = self.project.as_mut() else { return };
+        let result = loaded.import_step(file).and_then(|name| loaded.save().map(|()| name));
+        match result {
+            Ok(name) => {
+                self.worker_status = format!("Imported {} as the part '{name}'", file.display());
+                self.selected_part = Some(name);
+                self.selected_step = None;
+                self.reload_project();
+            }
+            Err(e) => self.worker_status = format!("Import failed: {e:#}"),
+        }
+    }
+
+    fn set_part_kind(&mut self, name: &str, kind: PartKind) {
+        let Some(loaded) = self.project.as_mut() else { return };
+        match loaded.set_kind(name, kind).and_then(|()| loaded.save()) {
+            Ok(()) => self.reload_project(),
+            Err(e) => self.worker_status = format!("Couldn't change '{name}': {e:#}"),
+        }
+    }
+
+    /// Toolbar, keyboard shortcuts and the measuring tool, drawn over the 3D view.
+    fn viewport_overlay(&mut self, ui: &mut egui::Ui, input: viewport::ViewportInput) {
+        let rect = input.rect;
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        if input.hover.is_some() && !typing {
+            if ui.input(|i| i.key_pressed(egui::Key::M)) {
+                self.measure.toggle();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::F)) {
+                self.viewport.fit();
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::E)) {
+                self.viewport.show_edges = !self.viewport.show_edges;
+            }
+        }
+        if self.measure.active && !typing && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.measure.picks.is_empty() {
+                self.measure.toggle();
+            } else {
+                self.measure.clear();
+            }
+        }
+
+        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(300.0, 30.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Fit").on_hover_text("Fit to view (F, or double click)").clicked() {
+                        self.viewport.fit();
+                    }
+                    if ui.selectable_label(self.measure.active, "Measure").on_hover_text("Measure (M)").clicked() {
+                        self.measure.toggle();
+                    }
+                    if ui.selectable_label(self.viewport.show_edges, "Edges").on_hover_text("Show edges (E)").clicked() {
+                        self.viewport.show_edges = !self.viewport.show_edges;
+                    }
+                });
+            });
+        });
+
+        if !self.measure.active {
+            return;
+        }
+        self.measure.hover = input.hover.and_then(|p| self.viewport.pick(p));
+        if input.hover.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        if let Some(pos) = input.clicked {
+            if let Some(hit) = self.viewport.pick(pos) {
+                if let Some(key) = self.shown.get(&hit.part).and_then(|p| Mesh::key_of(p)) {
+                    let (a, b) = self.measure.click(hit, key);
+                    match self.worker.as_mut().map(|w| w.request_measure(a, b)) {
+                        Some(Ok(id)) => self.measure.sent(id),
+                        Some(Err(e)) => self.worker_status = format!("Measure failed: {e:#}"),
+                        None => self.worker_status = "Measuring needs the geometry worker, which isn't running.".to_owned(),
+                    }
+                }
+            }
+        }
+
+        let painter = ui.painter_at(rect);
+        let first = egui::Color32::from_rgb(240, 150, 40);
+        let second = egui::Color32::from_rgb(40, 190, 230);
+        if let Some(hover) = &self.measure.hover {
+            self.viewport.draw_hit(&painter, hover, egui::Color32::from_white_alpha(200));
+        }
+        for (i, picked) in self.measure.picks.iter().enumerate() {
+            self.viewport.draw_hit(&painter, &picked.hit, if i == 0 { first } else { second });
+        }
+        if let Some((a, b)) = self.measure.line() {
+            if let (Some(sa), Some(sb)) = (self.viewport.project(a), self.viewport.project(b)) {
+                painter.line_segment([sa, sb], egui::Stroke::new(2.0, egui::Color32::WHITE));
+                painter.circle_filled(sa, 3.0, first);
+                painter.circle_filled(sb, 3.0, second);
+                if let Some(text) = self.measure.distance_text() {
+                    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(14.0), egui::Color32::WHITE);
+                    let mid = sa + (sb - sa) * 0.5;
+                    let label = egui::Rect::from_center_size(mid, galley.size() + egui::vec2(10.0, 6.0));
+                    painter.rect_filled(label, 4.0, egui::Color32::from_black_alpha(190));
+                    painter.galley(label.min + egui::vec2(5.0, 3.0), galley, egui::Color32::WHITE);
+                }
+            }
+        }
+
+        let panel = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 46.0), egui::vec2(320.0, 170.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(300.0);
+                self.measure.panel_ui(ui);
+            });
+        });
+    }
+
     /// Write parts to the project's exports folder, using the viewer's own worker.
     fn export(&mut self, parts: &[String], format: ExportFormat) {
         let (Some(loaded), Some(worker)) = (&self.project, &mut self.worker) else {
@@ -284,14 +413,7 @@ impl State {
         }
         for name in parts {
             let Ok(part) = loaded.part(name) else { continue };
-            let request = RebuildRequest {
-                part: part.name.clone(),
-                features: part
-                    .features
-                    .iter()
-                    .map(|f| FeatureInput { id: f.id.clone(), code: f.code.clone(), params: f.params.clone() })
-                    .collect(),
-            };
+            let request = intercraft_tools::request_for(&loaded.dir, part);
             match worker.request_export(request, format, &dir.join(format!("{}.{ext}", part.name))) {
                 Ok(()) => self.exports_pending += 1,
                 Err(e) => self.worker_status = format!("Export failed: {e:#}"),
@@ -318,6 +440,8 @@ impl State {
                 self.last_mtime = loaded.latest_mtime();
                 self.project_error = None;
                 self.project = Some(loaded);
+                // Picks point at shapes that are about to change.
+                self.measure.clear();
                 self.rebuild_all();
             }
             // Keep showing the last good project. A half-saved file shouldn't blank the view.
@@ -332,16 +456,7 @@ impl State {
             entry.stale = true;
         }
         for part in &loaded.project.parts {
-            let features = part
-                .features
-                .iter()
-                .map(|f| FeatureInput {
-                    id: f.id.clone(),
-                    code: f.code.clone(),
-                    params: f.params.clone(),
-                })
-                .collect();
-            match worker.rebuild(RebuildRequest { part: part.name.clone(), features }) {
+            match worker.rebuild(intercraft_tools::request_for(&loaded.dir, part)) {
                 Ok(()) => {
                     self.building.insert(part.name.clone());
                 }
@@ -402,12 +517,17 @@ impl State {
                     // Anything still stale was removed from the project or sits after a failure.
                     self.results.retain(|(p, _), e| p != &part || !e.stale);
                 }
-                GeoEvent::Error { error } if self.exports_pending > 0 => {
+                GeoEvent::Measured { id, data } => self.measure.result(id, Ok(data)),
+                GeoEvent::Inspected { .. } => {}
+                GeoEvent::Error { id: Some(id), error } if self.measure.waiting_for(id) => {
+                    self.measure.result(id, Err(error));
+                }
+                GeoEvent::Error { error, .. } if self.exports_pending > 0 => {
                     self.exports_pending -= 1;
                     let first = error.lines().next().unwrap_or_default();
                     self.worker_status = format!("Export failed: {first}");
                 }
-                GeoEvent::Error { error } => self.worker_status = format!("Worker error: {error}"),
+                GeoEvent::Error { error, .. } => self.worker_status = format!("Worker error: {error}"),
                 GeoEvent::Exported { path } => {
                     self.exports_pending = self.exports_pending.saturating_sub(1);
                     if let Some(name) = path.file_name() {
@@ -433,15 +553,15 @@ impl State {
 
         for (i, part) in loaded.project.parts.iter().enumerate() {
             let mut wanted = None;
-            for feature in &part.features {
-                let key = (part.name.clone(), feature.id.clone());
+            for step in steps(part) {
+                let key = (part.name.clone(), step.id.to_owned());
                 match self.results.get(&key) {
                     Some(Entry { result, stale: false }) if result.ok => {
                         wanted = result.mesh.clone();
                     }
                     _ => break,
                 }
-                if self.is_selected_step(&part.name, &feature.id) {
+                if self.is_selected_step(&part.name, step.id) {
                     break;
                 }
             }
@@ -453,7 +573,7 @@ impl State {
             }
             match Mesh::load(&path) {
                 Ok(mesh) => {
-                    self.viewport.set_mesh(&part.name, &mesh, part_color(part.kind, i));
+                    self.viewport.set_mesh(&part.name, mesh, part_color(part.kind, i));
                     self.shown.insert(part.name.clone(), path);
                 }
                 Err(e) => self.worker_status = format!("Mesh load failed: {e:#}"),
@@ -474,7 +594,7 @@ impl State {
             .as_ref()
             .and_then(|name| parts.iter().find(|p| &p.name == name))
             .or(parts.first());
-        let still_there = |step: &String| part.is_some_and(|p| p.features.iter().any(|f| &f.id == step));
+        let still_there = |step: &String| part.is_some_and(|p| steps(p).iter().any(|s| s.id == step));
         if !self.selected_step.as_ref().is_none_or(still_there) {
             self.selected_step = None;
         }
@@ -494,12 +614,13 @@ impl State {
 
     /// Overall state of a part: failed beats rebuilding beats built.
     fn part_status(&self, ui: &egui::Ui, part: &Part) -> (egui::Color32, &'static str) {
-        if part.features.is_empty() {
+        let steps = steps(part);
+        if steps.is_empty() {
             return (ui.visuals().weak_text_color(), "No steps yet");
         }
         let mut status = (egui::Color32::from_rgb(70, 170, 90), "Built");
-        for feature in &part.features {
-            match self.results.get(&(part.name.clone(), feature.id.clone())) {
+        for step in &steps {
+            match self.results.get(&(part.name.clone(), step.id.to_owned())) {
                 Some(e) if !e.stale && !e.result.ok => {
                     return (ui.visuals().error_fg_color, "A step failed");
                 }
@@ -511,8 +632,8 @@ impl State {
     }
 
     fn latest_report(&self, part: &Part) -> Option<&Report> {
-        let last = part.features.last()?;
-        let entry = self.results.get(&(part.name.clone(), last.id.clone()))?;
+        let last = steps(part).pop()?;
+        let entry = self.results.get(&(part.name.clone(), last.id.to_owned()))?;
         entry.result.report.as_ref()
     }
 
@@ -530,6 +651,8 @@ impl State {
 
         let mut clicked = None;
         let mut visibility = None;
+        let mut lock = None;
+        let mut import = false;
         for (i, part) in loaded.project.parts.iter().enumerate() {
             let selected = self.selected_part.as_ref() == Some(&part.name);
             let fill = if selected {
@@ -563,7 +686,7 @@ impl State {
                         PartKind::Design => "design",
                         PartKind::Reference => "reference",
                     };
-                    let mut detail = format!("{kind} · {}", plural(part.features.len(), "step"));
+                    let mut detail = format!("{kind} · {}", plural(steps(part).len(), "step"));
                     if let Some(r) = self.latest_report(part) {
                         detail += &format!(" · {:.1} mm³", r.volume);
                     }
@@ -574,8 +697,28 @@ impl State {
             if response.clicked() {
                 clicked = Some(part.name.clone());
             }
+            response.context_menu(|ui| {
+                let (label, kind) = match part.kind {
+                    PartKind::Design => ("Lock as reference", PartKind::Reference),
+                    PartKind::Reference => ("Unlock for editing", PartKind::Design),
+                };
+                if ui.button(label).clicked() {
+                    lock = Some((part.name.clone(), kind));
+                    ui.close();
+                }
+            });
+        }
+        ui.add_space(6.0);
+        if ui.button("Import STEP...").on_hover_text("Add a part from a STEP file").clicked() {
+            import = true;
         }
 
+        if let Some((name, kind)) = lock {
+            self.set_part_kind(&name, kind);
+        }
+        if import {
+            self.import_step_dialog();
+        }
         if let Some((name, visible)) = visibility {
             self.viewport.set_visible(&name, visible);
             if visible {
@@ -598,34 +741,35 @@ impl State {
             return;
         };
         // Follow the latest step unless one is picked on the timeline.
+        let steps = steps(part);
         let index = match &self.selected_step {
-            Some(id) => part.features.iter().position(|f| &f.id == id),
-            None => part.features.len().checked_sub(1),
+            Some(id) => steps.iter().position(|s| s.id == id),
+            None => steps.len().checked_sub(1),
         };
         let Some(index) = index else {
             ui.weak("This part has no steps yet.");
             return;
         };
-        let feature = &part.features[index];
+        let step = &steps[index];
 
         ui.weak(format!(
             "{} · step {} of {}{}",
             part.name,
             index + 1,
-            part.features.len(),
+            steps.len(),
             if self.selected_step.is_none() { " (latest)" } else { "" }
         ));
-        ui.heading(&feature.label);
-        ui.weak(&feature.file);
-        if !feature.prompt.is_empty() {
+        ui.heading(&step.label);
+        ui.weak(step.file);
+        if !step.prompt.is_empty() {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(&feature.prompt).italics());
+            ui.label(egui::RichText::new(step.prompt).italics());
         }
 
-        if !feature.params.is_empty() {
+        if let Some(params) = step.params.filter(|p| !p.is_empty()) {
             ui.separator();
             egui::Grid::new("params").num_columns(2).show(ui, |ui| {
-                for (name, value) in &feature.params {
+                for (name, value) in params {
                     ui.label(name);
                     ui.monospace(value.to_string());
                     ui.end_row();
@@ -634,7 +778,7 @@ impl State {
         }
 
         ui.separator();
-        let Some(entry) = self.results.get(&(part.name.clone(), feature.id.clone())) else {
+        let Some(entry) = self.results.get(&(part.name.clone(), step.id.to_owned())) else {
             ui.weak("Not built yet.");
             return;
         };
@@ -688,7 +832,7 @@ impl State {
             ui.strong(&part.name);
             ui.weak(format!(
                 "{}. Click a step to see the part as it was then.",
-                plural(part.features.len(), "step")
+                plural(steps(part).len(), "step")
             ));
         });
         ui.add_space(4.0);
@@ -696,33 +840,25 @@ impl State {
         let mut clicked = None;
         egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
-                for (i, feature) in part.features.iter().enumerate() {
-                    let entry = self.results.get(&(part.name.clone(), feature.id.clone()));
-                    let selected = self.selected_step.as_ref() == Some(&feature.id);
+                for (i, step) in steps(part).iter().enumerate() {
+                    let entry = self.results.get(&(part.name.clone(), step.id.to_owned()));
+                    let selected = self.selected_step.as_deref() == Some(step.id);
                     let response = step_card(ui, selected, |ui| {
                         ui.horizontal(|ui| {
                             let (color, hint) = status_dot(ui, entry);
                             paint_dot(ui, color, hint);
-                            ui.strong(format!("{}  {}", i + 1, feature.label));
+                            ui.strong(format!("{}  {}", i + 1, step.label));
                         });
                         if let Some(text) = entry.and_then(|e| volume_delta(&e.result)) {
                             ui.weak(text);
                         }
-                        let prompt = if feature.prompt.is_empty() {
-                            "(no prompt recorded)"
-                        } else {
-                            feature.prompt.as_str()
-                        };
+                        let prompt = if step.prompt.is_empty() { "(no prompt recorded)" } else { step.prompt };
                         let text = egui::RichText::new(shorten(prompt, 90)).italics().weak();
                         ui.add(egui::Label::new(text).wrap());
                     });
-                    let response = if feature.prompt.is_empty() {
-                        response
-                    } else {
-                        response.on_hover_text(&feature.prompt)
-                    };
+                    let response = if step.prompt.is_empty() { response } else { response.on_hover_text(step.prompt) };
                     if response.clicked() {
-                        clicked = Some(if selected { None } else { Some(feature.id.clone()) });
+                        clicked = Some(if selected { None } else { Some(step.id.to_owned()) });
                     }
                 }
 
@@ -741,6 +877,37 @@ impl State {
     }
 }
 
+/// One step of a part as the panels show it: the imported file, or a feature.
+struct Step<'a> {
+    id: &'a str,
+    label: String,
+    prompt: &'a str,
+    file: &'a str,
+    params: Option<&'a intercraft_core::Params>,
+}
+
+fn steps(part: &Part) -> Vec<Step<'_>> {
+    let mut list = Vec::with_capacity(part.features.len() + 1);
+    if let Some(source) = &part.source {
+        let name = source.rsplit('/').next().unwrap_or(source);
+        list.push(Step {
+            id: intercraft_geo::IMPORT_STEP_ID,
+            label: format!("Imported {name}"),
+            prompt: "Starting shape from an imported STEP file.",
+            file: source,
+            params: None,
+        });
+    }
+    list.extend(part.features.iter().map(|f| Step {
+        id: &f.id,
+        label: f.label.clone(),
+        prompt: &f.prompt,
+        file: &f.file,
+        params: Some(&f.params),
+    }));
+    list
+}
+
 fn step_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let visuals = ui.visuals();
     let stroke = if selected {
@@ -754,7 +921,7 @@ fn step_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui))
         .corner_radius(6.0)
         .inner_margin(8)
         .show(ui, |ui| {
-            ui.set_width(170.0);
+            ui.set_width(150.0);
             ui.set_min_height(70.0);
             // The timeline row is horizontal, so stack the card's own contents.
             ui.vertical(add);
@@ -824,7 +991,10 @@ impl TabViewer for State {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         match tab {
-            Tab::Viewport => self.viewport.ui(ui),
+            Tab::Viewport => {
+                let input = self.viewport.ui(ui);
+                self.viewport_overlay(ui, input);
+            }
             Tab::Parts => self.parts_ui(ui),
             Tab::Inspector => self.inspector_ui(ui),
             Tab::Timeline => self.timeline_ui(ui),
@@ -846,8 +1016,10 @@ impl TabViewer for State {
     }
 
     // The viewport draws its own background, edge to edge.
-    fn clear_background(&self, tab: &Tab) -> bool {
-        *tab != Tab::Viewport
+    // Every tab, the viewport included, gets the panel background, so the dock's
+    // margin around the 3D view matches the rest of the window.
+    fn clear_background(&self, _tab: &Tab) -> bool {
+        true
     }
 
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {

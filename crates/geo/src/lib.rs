@@ -16,7 +16,24 @@ pub struct FeatureInput {
     pub id: String,
     pub code: String,
     pub params: serde_json::Map<String, serde_json::Value>,
+    /// For a part's first step: a STEP file (already checked to be inside the
+    /// project's imports folder) that becomes the starting shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<PathBuf>,
 }
+
+impl FeatureInput {
+    pub fn snippet(id: &str, code: &str, params: &serde_json::Map<String, serde_json::Value>) -> Self {
+        Self { id: id.to_owned(), code: code.to_owned(), params: params.clone(), import: None }
+    }
+
+    pub fn import(path: PathBuf) -> Self {
+        Self { id: IMPORT_STEP_ID.to_owned(), code: String::new(), params: Default::default(), import: Some(path) }
+    }
+}
+
+/// Feature id of the imported-file step at the start of an imported part.
+pub const IMPORT_STEP_ID: &str = "import";
 
 #[derive(Debug, Clone)]
 pub struct RebuildRequest {
@@ -57,7 +74,13 @@ pub enum GeoEvent {
     Feature(FeatureResult),
     Done { part: String },
     Exported { path: PathBuf },
-    Error { error: String },
+    Measured { id: u64, data: serde_json::Value },
+    Inspected { id: u64, data: serde_json::Value },
+    Error {
+        #[serde(default)]
+        id: Option<u64>,
+        error: String,
+    },
     /// The worker process ended. Not sent by the worker itself.
     #[serde(skip)]
     Exited,
@@ -171,7 +194,7 @@ impl PythonWorker {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let event = serde_json::from_str::<GeoEvent>(&line).unwrap_or_else(|e| {
-                    GeoEvent::Error { error: format!("bad worker message: {e}: {line}") }
+                    GeoEvent::Error { id: None, error: format!("bad worker message: {e}: {line}") }
                 });
                 if tx.send(event).is_err() {
                     return;
@@ -204,7 +227,14 @@ impl PythonWorker {
         if matches!(event, GeoEvent::Ready { .. }) {
             self.ready = true;
         }
-        if matches!(event, GeoEvent::Done { .. } | GeoEvent::Exported { .. } | GeoEvent::Error { .. }) {
+        if matches!(
+            event,
+            GeoEvent::Done { .. }
+                | GeoEvent::Exported { .. }
+                | GeoEvent::Measured { .. }
+                | GeoEvent::Inspected { .. }
+                | GeoEvent::Error { .. }
+        ) {
             self.in_flight = self.in_flight.saturating_sub(1);
         }
     }
@@ -251,7 +281,39 @@ impl PythonWorker {
             match self.recv_blocking()? {
                 GeoEvent::Feature(result) => results.push(result),
                 GeoEvent::Done { .. } => return Ok(results),
-                GeoEvent::Error { error } => bail!(error),
+                GeoEvent::Error { error, .. } => bail!(error),
+                _ => {}
+            }
+        }
+    }
+
+    /// Ask for a measurement without waiting. `a` and `b` select an edge, vertex, face or
+    /// point of a built shape, e.g. `{"mesh": key, "kind": "edge", "index": 3}`. With
+    /// only `a`, the result describes that one item (length, radius...). Returns the
+    /// request id, which comes back on `GeoEvent::Measured` or `Error`.
+    pub fn request_measure(&mut self, a: serde_json::Value, b: Option<serde_json::Value>) -> Result<u64> {
+        let id = self.next_id;
+        self.send(serde_json::json!({ "cmd": "measure", "a": a, "b": b }))?;
+        Ok(id)
+    }
+
+    pub fn measure_blocking(&mut self, a: serde_json::Value, b: Option<serde_json::Value>) -> Result<serde_json::Value> {
+        let id = self.request_measure(a, b)?;
+        self.wait_for(id)
+    }
+
+    /// Faces, holes and circular edges of a built shape, by its mesh key.
+    pub fn inspect_blocking(&mut self, mesh_key: &str) -> Result<serde_json::Value> {
+        let id = self.next_id;
+        self.send(serde_json::json!({ "cmd": "inspect", "mesh": mesh_key }))?;
+        self.wait_for(id)
+    }
+
+    fn wait_for(&mut self, id: u64) -> Result<serde_json::Value> {
+        loop {
+            match self.recv_blocking()? {
+                GeoEvent::Measured { id: got, data } | GeoEvent::Inspected { id: got, data } if got == id => return Ok(data),
+                GeoEvent::Error { id: Some(got), error } if got == id => bail!(error),
                 _ => {}
             }
         }
@@ -273,7 +335,7 @@ impl PythonWorker {
         loop {
             match self.recv_blocking()? {
                 GeoEvent::Exported { path } => return Ok(path),
-                GeoEvent::Error { error } => bail!(error),
+                GeoEvent::Error { error, .. } => bail!(error),
                 _ => {}
             }
         }
@@ -343,27 +405,49 @@ pub struct Mesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub indices: Vec<u32>,
+    /// One polyline per BRep edge, in the shape's edge order.
+    pub edges: Vec<Vec<[f32; 3]>>,
+    /// BRep vertices (corners), in the shape's vertex order.
+    pub corners: Vec<[f32; 3]>,
 }
 
 impl Mesh {
+    /// The key the worker caches this shape under, for measure and inspect requests.
+    pub fn key_of(path: &Path) -> Option<String> {
+        Some(path.file_stem()?.to_string_lossy().into_owned())
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        if bytes.len() < 12 || &bytes[0..4] != b"ICM1" {
-            bail!("{} is not an ICM1 mesh", path.display());
+        Self::parse(&bytes).with_context(|| format!("reading mesh {}", path.display()))
+    }
+
+    /// ICM2: header, triangles, then edge polylines and corner points.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader { bytes, at: 0 };
+        if r.take(4)? != b"ICM2" {
+            bail!("not an ICM2 mesh");
         }
-        let nv = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
-        let nt = u32::from_le_bytes(bytes[8..12].try_into()?) as usize;
-        let pos_end = 12 + nv * 12;
-        let nrm_end = pos_end + nv * 12;
-        let idx_end = nrm_end + nt * 12;
-        if bytes.len() != idx_end {
-            bail!("{} has the wrong length", path.display());
+        let nv = r.u32()? as usize;
+        let nt = r.u32()? as usize;
+        let positions = r.points(nv)?;
+        let normals = r.points(nv)?;
+        let indices: Vec<u32> = bytemuck::pod_collect_to_vec(r.take(nt * 12)?);
+        if indices.iter().any(|&i| i as usize >= nv) {
+            bail!("a triangle points past the vertex list");
         }
-        Ok(Self {
-            positions: bytemuck::pod_collect_to_vec(&bytes[12..pos_end]),
-            normals: bytemuck::pod_collect_to_vec(&bytes[pos_end..nrm_end]),
-            indices: bytemuck::pod_collect_to_vec(&bytes[nrm_end..idx_end]),
-        })
+        let edge_count = r.u32()? as usize;
+        let mut edges = Vec::with_capacity(edge_count.min(100_000));
+        for _ in 0..edge_count {
+            let n = r.u32()? as usize;
+            edges.push(r.points(n)?);
+        }
+        let corner_count = r.u32()? as usize;
+        let corners = r.points(corner_count)?;
+        if r.at != bytes.len() {
+            bail!("trailing bytes after the mesh");
+        }
+        Ok(Self { positions, normals, indices, edges, corners })
     }
 
     /// Min and max corners, or None for an empty mesh.
@@ -376,6 +460,78 @@ impl Mesh {
             }
             (lo, hi)
         }))
+    }
+}
+
+/// Bounds-checked little-endian reader, so a damaged mesh file is an error, not a panic.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self.at.checked_add(n).filter(|&e| e <= self.bytes.len());
+        let Some(end) = end else { bail!("mesh file is truncated") };
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
+    }
+
+    fn points(&mut self, n: usize) -> Result<Vec<[f32; 3]>> {
+        let len = n.checked_mul(12).ok_or_else(|| anyhow::anyhow!("mesh count overflows"))?;
+        Ok(bytemuck::pod_collect_to_vec(self.take(len)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Vec<u8> {
+        let mut b = b"ICM2".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend(1u32.to_le_bytes());
+        for v in [[0f32, 0., 0.], [1., 0., 0.], [0., 1., 0.]] {
+            b.extend(bytemuck::cast_slice(&v));
+        }
+        for _ in 0..3 {
+            b.extend(bytemuck::cast_slice(&[0f32, 0., 1.]));
+        }
+        b.extend(bytemuck::cast_slice(&[0u32, 1, 2]));
+        b.extend(1u32.to_le_bytes()); // one edge
+        b.extend(2u32.to_le_bytes());
+        b.extend(bytemuck::cast_slice(&[0f32, 0., 0., 1., 0., 0.]));
+        b.extend(1u32.to_le_bytes()); // one corner
+        b.extend(bytemuck::cast_slice(&[0f32, 0., 0.]));
+        b
+    }
+
+    #[test]
+    fn parses_a_mesh_with_edges() {
+        let mesh = Mesh::parse(&sample()).unwrap();
+        assert_eq!((mesh.positions.len(), mesh.indices.len(), mesh.edges.len(), mesh.corners.len()), (3, 3, 1, 1));
+    }
+
+    #[test]
+    fn damaged_files_are_errors_not_panics() {
+        let good = sample();
+        for cut in 0..good.len() {
+            assert!(Mesh::parse(&good[..cut]).is_err(), "accepted a file cut at {cut}");
+        }
+        let mut bad_index = good.clone();
+        bad_index[12 + 72..12 + 76].copy_from_slice(&99u32.to_le_bytes());
+        assert!(Mesh::parse(&bad_index).is_err());
+        let mut huge = good.clone();
+        huge[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Mesh::parse(&huge).is_err());
+        let mut extra = good;
+        extra.push(0);
+        assert!(Mesh::parse(&extra).is_err());
     }
 }
 

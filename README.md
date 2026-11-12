@@ -59,7 +59,7 @@ To see the live update, leave the app open and change a value in `examples/brack
 
 | Menu | What it does |
 |---|---|
-| File | New project (Ctrl+N), Open project (Ctrl+O), Open recent, Show project folder, Quit |
+| File | New project (Ctrl+N), Open project (Ctrl+O), Import STEP, Open recent, Show project folder, Quit |
 | Export | The selected part or all parts as STEP (exact, editable) or STL (for printing), into the project's `exports` folder |
 | View | Fit to view, show or hide panels, Reset layout, theme (System, Dark, Light) |
 | Settings | Chat provider, model, effort, API key and theme (Ctrl+,) |
@@ -73,7 +73,17 @@ New projects go in `Documents\InterCraft Projects` unless you pick another folde
 | Orbit | Left drag |
 | Pan | Right or middle drag |
 | Zoom | Scroll |
-| Fit to view | Double click |
+| Fit to view | Double click, or F |
+| Measure | M, or the Measure button (Esc clears) |
+| Show or hide edges | E |
+
+### Measuring
+
+Turn on Measure and click a corner, edge or face. Corners and edges snap when the cursor is close. One click describes what you picked (an edge's length, a circle's diameter and centre, a corner's position). A second click gives the distance between the two, the X, Y and Z offsets, and the angle when both are straight edges or flat faces. The numbers come from the CAD kernel, so they are exact for corners and edges. A point on a curved face comes from the mesh, which is within 0.05 mm.
+
+### Importing STEP files
+
+File > Import STEP (or the button under the parts list) copies the file into the project's `imports` folder and adds a part that starts from it. The import is step 1 on the timeline, and the model can add features on top of it: holes, pockets, fillets. Right-click a part to lock it as a reference (so the model designs around it but can't change it) or unlock it for editing.
 
 ## Driving it from an LLM
 
@@ -124,6 +134,8 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `edit_feature` | Changes a feature's code, label or parameters |
 | `set_param` | Changes one dimension |
 | `delete_feature` | Removes a feature |
+| `inspect_part` | Faces, holes and circular edges of a part with exact sizes and positions |
+| `measure` | Exact distance, angle, length or diameter between faces, edges, corners and points |
 | `export_part` | Writes STEP and STL to the project's `exports` folder |
 
 Every edit returns a build report (volume, volume change, size, errors), so the LLM can check its own work with numbers. A feature that fails to build stays saved and shows red in the app until it is fixed.
@@ -201,8 +213,9 @@ The suites include stress tests for both chat routes (a fake Messages API and a 
 2. Tool API and MCP server so an LLM can drive it (done)
 3. Built-in chat panel with the Anthropic API or your own Claude Code (done)
 4. Menus, project navigation, rich text and choice questions (done)
-5. OS-level isolation for the geometry worker
-6. OpenAI-compatible client (OpenAI, OpenRouter, local models through Ollama or LM Studio)
-7. Editing steps from the timeline and Inspector, with undo
-8. Sketch panel
-9. Fit checks, section view, before and after overlay
+5. STEP import, edge display, measuring tool, and inspect and measure tools for the model (done)
+6. OS-level isolation for the geometry worker
+7. OpenAI-compatible client (OpenAI, OpenRouter, local models through Ollama or LM Studio)
+8. Editing steps from the timeline and Inspector, with undo
+9. Sketch panel
+10. Fit checks, section view, before and after overlay

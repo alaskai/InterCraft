@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
+use egui::containers::menu::{MenuButton, MenuConfig};
 use egui_dock::{DockState, NodeIndex};
 use intercraft_geo::ExportFormat;
 
@@ -11,6 +12,9 @@ use crate::{App, Tab};
 
 /// Where new projects go unless the user picks somewhere else.
 pub fn default_projects_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("INTERCRAFT_PROJECTS_DIR") {
+        return PathBuf::from(dir); // tests keep new projects out of Documents
+    }
     dirs::document_dir().unwrap_or_else(std::env::temp_dir).join("InterCraft Projects")
 }
 
@@ -18,7 +22,8 @@ pub fn default_projects_dir() -> PathBuf {
 pub fn default_dock() -> DockState<Tab> {
     let mut dock = DockState::new(vec![Tab::Viewport]);
     let tree = dock.main_surface_mut();
-    let [centre, _right] = tree.split_right(NodeIndex::root(), 0.76, vec![Tab::Chat, Tab::Sketch]);
+    // The sketch panel isn't built yet, so it stays out of the default layout (View can add it).
+    let [centre, _right] = tree.split_right(NodeIndex::root(), 0.76, vec![Tab::Chat]);
     let [centre, left] = tree.split_left(centre, 0.22, vec![Tab::Parts]);
     tree.split_below(left, 0.5, vec![Tab::Inspector]);
     tree.split_below(centre, 0.80, vec![Tab::Timeline]);
@@ -45,6 +50,11 @@ pub struct NewProjectDialog {
 impl NewProjectDialog {
     pub fn new() -> Self {
         Self { name: String::new(), location: default_projects_dir(), error: None }
+    }
+
+    #[cfg(test)]
+    pub fn set_name(&mut self, name: &str) {
+        self.name = name.to_owned();
     }
 }
 
@@ -83,7 +93,10 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| self.file_menu(ui));
             ui.menu_button("Export", |ui| self.export_menu(ui));
-            ui.menu_button("View", |ui| self.view_menu(ui));
+            // Stays open while ticking panels on and off.
+            MenuButton::new("View")
+                .config(MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+                .ui(ui, |ui| self.view_menu(ui));
             if ui.button("Settings").clicked() {
                 self.settings_open = true;
             }
@@ -98,6 +111,10 @@ impl App {
         if ui.add(egui::Button::new("Open project...").shortcut_text("Ctrl+O")).clicked() {
             ui.close();
             self.open_project_dialog();
+        }
+        if ui.button("Import STEP...").on_hover_text("Add a part from a STEP file").clicked() {
+            ui.close();
+            self.state.import_step_dialog();
         }
         ui.menu_button("Open recent", |ui| {
             let recent = Settings::load().recent_projects;
@@ -237,8 +254,8 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.weak("Settings file:");
                     if ui.small_button("Show").clicked() {
-                        if let Some(dir) = dirs::config_dir() {
-                            reveal(&dir.join("InterCraft"));
+                        if let Some(dir) = intercraft_tools::config_dir() {
+                            reveal(&dir);
                         }
                     }
                 });

@@ -54,7 +54,7 @@ impl Default for Settings {
 }
 
 fn settings_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("InterCraft").join("settings.json"))
+    Some(intercraft_tools::config_dir()?.join("settings.json"))
 }
 
 impl Settings {

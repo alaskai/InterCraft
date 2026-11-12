@@ -2,9 +2,50 @@
 // live caption shown over the 3D view while a reply runs. How much is said depends
 // on the user's explanation level.
 
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
 
 use crate::settings::Explain;
+
+/// How long a caption stays up after the work it describes has finished.
+pub const LINGER: Duration = Duration::from_secs(4);
+
+/// The caption on screen: its text, and when the work it describes ended (None
+/// while it is still going on).
+#[derive(Debug, Clone, Default)]
+pub struct Caption {
+    text: Option<String>,
+    ended: Option<Instant>,
+}
+
+impl Caption {
+    pub fn set(&mut self, text: String) {
+        self.text = Some(text);
+        self.ended = None;
+    }
+
+    /// The work is done. The caption fades out over the next few seconds.
+    pub fn finish(&mut self) {
+        if self.text.is_some() && self.ended.is_none() {
+            self.ended = Some(Instant::now());
+        }
+    }
+
+    /// Text to draw and how opaque to draw it (1 while working, fading to 0).
+    pub fn shown(&self) -> Option<(&str, f32)> {
+        let text = self.text.as_deref()?;
+        let alpha = match self.ended {
+            None => 1.0,
+            Some(ended) => {
+                let left = LINGER.saturating_sub(ended.elapsed()).as_secs_f32() / LINGER.as_secs_f32();
+                // Fully visible for most of the time, then a quick fade.
+                (left * 3.0).min(1.0)
+            }
+        };
+        (alpha > 0.0).then_some((text, alpha))
+    }
+}
 
 /// What a tool does, in one sentence a newcomer can follow.
 pub fn tool_purpose(name: &str) -> &'static str {
@@ -89,6 +130,21 @@ pub fn caption(name: &str, input: &Value, level: Explain) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_caption_stays_while_working_then_fades() {
+        let mut caption = Caption::default();
+        assert!(caption.shown().is_none());
+        caption.finish();
+        assert!(caption.shown().is_none(), "finishing nothing shows nothing");
+        caption.set("Adding a bore".into());
+        assert_eq!(caption.shown(), Some(("Adding a bore", 1.0)));
+        caption.finish();
+        let (_, alpha) = caption.shown().unwrap();
+        assert!(alpha > 0.9, "still clearly visible just after finishing");
+        caption.ended = Some(Instant::now() - LINGER);
+        assert!(caption.shown().is_none(), "gone once it has lingered");
+    }
 
     #[test]
     fn every_tool_has_a_purpose() {

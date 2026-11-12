@@ -68,6 +68,7 @@ enum Tab {
     Timeline,
     Chat,
     Sketch,
+    Brief,
 }
 
 struct App {
@@ -116,6 +117,9 @@ struct State {
     rename: Option<(RenameTarget, String, Option<String>)>,
     /// A step's code being edited in the Inspector, not applied yet.
     code_draft: Option<CodeDraft>,
+    /// The brief as typed in its tab, while editing.
+    brief_draft: Option<String>,
+    brief_markdown: egui_commonmark::CommonMarkCache,
 
     viewport: Viewport,
     chat: chat::ChatPanel,
@@ -166,6 +170,8 @@ impl App {
             param_drag: None,
             rename: None,
             code_draft: None,
+            brief_draft: None,
+            brief_markdown: Default::default(),
             viewport: Viewport::new(render_state),
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
             measure: measure::MeasureTool::default(),
@@ -713,6 +719,59 @@ impl State {
         let pixels = self.viewport.snapshot(&shot)?;
 
         encode_png(&pixels, viewport::SHOT_SIZE, viewport::SHOT_SIZE)
+    }
+
+    /// The project's design brief: shown as formatted text, editable on request.
+    fn brief_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(loaded) = &self.project else {
+            ui.weak("No project loaded.");
+            return;
+        };
+        let saved = loaded.brief.clone();
+        let mut save = None;
+        match &mut self.brief_draft {
+            Some(draft) => {
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = Some(draft.clone());
+                    }
+                    if ui.button("Cancel").clicked() {
+                        save = Some(saved.clone());
+                    }
+                    ui.weak("Markdown: '## ' starts a section.");
+                });
+                let editor = egui::TextEdit::multiline(draft).code_editor().desired_width(f32::INFINITY).desired_rows(20);
+                ui.add(editor).widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Brief text"));
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    if ui.button("Edit brief").on_hover_text("Change the brief yourself. The model keeps it up to date too.").clicked() {
+                        self.brief_draft = Some(saved.clone());
+                    }
+                    ui.weak("What the project is, how it will be made, key sizes, decisions and open items.");
+                });
+                ui.separator();
+                let blank = saved.trim().is_empty() || saved.trim() == intercraft_core::BRIEF_TEMPLATE.trim();
+                if blank {
+                    ui.weak("The brief is empty. Describe what you want to make in the chat and the model will fill it in with you, or press Edit brief.");
+                } else {
+                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.brief_markdown, &saved);
+                }
+            }
+        }
+        if let Some(text) = save {
+            if text == saved {
+                self.brief_draft = None;
+                return;
+            }
+            match self.edit_project(|p| p.set_brief(text).and_then(|()| p.save())) {
+                Ok(()) => {
+                    self.brief_draft = None;
+                    self.worker_status = "Saved the brief. Ctrl+Z undoes it.".to_owned();
+                }
+                Err(e) => self.worker_status = format!("Couldn't save the brief: {e:#}"),
+            }
+        }
     }
 
     /// Send a question to the chat for the user, and say so if it can't go yet.
@@ -1793,6 +1852,7 @@ impl TabViewer for State {
             }
             Tab::Parts => self.parts_ui(ui),
             Tab::Inspector => self.inspector_ui(ui),
+            Tab::Brief => self.brief_ui(ui),
             Tab::Timeline => self.timeline_ui(ui),
             Tab::Chat => {
                 let context = self

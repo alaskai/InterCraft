@@ -815,3 +815,35 @@ fn explain_buttons_ask_the_chat() {
     assert_eq!(asked, "Explain step 4, 'Edge fillets', of RodBracket: what it does and why it is designed this way. Keep it short and plain.");
     shot(&mut h, "explain_asked");
 }
+
+#[test]
+fn the_brief_tab_shows_and_edits_the_brief() {
+    let _one = one_at_a_time();
+    let project = example_project("brief");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let tab = h.state().dock.find_tab(&Tab::Brief).expect("the brief tab is in the layout");
+    h.state_mut().dock.set_active_tab(tab).expect("the tab can be shown");
+    h.step();
+    h.step();
+    // The example has no brief file yet.
+    h.get_by_label_contains("The brief is empty");
+
+    click(&mut h, "Edit brief");
+    h.state_mut().state.brief_draft = Some("# Brief
+
+## What it is
+
+A clamp for an 8 mm rod.
+".into());
+    h.step();
+    h.get_by_label("Brief text");
+    click(&mut h, "Save");
+    assert!(h.state().state.brief_draft.is_none());
+    let saved = std::fs::read_to_string(project.join("brief.md")).unwrap();
+    assert!(saved.contains("A clamp for an 8 mm rod."));
+    h.step();
+    h.get_by_label_contains("A clamp for an 8 mm rod.");
+    assert_eq!(h.state().state.history.undo_label(), Some("Update the brief"));
+    shot(&mut h, "brief_tab");
+}

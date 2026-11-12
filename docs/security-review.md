@@ -136,6 +136,8 @@ A fake `claude` binary in `claude_code_stress.rs` checks every one of these flag
 
 9. **OpenAI-compatible servers are chosen by the user.** That route sends the conversation, and a key if one is saved, to whatever address is set. Three rules limit the damage of a wrong setting: the address must be HTTPS unless it is on this computer, each server has its own key entry in the credential store (looked up for the exact address at send time, so the OpenAI key can't go to another host), and the key never appears in errors or debug output. The client has 12 stress scenarios, and it was tested against a scripted server, not against a real service. A local model is also more easily manipulated than a hosted one, but it only reaches the same sandboxed tools.
 
+10. **Standard parts come from a third-party library.** Snippets can call `standard_part` and `clearance_hole`, two functions written for InterCraft that use bd_warehouse 0.4.0 (Apache-2.0) inside the worker. Snippets never see bd_warehouse itself. `standard_part` returns a plain build123d copy of the part, so no library methods come with it, and the sandbox tests try to reach the library through both functions. The library is pinned in the lock file and covered by the weekly `pip-audit`.
+
 ## Checks you can repeat
 
 ```powershell

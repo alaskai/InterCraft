@@ -50,6 +50,12 @@ Assemblies:
 - view_model shows you the model. Look after a change that is easy to get wrong by position or side, and before telling the user it is done.
 - check_fit finds clashes and clearances between parts. Parts that should mate must not overlap.
 
+Standard parts and fits:
+- Never size a screw hole, nut trap, insert hole or bearing seat from memory. Call fastener_info for the size (e.g. "M4") and use its numbers.
+- Clearance holes: normal fit for most parts; loose for 3D printed holes, which print a little small. Heat-set insert holes: use the insert's hole diameter and make the hole a little deeper than the insert.
+- Printed fits: about 0.2 to 0.3 mm of clearance for parts that slide or turn, about 0.1 mm interference for a press fit in PLA. Say which rule you used in the feature's why.
+- add_standard_part adds a real screw, nut, washer, insert or bearing as its own part, so check_fit can test it against your design. In snippets, standard_part(kind, size, length) and clearance_hole(size, fit) give the same parts and hole sizes.
+
 Undo:
 - Every change is recorded. If an edit went wrong, or the user asks to go back, call undo instead of rebuilding by hand. redo steps forward again.
 - delete_part removes a whole part. Reference parts can only be removed by the user."#;
@@ -471,6 +477,31 @@ pub fn definitions() -> Value {
             },
         },
         {
+            "name": "fastener_info",
+            "description": "Real sizes for a metric screw size from the ISO tables: clearance hole diameters (close, normal, loose), tap drill, socket head diameter and height, hex nut across flats and thickness, and the heat-set insert hole. Use it instead of remembering sizes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "size": { "type": "string", "description": "Metric size, e.g. 'M3', 'M4' or 'M5'." } },
+                "required": ["size"],
+            },
+        },
+        {
+            "name": "add_standard_part",
+            "description": "Add a real standard part (screw, nut, washer, heat-set insert or ball bearing) as its own part with ISO dimensions, to design around and check fits against. Screws hang down from the origin with the head on top; use position and rotation to put it in place.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": STANDARD_KINDS },
+                    "size": { "type": "string", "description": "e.g. 'M4'. Bearings: bore-outside-width, e.g. 'M8-22-7'." },
+                    "length": { "type": "number", "description": "Screw length in mm. Screws only." },
+                    "name": { "type": "string", "description": "Part name. Omit for one made from the kind and size." },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                },
+                "required": ["kind", "size"],
+            },
+        },
+        {
             "name": "check_fit",
             "description": "Check how parts fit together in the assembly. For every pair it reports either an overlap (the clashing volume in mm3 and where it is) or the clearance (smallest gap in mm and the two closest points). Run it after placing parts or changing mating features.",
             "inputSchema": {
@@ -708,6 +739,52 @@ impl ToolHost {
                     result["projection"] = "Flat, without perspective: shapes keep their true proportions and you can't see the walls of a hole that runs straight through.".into();
                 }
                 Ok(result)
+            }
+            "fastener_info" => {
+                let size = standard_size(text(args, "size")?)?;
+                self.with_worker(|w| w.fastener_info_blocking(&size))
+            }
+            "add_standard_part" => {
+                let kind = text(args, "kind")?;
+                if !STANDARD_KINDS.contains(&kind) {
+                    bail!("unknown kind '{kind}'. Use one of: {}", STANDARD_KINDS.join(", "));
+                }
+                let size = standard_size(text(args, "size")?)?;
+                let screw = kind.ends_with("screw");
+                let length = args.get("length").and_then(Value::as_f64);
+                let code = match (screw, length) {
+                    (true, Some(l)) if l > 0.0 && l <= 500.0 => format!("part = standard_part({kind:?}, {size:?}, {l})"),
+                    (true, _) => bail!("a screw needs a length in mm, from 1 to 500"),
+                    (false, _) => format!("part = standard_part({kind:?}, {size:?})"),
+                };
+                let label = match length {
+                    Some(l) if screw => format!("{size} x {} {kind}", round(l)),
+                    _ => format!("{size} {kind}"),
+                };
+                let name = match optional_text(args, "name") {
+                    Some(name) => name.to_owned(),
+                    None => {
+                        let base: String = format!("{size}_{kind}").chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                        let taken = |n: &str| project.project.parts.iter().any(|p| p.name.eq_ignore_ascii_case(n));
+                        (1..).map(|i| if i == 1 { base.clone() } else { format!("{base}_{i}") }).find(|n| !taken(n)).unwrap_or(base)
+                    }
+                };
+                project.add_part(&name)?;
+                let new = NewFeature {
+                    label: label.chars().take(80).collect(),
+                    code,
+                    why: "A standard part with its real ISO dimensions, to design around and check fits against.".to_owned(),
+                    prompt: optional_text(args, "prompt").unwrap_or_default().to_owned(),
+                    ..Default::default()
+                };
+                project.add_feature(&name, new)?;
+                let position = optional_triple(args, "position")?.unwrap_or([0.0; 3]);
+                let rotation = optional_triple(args, "rotation")?.unwrap_or([0.0; 3]);
+                project.set_placement(&name, position, rotation)?;
+                project.save()?;
+                let mut report = self.build_report(project.part(&name)?, false)?;
+                report["added_part"] = name.into();
+                Ok(report)
             }
             "check_fit" => {
                 let wanted: Option<Vec<&str>> =
@@ -989,6 +1066,20 @@ fn optional_labels(args: &Value) -> Result<Option<std::collections::BTreeMap<Str
         labels.insert(name.clone(), label.trim().to_owned());
     }
     Ok(Some(labels))
+}
+
+/// Standard parts the worker can build. Matches `parts_library.KINDS`.
+pub const STANDARD_KINDS: [&str; 7] =
+    ["ball bearing", "button head screw", "countersunk screw", "heat-set insert", "hex nut", "socket head screw", "washer"];
+
+/// A size like "M4", "M4-0.7" or "M8-22-7". It goes into a snippet, so only plain characters.
+fn standard_size(size: &str) -> Result<String> {
+    let size = size.trim();
+    let plain = !size.is_empty() && size.len() <= 20 && size.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    if !plain || !size.starts_with(['M', 'm']) {
+        bail!("give a metric size like 'M4' or 'M4-0.7'");
+    }
+    Ok(format!("M{}", &size[1..]))
 }
 
 /// Three numbers, e.g. a position.

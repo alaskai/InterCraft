@@ -200,6 +200,8 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `delete_part` | Removes a design part (reference parts can only be removed by you) |
 | `place_part` | Moves or turns a design part in the assembly |
 | `duplicate_part`, `rename_part` | Copies or renames a part |
+| `fastener_info` | Real sizes for a metric screw from the ISO tables: clearance holes, tap drill, head, nut and heat-set insert hole |
+| `add_standard_part` | Adds a real screw, nut, washer, heat-set insert or ball bearing as its own part |
 | `check_fit` | Clashes (with volume) and clearances between parts |
 | `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing one part. The six side views are drawn flat, like a drawing |
 | `undo`, `redo` | Step back or forward through the project history |
@@ -227,7 +229,7 @@ examples/bracket/
     ...
 ```
 
-Each snippet is build123d code that reads and reassigns `part`. Its parameters arrive in `p`. All lengths are in mm.
+Each snippet is build123d code that reads and reassigns `part`. Its parameters arrive in `p`. All lengths are in mm. Snippets can also call `standard_part(kind, size, length)` for a real screw, nut, washer, insert or bearing, and `clearance_hole(size, fit)` for an ISO clearance hole diameter. Both come from the bd_warehouse tables.
 
 ```python
 bore = Rot(90, 0, 0) * Cylinder(p["bore_d"] / 2, 100)

@@ -427,3 +427,40 @@ fn the_brief_is_read_and_updated_through_the_tools() {
     assert_eq!(undone["undone"], "Update the brief");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn standard_parts_and_sizes_come_from_the_tables() {
+    if !worker_available() {
+        return;
+    }
+    let _one = one_at_a_time();
+    let (mut host, dir) = project("standard");
+    host.call("add_part", &json!({ "name": "Plate" })).unwrap();
+
+    // ISO 273 clearance holes for M4 are 4.3, 4.5 and 4.8 mm.
+    let info = host.call("fastener_info", &json!({ "size": "M4" })).unwrap();
+    assert_eq!(info["size"], "M4-0.7");
+    assert_eq!(info["clearance_hole"], json!({ "close": 4.3, "normal": 4.5, "loose": 4.8 }), "{info}");
+    assert_eq!(info["hex_nut"]["across_flats"], 7.0, "ISO 4032 M4 nut is 7 mm across flats");
+    assert_eq!(info["heat_set_insert"]["hole_diameter"], 5.5, "McMaster 94459A170 hole");
+    assert!(host.call("fastener_info", &json!({ "size": "M4\") ; import os #" })).is_err());
+    assert!(host.call("fastener_info", &json!({ "size": "banana" })).is_err());
+
+    // A real M4 x 16 screw, as its own part, standing in a plate's hole.
+    let screw = host.call("add_standard_part", &json!({ "kind": "socket head screw", "size": "M4", "length": 16, "position": [0, 0, 5] })).unwrap();
+    assert_eq!(screw["added_part"], "M4_socket_head_screw", "{screw}");
+    assert_eq!(screw["features"][0]["status"], "built", "{screw}");
+    let size = &screw["features"][0]["size_mm"];
+    assert_eq!(size[0], 7.22, "head diameter: {screw}");
+    assert!(size[2].as_f64().unwrap() > 16.0, "shank plus head: {screw}");
+    assert!(host.call("add_standard_part", &json!({ "kind": "socket head screw", "size": "M4" })).is_err(), "a screw needs a length");
+    assert!(host.call("add_standard_part", &json!({ "kind": "rivet", "size": "M4" })).is_err());
+
+    // In a snippet, clearance_hole gives the same table value.
+    add(&mut host, "Plate", "Body", "part = Box(30, 30, 5) - Cylinder(clearance_hole('M4') / 2, 10)").unwrap();
+    let hole = host.call("inspect_part", &json!({ "part": "Plate" })).unwrap();
+    assert!(hole["circle_edge_diameters"].as_object().unwrap().contains_key("4.5"), "{hole}");
+    let nut = host.call("add_standard_part", &json!({ "kind": "hex nut", "size": "M4" })).unwrap();
+    assert_eq!(nut["features"][0]["status"], "built", "{nut}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

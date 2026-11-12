@@ -1076,7 +1076,7 @@ impl State {
                     self.results.retain(|(p, _), e| p != &part || !e.stale);
                 }
                 GeoEvent::Measured { id, data } => self.measure.result(id, Ok(data)),
-                GeoEvent::Inspected { .. } => {}
+                GeoEvent::Inspected { .. } | GeoEvent::Info { .. } => {}
                 GeoEvent::Fitted { id, data } => {
                     if let Some(fit) = self.fit.as_mut().filter(|f| f.waiting_for(id)) {
                         let meshes: Vec<Mesh> = fit::overlap_meshes(&data).iter().filter_map(|p| Mesh::load(p).ok()).collect();

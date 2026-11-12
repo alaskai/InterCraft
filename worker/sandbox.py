@@ -64,6 +64,10 @@ def build_namespace():
         if name.startswith("_") or name in _IO_NAMES:
             del ns[name]
     ns["math"] = math
+    # Standard parts and hole sizes, through two vetted functions only.
+    import parts_library
+    ns["standard_part"] = parts_library.standard_part
+    ns["clearance_hole"] = parts_library.clearance_hole
     return ns
 
 

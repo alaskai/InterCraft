@@ -540,3 +540,13 @@ fn pictures_travel_with_the_message() {
     let (after, _, _) = send(&mut chat, "scenario:text#after-picture");
     after.unwrap();
 }
+
+#[test]
+fn each_request_reports_its_cost() {
+    let r = run("scenario:text#cost");
+    r.result.unwrap();
+    let usage = r.events.iter().find_map(|e| if let ChatEvent::Usage(u) = e { Some(*u) } else { None }).expect("usage");
+    let cost = r.events.iter().find_map(|e| if let ChatEvent::Cost(c) = e { Some(*c) } else { None }).expect("a cost");
+    let price = intercraft_llm::anthropic_price("claude-opus-5-5", &usage).unwrap();
+    assert!((cost - intercraft_llm::cost(price, &usage)).abs() < 1e-12);
+}

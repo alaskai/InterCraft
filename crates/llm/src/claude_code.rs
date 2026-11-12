@@ -56,6 +56,9 @@ pub struct ClaudeCodeChat {
     /// Kept so a restarted process (after Stop or a model change) carries on the conversation.
     session_id: Option<String>,
     running: Option<Running>,
+    /// Claude Code's running cost estimate for the session at the last reply, so each
+    /// reply's own cost is the difference.
+    session_cost: f64,
 }
 
 /// `claude --version`, or None when Claude Code isn't installed or isn't on PATH.
@@ -84,7 +87,7 @@ fn hide_console(cmd: &mut Command) {
 
 impl ClaudeCodeChat {
     pub fn new(settings: ClaudeCodeSettings) -> Self {
-        Self { settings, session_id: None, running: None }
+        Self { settings, session_id: None, running: None, session_cost: 0.0 }
     }
 
     pub fn update_settings(&mut self, settings: ClaudeCodeSettings) {
@@ -301,6 +304,13 @@ impl ChatSession for ClaudeCodeChat {
                     if let Some(id) = msg["session_id"].as_str() {
                         self.session_id = Some(id.to_owned());
                     }
+                    // A running total for the whole session, restored on resume. A crash can
+                    // report zero, which says nothing about this reply.
+                    if let Some(total) = msg["total_cost_usd"].as_f64().filter(|t| *t > 0.0) {
+                        let reply = if total >= self.session_cost { total - self.session_cost } else { total };
+                        self.session_cost = total;
+                        on_event(ChatEvent::Cost(reply));
+                    }
                     let usage = &msg["usage"];
                     on_event(ChatEvent::Usage(Usage {
                         input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
@@ -326,6 +336,7 @@ impl ChatSession for ClaudeCodeChat {
     fn reset(&mut self) {
         self.stop();
         self.session_id = None;
+        self.session_cost = 0.0;
     }
 }
 

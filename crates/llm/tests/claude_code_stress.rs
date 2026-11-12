@@ -232,3 +232,20 @@ fn pictures_travel_with_the_message() {
     result.unwrap();
     assert_eq!(text_of(&events), "saw 0 picture(s)");
 }
+
+#[test]
+fn each_reply_reports_its_own_cost() {
+    setup();
+    let mut chat = new_chat();
+    let costs = |events: &[ChatEvent]| -> Vec<f64> {
+        events.iter().filter_map(|e| if let ChatEvent::Cost(c) = e { Some(*c) } else { None }).collect()
+    };
+    // The fake's running total goes 0.02, 0.04: each reply is 2 cents, not the running total.
+    let (result, first) = send(&mut chat, "echo one");
+    result.unwrap();
+    let (result, second) = send(&mut chat, "echo two");
+    result.unwrap();
+    assert_eq!(costs(&first).len(), 1);
+    assert!((costs(&first)[0] - 0.02).abs() < 1e-9);
+    assert!((costs(&second)[0] - 0.02).abs() < 1e-9, "{:?}", costs(&second));
+}

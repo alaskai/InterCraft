@@ -33,6 +33,10 @@ pub struct OpenAiSettings {
     pub system: String,
     /// The model can read images, so `view_model` pictures are sent to it.
     pub vision: bool,
+    /// US dollars per million input and output tokens, as the user entered them.
+    /// Zero for both means unknown, and no cost is shown.
+    pub price_input: f64,
+    pub price_output: f64,
 }
 
 // Written by hand so the key never ends up in a log or error message.
@@ -193,12 +197,23 @@ impl OpenAiChat {
             }
             if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
                 let cached = usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
-                on_event(ChatEvent::Usage(Usage {
+                let tokens = Usage {
                     input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0).saturating_sub(cached),
                     cache_read_tokens: cached,
                     cache_write_tokens: 0,
                     output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
-                }));
+                };
+                on_event(ChatEvent::Usage(tokens));
+                if self.settings.price_input > 0.0 || self.settings.price_output > 0.0 {
+                    // Servers price cached input differently, so it is counted as plain input here.
+                    let price = crate::Price {
+                        input: self.settings.price_input,
+                        cache_write: self.settings.price_input,
+                        cache_read: self.settings.price_input,
+                        output: self.settings.price_output,
+                    };
+                    on_event(ChatEvent::Cost(crate::pricing::cost(price, &tokens)));
+                }
             }
             let choice = &chunk["choices"][0];
             if let Some(text) = choice["delta"]["content"].as_str().filter(|t| !t.is_empty()) {

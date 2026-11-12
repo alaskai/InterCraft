@@ -283,6 +283,9 @@ impl AnthropicChat {
             bail!("the connection closed before the reply finished. Try sending again");
         }
         on_event(ChatEvent::Usage(turn.usage));
+        if let Some(price) = crate::pricing::anthropic_price(&self.settings.model, &turn.usage) {
+            on_event(ChatEvent::Cost(crate::pricing::cost(price, &turn.usage)));
+        }
         Ok(turn)
     }
 }

@@ -180,6 +180,7 @@ fn chat(server: &Server, vision: bool) -> OpenAiChat {
         model: "test-model".into(),
         system: "You edit CAD parts.".into(),
         vision,
+        ..Default::default()
     })
 }
 
@@ -464,4 +465,28 @@ fn a_users_picture_is_sent_only_to_a_model_that_can_see() {
         send(&mut chat, "and then?").ok();
         assert_history_is_valid(&server.body(1));
     }
+}
+
+#[test]
+fn costs_follow_the_prices_entered() {
+    let reply = || Reply::Stream(vec![text("ok"), finish("stop"), usage(1_000_000, 0, 500_000)]);
+    let server = Server::start(vec![reply(), reply()]);
+    let mut priced = OpenAiChat::new(OpenAiSettings {
+        base_url: server.base_url.clone(),
+        model: "m".into(),
+        price_input: 2.0,
+        price_output: 8.0,
+        ..Default::default()
+    });
+    let run = send(&mut priced, "hi");
+    run.ok();
+    let cost: Vec<f64> = run.events.iter().filter_map(|e| if let ChatEvent::Cost(c) = e { Some(*c) } else { None }).collect();
+    assert_eq!(cost.len(), 1);
+    assert!((cost[0] - 6.0).abs() < 1e-9, "1M in at $2 plus 0.5M out at $8: {cost:?}");
+
+    // No prices entered: tokens only, no cost.
+    let mut unpriced = chat(&server, false);
+    let run = send(&mut unpriced, "hi");
+    run.ok();
+    assert!(!run.events.iter().any(|e| matches!(e, ChatEvent::Cost(_))));
 }

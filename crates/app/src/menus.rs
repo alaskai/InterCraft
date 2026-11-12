@@ -20,9 +20,9 @@ pub fn default_projects_dir() -> PathBuf {
 
 /// Viewport in the middle, parts and inspector on the left, chat on the right, timeline below.
 pub fn default_dock() -> DockState<Tab> {
-    let mut dock = DockState::new(vec![Tab::Viewport]);
+    // The sketch canvas shares the middle with the 3D view, as a second tab.
+    let mut dock = DockState::new(vec![Tab::Viewport, Tab::Sketch]);
     let tree = dock.main_surface_mut();
-    // The sketch panel isn't built yet, so it stays out of the default layout (View can add it).
     let [centre, _right] = tree.split_right(NodeIndex::root(), 0.76, vec![Tab::Chat]);
     let [centre, left] = tree.split_left(centre, 0.22, vec![Tab::Parts]);
     tree.split_below(left, 0.5, vec![Tab::Inspector]);

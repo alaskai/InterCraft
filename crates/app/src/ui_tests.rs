@@ -658,3 +658,55 @@ fn openai_compatible_server_settings() {
     h.step();
     h.get_by_label_contains("must start with https://");
 }
+
+#[test]
+fn a_sketch_becomes_a_part_and_a_cut() {
+    let _one = one_at_a_time();
+    let project = example_project("sketch");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    // Draw on the real canvas: a 30 x 20 rectangle with an 8 mm circle inside it.
+    let tab = h.state().dock.find_tab(&Tab::Sketch).expect("the sketch tab is in the layout");
+    h.state_mut().dock.set_active_tab(tab).expect("the tab can be shown");
+    h.step();
+    h.step();
+    let canvas = h.get_by_label("Sketch canvas").rect();
+    let at = |h: &Harness<'static, App>, p: [f64; 2]| h.state().state.sketch.to_screen(canvas, p);
+    click(&mut h, "Rectangle");
+    for p in [[0.0, 0.0], [30.0, 20.0]] {
+        let pos = at(&h, p);
+        click_at(&mut h, pos);
+    }
+    click(&mut h, "Circle");
+    for p in [[10.0, 10.0], [14.0, 10.0]] {
+        let pos = at(&h, p);
+        click_at(&mut h, pos);
+    }
+    let shapes = h.state().state.sketch.shapes.clone();
+    assert_eq!(shapes, [sketch::Shape::Rect([0.0, 0.0], [30.0, 20.0]), sketch::Shape::Circle { centre: [10.0, 10.0], radius: 4.0 }]);
+    assert_eq!(sketch::holes(&shapes), [false, true]);
+    shot(&mut h, "sketch_canvas");
+
+    // New part: the volume is the sketch's area times the height.
+    click(&mut h, "New part");
+    wait_until(&mut h, "the sketched part", |app| built(app) && latest_volume(app, "Sketch", "f010").is_some());
+    let expected = (600.0 - std::f64::consts::PI * 16.0) * 5.0;
+    let volume = latest_volume(h.state(), "Sketch", "f010").unwrap();
+    assert!((volume - expected).abs() < 0.01, "{volume} vs {expected}");
+    assert_eq!(h.state().state.selected_part.as_deref(), Some("Sketch"));
+    assert_eq!(h.state().state.history.undo_label(), Some("Add part 'Sketch'"), "one undo step");
+
+    // Cut the same sketch 2 mm deep out of that part: the plate loses a 2 mm layer.
+    h.state_mut().state.sketch.height = 2.0;
+    h.step();
+    click(&mut h, "Cut from Sketch");
+    wait_until(&mut h, "the cut", |app| built(app) && latest_volume(app, "Sketch", "f020").is_some());
+    let after = latest_volume(h.state(), "Sketch", "f020").unwrap();
+    assert!((after - expected * 3.0 / 5.0).abs() < 0.01, "{after}");
+
+    // Send to chat puts the exact numbers in the message box.
+    click(&mut h, "Send to chat");
+    let message = h.state().state.chat.input().to_owned();
+    assert!(message.contains("rectangle 30 x 20 mm") && message.contains("hole: circle of diameter 8 mm"), "{message}");
+}

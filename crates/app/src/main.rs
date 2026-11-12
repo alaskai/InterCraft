@@ -8,6 +8,7 @@ mod measure;
 mod menus;
 mod params;
 mod settings;
+mod sketch;
 #[cfg(test)]
 mod ui_tests;
 mod viewport;
@@ -121,6 +122,7 @@ struct State {
     measure: measure::MeasureTool,
     /// The fit check panel, while it is open.
     fit: Option<fit::FitCheck>,
+    sketch: sketch::Sketch,
 
     exports_pending: usize,
     exported: Vec<String>,
@@ -168,6 +170,7 @@ impl App {
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
             measure: measure::MeasureTool::default(),
             fit: None,
+            sketch: sketch::Sketch::default(),
             exports_pending: 0,
             exported: Vec::new(),
             shown_name: None,
@@ -720,6 +723,42 @@ impl State {
         writer.write_image_data(&pixels)?;
         writer.finish()?;
         Ok(bytes)
+    }
+
+    /// Turn the sketch into a feature: a new part, or added to or cut from the selected one.
+    pub(crate) fn sketch_feature(&mut self, made: sketch::SketchFeature) {
+        let selected = self.selected_part.clone();
+        let result = self.edit_project(|p| {
+            let part = match (made.mode, selected) {
+                (sketch::Mode::NewPart, _) => {
+                    let taken = |name: &str| p.project.parts.iter().any(|part| part.name.eq_ignore_ascii_case(name));
+                    let name = (1..).map(|n| if n == 1 { "Sketch".to_owned() } else { format!("Sketch_{n}") }).find(|n| !taken(n));
+                    let name = name.unwrap_or_default();
+                    p.add_part(&name)?;
+                    name
+                }
+                (_, Some(part)) => part,
+                (_, None) => anyhow::bail!("select a part first"),
+            };
+            let new = intercraft_core::NewFeature {
+                label: made.label,
+                code: made.code,
+                params: made.params,
+                prompt: "Drawn in the sketch panel.".to_owned(),
+                after: None,
+            };
+            p.add_feature(&part, new)?;
+            p.save()?;
+            Ok(part)
+        });
+        match result {
+            Ok(part) => {
+                self.worker_status = format!("Extruded the sketch into '{part}'. Drag height and z in the Inspector to adjust.");
+                self.selected_part = Some(part);
+                self.selected_step = None;
+            }
+            Err(e) => self.worker_status = format!("Couldn't use the sketch: {e:#}"),
+        }
     }
 
     pub(crate) fn toggle_fit(&mut self) {
@@ -1700,7 +1739,15 @@ impl TabViewer for State {
                 self.chat.ui(ui, context);
             }
             Tab::Sketch => {
-                ui.weak("Quick sketch canvas goes here (milestone 4).");
+                let selected = self.selected_part.clone();
+                match self.sketch.ui(ui, selected.as_deref()) {
+                    Some(sketch::SketchAction::Feature(made)) => self.sketch_feature(made),
+                    Some(sketch::SketchAction::ToChat(text)) => {
+                        self.chat.add_to_input(&text);
+                        self.worker_status = "The sketch is in the chat box. Say what to do with it and send.".to_owned();
+                    }
+                    None => {}
+                }
             }
         }
     }
@@ -1718,6 +1765,6 @@ impl TabViewer for State {
 
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
         // These two manage their own scrolling.
-        if matches!(tab, Tab::Viewport | Tab::Chat) { [false, false] } else { [true, true] }
+        if matches!(tab, Tab::Viewport | Tab::Chat | Tab::Sketch) { [false, false] } else { [true, true] }
     }
 }

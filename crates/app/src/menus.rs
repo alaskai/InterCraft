@@ -1,4 +1,4 @@
-// Menu bar (File, Export, View, Settings), the Settings window and the project dialogs.
+// Menu bar (File, Edit, Export, View, Settings), the Settings window and the project dialogs.
 
 use std::path::{Path, PathBuf};
 
@@ -87,11 +87,23 @@ impl App {
         if pressed(egui::Key::Comma) {
             self.settings_open = true;
         }
+        // A focused text box has its own undo, so leave Ctrl+Z to it.
+        if !ctx.egui_wants_keyboard_input() {
+            let shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+            // Ctrl+Shift+Z first, because Ctrl+Z also matches with Shift held.
+            let redo = ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(shift, egui::Key::Z)));
+            if redo || pressed(egui::Key::Y) {
+                self.state.redo();
+            } else if pressed(egui::Key::Z) {
+                self.state.undo();
+            }
+        }
     }
 
     pub(crate) fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| self.file_menu(ui));
+            ui.menu_button("Edit", |ui| self.edit_menu(ui));
             ui.menu_button("Export", |ui| self.export_menu(ui));
             // Stays open while ticking panels on and off.
             MenuButton::new("View")
@@ -145,6 +157,56 @@ impl App {
         if ui.button("Quit").clicked() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
+
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        let history = &self.state.history;
+        let undo = history.undo_label().map(|l| format!("Undo: {}", crate::shorten(l, 40)));
+        let redo = history.redo_label().map(|l| format!("Redo: {}", crate::shorten(l, 40)));
+        let button = |text: &Option<String>, plain: &str, keys: &str| {
+            egui::Button::new(text.clone().unwrap_or_else(|| plain.to_owned())).shortcut_text(keys)
+        };
+        if ui.add_enabled(undo.is_some(), button(&undo, "Undo", "Ctrl+Z")).clicked() {
+            ui.close();
+            self.state.undo();
+        }
+        if ui.add_enabled(redo.is_some(), button(&redo, "Redo", "Ctrl+Y")).clicked() {
+            ui.close();
+            self.state.redo();
+        }
+        ui.separator();
+        ui.menu_button("History", |ui| {
+            let history = &self.state.history;
+            if history.entries.is_empty() {
+                ui.weak("No changes yet");
+                return;
+            }
+            let head = if history.outside_changes { None } else { history.head };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut jump = None;
+            if history.outside_changes {
+                ui.weak("Unrecorded edits from outside InterCraft");
+            }
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                // Newest first, like the undo order.
+                for entry in history.entries.iter().rev().take(60) {
+                    let undone = head.is_some_and(|h| entry.number > h);
+                    let text = format!("{}   {}", crate::shorten(&entry.label, 48), ago(now, entry.time));
+                    let text = if undone { egui::RichText::new(text).weak() } else { egui::RichText::new(text) };
+                    let hint = if undone { "Undone. Click to redo up to here." } else { "Go back to this point" };
+                    if ui.selectable_label(head == Some(entry.number), text).on_hover_text(hint).clicked() {
+                        jump = Some(entry.number);
+                    }
+                }
+            });
+            if let Some(number) = jump {
+                ui.close();
+                self.state.go_to(number);
+            }
+        });
     }
 
     fn export_menu(&mut self, ui: &mut egui::Ui) {
@@ -342,9 +404,29 @@ impl App {
     }
 }
 
+/// "just now", "5 min ago", "3 h ago", "2 d ago".
+fn ago(now: u64, then: u64) -> String {
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..60 => "just now".to_owned(),
+        60..3600 => format!("{} min ago", secs / 60),
+        3600..86400 => format!("{} h ago", secs / 3600),
+        _ => format!("{} d ago", secs / 86400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ages_read_simply() {
+        assert_eq!(ago(100, 90), "just now");
+        assert_eq!(ago(1000, 400), "10 min ago");
+        assert_eq!(ago(10_000, 0), "2 h ago");
+        assert_eq!(ago(200_000, 0), "2 d ago");
+        assert_eq!(ago(0, 50), "just now");
+    }
 
     #[test]
     fn project_names_are_folder_safe() {

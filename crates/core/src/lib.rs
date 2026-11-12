@@ -1,6 +1,10 @@
 // intercraft-core: the project model (parts, features), loading, editing and saving.
 // serde 1, serde_json 1, anyhow 1
 
+mod history;
+
+pub use history::{HistoryEntry, HistoryInfo};
+
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -96,6 +100,8 @@ pub struct LoadedProject {
     pub project: Project,
     /// Snippet files to delete on the next save.
     removed: Vec<PathBuf>,
+    /// The project as last loaded or saved (JSON), to tell what a save changed.
+    baseline: String,
 }
 
 impl LoadedProject {
@@ -106,46 +112,49 @@ impl LoadedProject {
         let mut project: Project =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", manifest.display()))?;
 
-        // Project files can come from anywhere, so nothing in them may reach outside the folder.
-        let mut part_names = HashSet::new();
-        for part in &mut project.parts {
-            check_part_name(&part.name)?;
-            if let Some(source) = &part.source {
-                check_import_path(source)?;
-            }
-            if !part_names.insert(part.name.to_ascii_lowercase()) {
-                bail!("project.json lists the part '{}' twice", part.name);
-            }
-            let mut ids = HashSet::new();
-            for feature in &mut part.features {
-                if !ids.insert(feature.id.clone()) {
-                    bail!("part '{}' has two features with the id '{}'", part.name, feature.id);
-                }
-                check_snippet_path(&feature.file)?;
-                let path = dir.join(&feature.file);
-                feature.code = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading snippet {}", path.display()))?;
-            }
+        check_project(&project)?;
+        for feature in project.parts.iter_mut().flat_map(|p| p.features.iter_mut()) {
+            let path = dir.join(&feature.file);
+            feature.code =
+                std::fs::read_to_string(&path).with_context(|| format!("reading snippet {}", path.display()))?;
         }
-        Ok(Self { dir: dir.to_path_buf(), project, removed: Vec::new() })
+        Ok(Self::from_project(dir, project))
+    }
+
+    fn from_project(dir: &Path, project: Project) -> Self {
+        let mut loaded = Self { dir: dir.to_path_buf(), project, removed: Vec::new(), baseline: String::new() };
+        loaded.baseline = loaded.content_key();
+        loaded
     }
 
     /// Start an empty project in `dir` and write it to disk.
     pub fn create(dir: &Path, name: &str) -> Result<Self> {
         let project = Project { name: name.to_owned(), units: default_units(), parts: Vec::new() };
-        let loaded = Self { dir: dir.to_path_buf(), project, removed: Vec::new() };
+        let loaded = Self::from_project(dir, project);
         loaded.write_files()?;
         Ok(loaded)
     }
 
     /// Write changed snippets first, then project.json, then remove deleted snippets.
     /// That order means a reader never sees a manifest pointing at a missing file.
+    /// Each save is also recorded in the undo history.
     pub fn save(&mut self) -> Result<()> {
         self.write_files()?;
-        for path in self.removed.drain(..) {
-            let _ = std::fs::remove_file(path);
-        }
+        self.remove_deleted();
+        // The change itself is saved by now; a history that can't be written
+        // (a full disk, say) shouldn't turn it into an error.
+        let _ = self.record();
         Ok(())
+    }
+
+    fn remove_deleted(&mut self) {
+        for path in self.removed.drain(..) {
+            let _ = std::fs::remove_file(&path);
+            // Drops the part's folder once its last snippet is gone. Fails harmlessly otherwise.
+            if let Some(parent) = path.parent().filter(|p| *p != self.dir) {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
     }
 
     fn write_files(&self) -> Result<()> {
@@ -237,6 +246,22 @@ impl LoadedProject {
             features: Vec::new(),
         });
         Ok(name)
+    }
+
+    /// Remove a part and its snippets. An imported STEP file stays in the imports
+    /// folder, so undo can bring the part back.
+    pub fn remove_part(&mut self, name: &str) -> Result<()> {
+        let index = self
+            .project
+            .parts
+            .iter()
+            .position(|p| p.name == name)
+            .with_context(|| format!("no part named '{name}'"))?;
+        let part = self.project.parts.remove(index);
+        for feature in part.features {
+            self.removed.push(self.dir.join(feature.file));
+        }
+        Ok(())
     }
 
     /// Lock a part (reference) or unlock it (design).
@@ -365,6 +390,56 @@ impl LoadedProject {
             .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
             .max()
     }
+}
+
+/// Hold the returned file while changing a project, so the viewer and MCP clients
+/// never write at the same time. Waits for whoever holds it.
+pub fn lock(dir: &Path) -> Result<std::fs::File> {
+    let file = open_lock(dir)?;
+    file.lock().context("waiting for the project lock")?;
+    Ok(file)
+}
+
+/// Like `lock`, but returns None straight away if someone else holds it.
+pub fn try_lock(dir: &Path) -> Result<Option<std::fs::File>> {
+    let file = open_lock(dir)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).context("taking the project lock"),
+    }
+}
+
+fn open_lock(dir: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".intercraft.lock"))
+        .context("opening the project lock")
+}
+
+/// Project files can come from anywhere, so nothing in them may reach outside the folder.
+fn check_project(project: &Project) -> Result<()> {
+    let mut part_names = HashSet::new();
+    for part in &project.parts {
+        check_part_name(&part.name)?;
+        if let Some(source) = &part.source {
+            check_import_path(source)?;
+        }
+        if !part_names.insert(part.name.to_ascii_lowercase()) {
+            bail!("project.json lists the part '{}' twice", part.name);
+        }
+        let mut ids = HashSet::new();
+        for feature in &part.features {
+            if !ids.insert(feature.id.clone()) {
+                bail!("part '{}' has two features with the id '{}'", part.name, feature.id);
+            }
+            check_snippet_path(&feature.file)?;
+        }
+    }
+    Ok(())
 }
 
 /// Part names become folder names, so keep them plain.

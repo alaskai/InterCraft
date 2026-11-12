@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState, TabViewer};
-use intercraft_core::{LoadedProject, Part, PartKind};
+use intercraft_core::{HistoryInfo, LoadedProject, Part, PartKind};
 use intercraft_geo::{ExportFormat, FeatureResult, GeoEvent, GeometryBackend, Mesh, PythonWorker, Report};
 use viewport::Viewport;
 
@@ -105,6 +105,8 @@ struct State {
     /// Mesh file currently on screen for each part.
     shown: HashMap<String, PathBuf>,
     hidden: HashSet<String>,
+    /// Undo history of the open project, refreshed on every reload.
+    history: HistoryInfo,
 
     viewport: Viewport,
     chat: chat::ChatPanel,
@@ -148,6 +150,7 @@ impl App {
             selected_step: None,
             shown: HashMap::new(),
             hidden: HashSet::new(),
+            history: HistoryInfo::default(),
             viewport: Viewport::new(render_state),
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
             measure: measure::MeasureTool::default(),
@@ -268,6 +271,7 @@ impl State {
         self.worker_status = format!("Opened {}", loaded.project.name);
         self.last_mtime = loaded.latest_mtime();
         self.project_error = None;
+        self.history = loaded.history();
         self.project = Some(loaded);
         self.rebuild_all();
         Ok(())
@@ -286,24 +290,94 @@ impl State {
     }
 
     fn import_step(&mut self, file: &std::path::Path) {
-        let Some(loaded) = self.project.as_mut() else { return };
-        let result = loaded.import_step(file).and_then(|name| loaded.save().map(|()| name));
+        let result = self.edit_project(|p| {
+            let name = p.import_step(file)?;
+            p.save()?;
+            Ok(name)
+        });
         match result {
             Ok(name) => {
                 self.worker_status = format!("Imported {} as the part '{name}'", file.display());
                 self.selected_part = Some(name);
                 self.selected_step = None;
-                self.reload_project();
             }
             Err(e) => self.worker_status = format!("Import failed: {e:#}"),
         }
     }
 
     fn set_part_kind(&mut self, name: &str, kind: PartKind) {
-        let Some(loaded) = self.project.as_mut() else { return };
-        match loaded.set_kind(name, kind).and_then(|()| loaded.save()) {
-            Ok(()) => self.reload_project(),
-            Err(e) => self.worker_status = format!("Couldn't change '{name}': {e:#}"),
+        if let Err(e) = self.edit_project(|p| p.set_kind(name, kind).and_then(|()| p.save())) {
+            self.worker_status = format!("Couldn't change '{name}': {e:#}");
+        }
+    }
+
+    pub(crate) fn delete_part(&mut self, name: &str) {
+        match self.edit_project(|p| p.remove_part(name).and_then(|()| p.save())) {
+            Ok(()) => {
+                self.hidden.remove(name);
+                self.worker_status = format!("Deleted '{name}'. Ctrl+Z brings it back.");
+            }
+            Err(e) => self.worker_status = format!("Couldn't delete '{name}': {e:#}"),
+        }
+    }
+
+    fn delete_step(&mut self, part: &str, id: &str) {
+        match self.edit_project(|p| p.delete_feature(part, id).and_then(|()| p.save())) {
+            Ok(()) => self.worker_status = format!("Deleted a step from '{part}'. Ctrl+Z brings it back."),
+            Err(e) => self.worker_status = format!("Couldn't delete that step: {e:#}"),
+        }
+    }
+
+    pub(crate) fn undo(&mut self) {
+        self.worker_status = match self.edit_project(|p| p.undo()) {
+            Ok(label) => format!("Undid: {label}"),
+            Err(e) => capitalise(&format!("{e:#}")),
+        };
+    }
+
+    pub(crate) fn redo(&mut self) {
+        self.worker_status = match self.edit_project(|p| p.redo()) {
+            Ok(label) => format!("Redid: {label}"),
+            Err(e) => capitalise(&format!("{e:#}")),
+        };
+    }
+
+    /// Jump to a point in the history (Edit > History).
+    pub(crate) fn go_to(&mut self, number: u64) {
+        if let Err(e) = self.edit_project(|p| p.go_to(number)) {
+            self.worker_status = format!("Couldn't go back: {e:#}");
+        } else if let Some(entry) = self.history.entries.iter().find(|e| e.number == number) {
+            self.worker_status = format!("Went to: {}", entry.label);
+        }
+    }
+
+    /// Change the project the same way the tools do: under the project lock and
+    /// starting from the files as they are now, so a change the model made a moment
+    /// ago is never overwritten. Reloads afterwards.
+    fn edit_project<T>(&mut self, change: impl FnOnce(&mut LoadedProject) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let lock = intercraft_core::try_lock(&self.project_dir)?;
+        if lock.is_none() {
+            anyhow::bail!("the model is changing this project right now. Try again when it has finished");
+        }
+        let mut loaded = LoadedProject::load(&self.project_dir)?;
+        let result = change(&mut loaded);
+        drop(lock);
+        self.reload_project();
+        result
+    }
+
+    fn set_visible(&mut self, name: &str, visible: bool) {
+        self.viewport.set_visible(name, visible);
+        if visible {
+            self.hidden.remove(name);
+        } else {
+            self.hidden.insert(name.to_owned());
+        }
+    }
+
+    fn show_all(&mut self) {
+        for name in std::mem::take(&mut self.hidden) {
+            self.viewport.set_visible(&name, true);
         }
     }
 
@@ -321,6 +395,12 @@ impl State {
             if ui.input(|i| i.key_pressed(egui::Key::E)) {
                 self.viewport.show_edges = !self.viewport.show_edges;
             }
+            if ui.input(|i| i.key_pressed(egui::Key::H)) {
+                if let Some(name) = self.selected_part.clone() {
+                    let hidden = self.hidden.contains(&name);
+                    self.set_visible(&name, hidden);
+                }
+            }
         }
         if self.measure.active && !typing && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.measure.picks.is_empty() {
@@ -330,7 +410,7 @@ impl State {
             }
         }
 
-        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(300.0, 30.0));
+        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(420.0, 30.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
             egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -342,6 +422,12 @@ impl State {
                     }
                     if ui.selectable_label(self.viewport.show_edges, "Edges").on_hover_text("Show edges (E)").clicked() {
                         self.viewport.show_edges = !self.viewport.show_edges;
+                    }
+                    if !self.hidden.is_empty() {
+                        let text = format!("Show all ({} hidden)", self.hidden.len());
+                        if ui.button(text).clicked() {
+                            self.show_all();
+                        }
                     }
                 });
             });
@@ -439,6 +525,7 @@ impl State {
             Ok(loaded) => {
                 self.last_mtime = loaded.latest_mtime();
                 self.project_error = None;
+                self.history = loaded.history();
                 self.project = Some(loaded);
                 // Picks point at shapes that are about to change.
                 self.measure.clear();
@@ -574,6 +661,9 @@ impl State {
             match Mesh::load(&path) {
                 Ok(mesh) => {
                     self.viewport.set_mesh(&part.name, mesh, part_color(part.kind, i));
+                    if self.hidden.contains(&part.name) {
+                        self.viewport.set_visible(&part.name, false);
+                    }
                     self.shown.insert(part.name.clone(), path);
                 }
                 Err(e) => self.worker_status = format!("Mesh load failed: {e:#}"),
@@ -583,6 +673,7 @@ impl State {
         let names: HashSet<&str> = loaded.project.parts.iter().map(|p| p.name.as_str()).collect();
         self.viewport.retain_meshes(|name| names.contains(name));
         self.shown.retain(|name, _| names.contains(name.as_str()));
+        self.hidden.retain(|name| names.contains(name.as_str()));
     }
 
     /// Keep the selection pointing at things that still exist after a reload.
@@ -649,89 +740,122 @@ impl State {
             ui.weak("No parts yet. Ask the LLM to add one.");
         }
 
-        let mut clicked = None;
-        let mut visibility = None;
-        let mut lock = None;
-        let mut import = false;
+        let mut action = None;
         for (i, part) in loaded.project.parts.iter().enumerate() {
             let selected = self.selected_part.as_ref() == Some(&part.name);
+            let hidden = self.hidden.contains(&part.name);
             let fill = if selected {
                 ui.visuals().selection.bg_fill.gamma_multiply(0.35)
             } else {
                 egui::Color32::TRANSPARENT
             };
-            let response = egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(6, 4))
-                .corner_radius(4.0)
-                .fill(fill)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let mut visible = !self.hidden.contains(&part.name);
-                        if ui.checkbox(&mut visible, "").on_hover_text("Show or hide").changed() {
-                            visibility = Some((part.name.clone(), visible));
-                        }
-                        // Same colour as in the viewport, so parts are easy to match up.
-                        let [r, g, b] = part_color(part.kind, i).map(|c| (c * 255.0) as u8);
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
-                        ui.strong(&part.name);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let (color, hint) = self.part_status(ui, part);
-                            paint_dot(ui, color, hint);
+            // The row senses clicks before its contents are added, so the eye button
+            // sits on top of it and gets its own clicks.
+            let row = ui
+                .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .corner_radius(4.0)
+                        .fill(fill)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                if eye_button(ui, !hidden, &part.name).clicked() {
+                                    action = Some(PartAction::Visible(part.name.clone(), hidden));
+                                }
+                                // Same colour as in the viewport, so parts are easy to match up.
+                                let [r, g, b] = part_color(part.kind, i).map(|c| (c * 255.0) as u8);
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                                let swatch = egui::Color32::from_rgb(r, g, b);
+                                let swatch = if hidden { swatch.gamma_multiply(0.35) } else { swatch };
+                                ui.painter().rect_filled(rect, 2.0, swatch);
+                                let name = egui::RichText::new(&part.name).strong();
+                                ui.label(if hidden { name.color(ui.visuals().weak_text_color()) } else { name });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let (color, hint) = self.part_status(ui, part);
+                                    paint_dot(ui, color, hint);
+                                });
+                            });
+                            let kind = match part.kind {
+                                PartKind::Design => "design",
+                                PartKind::Reference => "reference",
+                            };
+                            let mut detail = format!("{kind} · {}", plural(steps(part).len(), "step"));
+                            if let Some(r) = self.latest_report(part) {
+                                detail += &format!(" · {:.1} mm³", r.volume);
+                            }
+                            if hidden {
+                                detail += " · hidden";
+                            }
+                            ui.weak(detail);
                         });
-                    });
-                    let kind = match part.kind {
-                        PartKind::Design => "design",
-                        PartKind::Reference => "reference",
-                    };
-                    let mut detail = format!("{kind} · {}", plural(steps(part).len(), "step"));
-                    if let Some(r) = self.latest_report(part) {
-                        detail += &format!(" · {:.1} mm³", r.volume);
-                    }
-                    ui.weak(detail);
                 })
-                .response
-                .interact(egui::Sense::click());
-            if response.clicked() {
-                clicked = Some(part.name.clone());
+                .response;
+            if row.clicked() {
+                action = Some(PartAction::Select(part.name.clone()));
             }
-            response.context_menu(|ui| {
+            row.context_menu(|ui| {
+                let name = part.name.clone();
+                if ui.button(if hidden { "Show" } else { "Hide" }).clicked() {
+                    action = Some(PartAction::Visible(name.clone(), hidden));
+                    ui.close();
+                }
+                if ui.button("Show only this").clicked() {
+                    action = Some(PartAction::Isolate(name.clone()));
+                    ui.close();
+                }
+                if ui.add_enabled(!self.hidden.is_empty(), egui::Button::new("Show all")).clicked() {
+                    action = Some(PartAction::ShowAll);
+                    ui.close();
+                }
+                ui.separator();
                 let (label, kind) = match part.kind {
                     PartKind::Design => ("Lock as reference", PartKind::Reference),
                     PartKind::Reference => ("Unlock for editing", PartKind::Design),
                 };
                 if ui.button(label).clicked() {
-                    lock = Some((part.name.clone(), kind));
+                    action = Some(PartAction::Kind(name.clone(), kind));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Delete part").shortcut_text("Del")).clicked() {
+                    action = Some(PartAction::Delete(name));
                     ui.close();
                 }
             });
         }
         ui.add_space(6.0);
         if ui.button("Import STEP...").on_hover_text("Add a part from a STEP file").clicked() {
-            import = true;
+            action = Some(PartAction::Import);
+        }
+        // Delete removes the selected part while the pointer is over this list.
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        if ui.ui_contains_pointer() && !typing && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+            if let Some(name) = self.selected_part.clone() {
+                action = Some(PartAction::Delete(name));
+            }
         }
 
-        if let Some((name, kind)) = lock {
-            self.set_part_kind(&name, kind);
-        }
-        if import {
-            self.import_step_dialog();
-        }
-        if let Some((name, visible)) = visibility {
-            self.viewport.set_visible(&name, visible);
-            if visible {
-                self.hidden.remove(&name);
-            } else {
-                self.hidden.insert(name);
+        match action {
+            Some(PartAction::Select(name)) => {
+                if self.selected_part.as_ref() != Some(&name) {
+                    self.selected_part = Some(name);
+                    self.selected_step = None;
+                }
             }
-        }
-        if let Some(name) = clicked {
-            if self.selected_part.as_ref() != Some(&name) {
-                self.selected_part = Some(name);
-                self.selected_step = None;
+            Some(PartAction::Visible(name, visible)) => self.set_visible(&name, visible),
+            Some(PartAction::Isolate(name)) => {
+                let names: Vec<String> = self.project.iter().flat_map(|p| &p.project.parts).map(|p| p.name.clone()).collect();
+                for other in names {
+                    let visible = other == name;
+                    self.set_visible(&other, visible);
+                }
             }
+            Some(PartAction::ShowAll) => self.show_all(),
+            Some(PartAction::Kind(name, kind)) => self.set_part_kind(&name, kind),
+            Some(PartAction::Delete(name)) => self.delete_part(&name),
+            Some(PartAction::Import) => self.import_step_dialog(),
+            None => {}
         }
     }
 
@@ -837,7 +961,9 @@ impl State {
         });
         ui.add_space(4.0);
 
+        let part_name = part.name.clone();
         let mut clicked = None;
+        let mut delete = None;
         egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 for (i, step) in steps(part).iter().enumerate() {
@@ -860,6 +986,14 @@ impl State {
                     if response.clicked() {
                         clicked = Some(if selected { None } else { Some(step.id.to_owned()) });
                     }
+                    response.context_menu(|ui| {
+                        if step.id == intercraft_geo::IMPORT_STEP_ID {
+                            ui.weak("This is the imported shape.\nDelete the part to remove it.");
+                        } else if ui.button("Delete step").clicked() {
+                            delete = Some(step.id.to_owned());
+                            ui.close();
+                        }
+                    });
                 }
 
                 let latest = step_card(ui, self.selected_step.is_none(), |ui| {
@@ -874,6 +1008,56 @@ impl State {
         if let Some(step) = clicked {
             self.selected_step = step;
         }
+        if let Some(id) = delete {
+            self.delete_step(&part_name, &id);
+        }
+    }
+}
+
+/// What a click in the parts list asked for, applied once the list is drawn.
+enum PartAction {
+    Select(String),
+    Visible(String, bool),
+    Isolate(String),
+    ShowAll,
+    Kind(String, PartKind),
+    Delete(String),
+    Import,
+}
+
+/// An eye, crossed out when the part is hidden. Drawn by hand so it needs no icon font.
+fn eye_button(ui: &mut egui::Ui, visible: bool, part: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::click());
+    let visuals = ui.visuals();
+    let color = if response.hovered() {
+        visuals.strong_text_color()
+    } else if visible {
+        visuals.text_color()
+    } else {
+        visuals.weak_text_color()
+    };
+    let stroke = egui::Stroke::new(1.3, color);
+    let c = rect.center();
+    let (w, h) = (7.0_f32, 4.0_f32);
+    let lid = |x: f32| h * (1.0 - (x / w).powi(2));
+    let mut points: Vec<egui::Pos2> = (0..=16).map(|i| -w + 2.0 * w * i as f32 / 16.0).map(|x| c + egui::vec2(x, -lid(x))).collect();
+    points.extend((1..16).map(|i| w - 2.0 * w * i as f32 / 16.0).map(|x| c + egui::vec2(x, lid(x))));
+    ui.painter().add(egui::Shape::closed_line(points, stroke));
+    if visible {
+        ui.painter().circle_filled(c, 2.2, color);
+    } else {
+        ui.painter().line_segment([c + egui::vec2(-w, h + 1.5), c + egui::vec2(w, -h - 1.5)], stroke);
+    }
+    let action = if visible { "Hide" } else { "Show" };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{action} {part}")));
+    response.on_hover_text(format!("{action} (H)"))
+}
+
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 

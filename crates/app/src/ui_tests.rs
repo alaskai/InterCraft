@@ -302,3 +302,52 @@ fn import_step_adds_an_editable_part() {
     assert!(h.get_all_by_label_contains("Imported RodBracket_2.step").count() >= 1, "no import step on the timeline");
     shot(&mut h, "imported");
 }
+
+fn part_names(h: &Harness<'static, App>) -> Vec<String> {
+    let project = h.state().state.project.as_ref().expect("a project is loaded");
+    project.project.parts.iter().map(|p| p.name.clone()).collect()
+}
+
+#[test]
+fn hide_delete_and_undo_a_part() {
+    let _one = one_at_a_time();
+    let project = example_project("undo");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    // The eye hides the part, and the toolbar offers to bring it back.
+    click(&mut h, "Hide RodBracket");
+    assert!(h.state().state.hidden.contains("RodBracket"));
+    h.get_by_label_contains("Show all (1 hidden)");
+    shot(&mut h, "part_hidden");
+    click(&mut h, "Show RodBracket");
+    assert!(h.state().state.hidden.is_empty());
+
+    // Delete it, then bring it back from the Edit menu.
+    h.state_mut().state.delete_part("RodBracket");
+    h.step();
+    assert!(part_names(&h).is_empty());
+    click(&mut h, "Edit");
+    shot(&mut h, "menu_edit");
+    h.get_by_label_contains("Undo: Delete part 'RodBracket'").click();
+    wait_until(&mut h, "the part to come back", built);
+    assert_eq!(part_names(&h), ["RodBracket"]);
+
+    // Ctrl+Y redoes the delete and Ctrl+Z undoes it again.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Y);
+    h.step();
+    h.step();
+    assert!(part_names(&h).is_empty(), "{}", h.state().state.worker_status);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    wait_until(&mut h, "the part to come back again", built);
+    assert_eq!(part_names(&h), ["RodBracket"]);
+
+    click(&mut h, "Edit");
+    shot(&mut h, "menu_edit_again");
+    h.get_by_label_contains("History").hover();
+    h.step();
+    h.step();
+    shot(&mut h, "menu_history");
+    // In the history list, as "Redo: ..." in the Edit menu, and in the status bar.
+    assert_eq!(h.get_all_by_label_contains("Delete part 'RodBracket'").count(), 3);
+}

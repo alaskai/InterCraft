@@ -10,3 +10,6 @@ exports/
 *.tmp
 # Machine-specific Cargo settings (for example a target dir outside OneDrive)
 .cargo/config.toml
+# Undo history and lock file the viewer keeps in each project
+.intercraft/
+.intercraft.lock

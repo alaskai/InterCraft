@@ -34,7 +34,11 @@ Working method:
 Imported parts and measuring:
 - A part can start from an imported STEP file (its first step is "import"). In the first feature after it, `part` is that imported shape, so cuts, holes and fillets work on it like any other.
 - Before editing an imported part, call inspect_part to find its faces, holes and their exact positions instead of guessing.
-- Use measure to check clearances, hole spacing and wall thickness after a change."#;
+- Use measure to check clearances, hole spacing and wall thickness after a change.
+
+Undo:
+- Every change is recorded. If an edit went wrong, or the user asks to go back, call undo instead of rebuilding by hand. redo steps forward again.
+- delete_part removes a whole part. Reference parts can only be removed by the user."#;
 
 /// Which project the tools edit.
 enum Target {
@@ -231,6 +235,25 @@ pub fn definitions() -> Value {
             },
         },
         {
+            "name": "delete_part",
+            "description": "Remove a whole design part and its features. It can be brought back with undo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "part": part },
+                "required": ["part"],
+            },
+        },
+        {
+            "name": "undo",
+            "description": "Undo the most recent change to the project, whoever made it (you, the user or another agent). Returns what was undone.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "redo",
+            "description": "Redo the change most recently undone. Fails if the project changed since the undo.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
             "name": "inspect_part",
             "description": "Describe a part's built shape precisely: volume, bounding box, cylindrical faces (holes and bosses) with diameter and axis, circular edge diameters, and the largest faces with type, area, centre and normal. Face and edge indices match measure. Use it before editing an imported part or when you need exact positions.",
             "inputSchema": {
@@ -380,6 +403,17 @@ impl ToolHost {
                 project.save()?;
                 self.build_report(project.part(part)?, false)
             }
+            "delete_part" => {
+                let name = text(args, "part")?;
+                if project.part(name)?.kind == intercraft_core::PartKind::Reference {
+                    bail!("'{name}' is a reference part. Only the user can remove it");
+                }
+                project.remove_part(name)?;
+                project.save()?;
+                Ok(json!({ "deleted_part": name, "undo": "call undo to bring it back" }))
+            }
+            "undo" => Ok(json!({ "undone": project.undo()? })),
+            "redo" => Ok(json!({ "redone": project.redo()? })),
             "inspect_part" => {
                 let part = project.part(text(args, "part")?)?.clone();
                 let key = self.built_key(&project.dir, &part, optional_text(args, "feature_id"))?;
@@ -426,16 +460,7 @@ impl ToolHost {
     /// Reads the project fresh on every call, because the user may have edited the files.
     /// Held for the whole call; released when the returned file is dropped.
     fn lock_project(&self) -> Result<std::fs::File> {
-        let dir = self.project_dir()?;
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(".intercraft.lock"))
-            .context("opening the project lock")?;
-        file.lock().context("waiting for the project lock")?;
-        Ok(file)
+        intercraft_core::lock(&self.project_dir()?)
     }
 
     /// A missing project is created, so a new folder opened in the viewer just works.

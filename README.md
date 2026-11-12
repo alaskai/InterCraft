@@ -51,8 +51,8 @@ To see the live update, leave the app open and change a value in `examples/brack
 
 | Panel | What it shows |
 |---|---|
-| Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it. |
-| Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. |
+| Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it, click the eye to hide or show it, and right-click for Show only this, Show all, Lock, Unlock and Delete. Delete removes the selected part while the pointer is over the list. |
+| Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. Right-click a step to delete it. |
 | Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). |
 
 ### Menus
@@ -60,6 +60,7 @@ To see the live update, leave the app open and change a value in `examples/brack
 | Menu | What it does |
 |---|---|
 | File | New project (Ctrl+N), Open project (Ctrl+O), Import STEP, Open recent, Show project folder, Quit |
+| Edit | Undo (Ctrl+Z), Redo (Ctrl+Y or Ctrl+Shift+Z), and History, which lists every change and jumps to any of them |
 | Export | The selected part or all parts as STEP (exact, editable) or STL (for printing), into the project's `exports` folder |
 | View | Fit to view, show or hide panels, Reset layout, theme (System, Dark, Light) |
 | Settings | Chat provider, model, effort, API key and theme (Ctrl+,) |
@@ -76,6 +77,7 @@ New projects go in `Documents\InterCraft Projects` unless you pick another folde
 | Fit to view | Double click, or F |
 | Measure | M, or the Measure button (Esc clears) |
 | Show or hide edges | E |
+| Hide or show the selected part | H |
 
 ### Measuring
 
@@ -84,6 +86,12 @@ Turn on Measure and click a corner, edge or face. Corners and edges snap when th
 ### Importing STEP files
 
 File > Import STEP (or the button under the parts list) copies the file into the project's `imports` folder and adds a part that starts from it. The import is step 1 on the timeline, and the model can add features on top of it: holes, pockets, fillets. Right-click a part to lock it as a reference (so the model designs around it but can't change it) or unlock it for editing.
+
+### Undo and history
+
+Every change is recorded, whoever made it: you in the app, the chat panel, or an agent through MCP. Edit > Undo steps back one change and Edit > History jumps to any point, so a bad edit from the model costs nothing. Edits made in a text editor are kept too. Undo reverts them as one step instead of losing them.
+
+The history lives in the project's `.intercraft/history` folder, one snapshot per change, up to the last 200. A deleted part's imported STEP file stays in `imports`, so undo can bring the part back.
 
 ## Driving it from an LLM
 
@@ -134,6 +142,8 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `edit_feature` | Changes a feature's code, label or parameters |
 | `set_param` | Changes one dimension |
 | `delete_feature` | Removes a feature |
+| `delete_part` | Removes a design part (reference parts can only be removed by you) |
+| `undo`, `redo` | Step back or forward through the project history |
 | `inspect_part` | Faces, holes and circular edges of a part with exact sizes and positions |
 | `measure` | Exact distance, angle, length or diameter between faces, edges, corners and points |
 | `export_part` | Writes STEP and STL to the project's `exports` folder |
@@ -149,6 +159,7 @@ A project is a folder with a `project.json` and one Python snippet per feature.
 ```
 examples/bracket/
   project.json            parts, feature order, labels, prompts, parameters
+  .intercraft/history/    undo snapshots (not needed to share the project)
   RodBracket/
     010_base.py
     020_bore.py
@@ -216,6 +227,7 @@ The suites include stress tests for both chat routes (a fake Messages API and a 
 5. STEP import, edge display, measuring tool, and inspect and measure tools for the model (done)
 6. OS-level isolation for the geometry worker
 7. OpenAI-compatible client (OpenAI, OpenRouter, local models through Ollama or LM Studio)
-8. Editing steps from the timeline and Inspector, with undo
-9. Sketch panel
-10. Fit checks, section view, before and after overlay
+8. Undo and history, hiding and deleting parts and steps (done)
+9. Editing steps from the timeline and Inspector
+10. Sketch panel
+11. Fit checks, section view, before and after overlay

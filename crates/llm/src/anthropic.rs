@@ -288,9 +288,10 @@ impl AnthropicChat {
 }
 
 impl ChatSession for AnthropicChat {
-    fn send(
+    fn send_with_images(
         &mut self,
         text: &str,
+        images: &[String],
         tools: &mut dyn ToolExecutor,
         on_event: &mut dyn FnMut(ChatEvent),
         cancel: &AtomicBool,
@@ -298,7 +299,10 @@ impl ChatSession for AnthropicChat {
         if self.settings.api_key.trim().is_empty() {
             bail!("no Anthropic API key set. Add one in the chat settings.");
         }
-        self.push_user_content(vec![json!({ "type": "text", "text": text })]);
+        // Pictures first, then the words about them.
+        let mut content: Vec<Value> = images.iter().map(|data| image_block(data)).collect();
+        content.push(json!({ "type": "text", "text": text }));
+        self.push_user_content(content);
         let definitions = tools.definitions();
 
         for _ in 0..MAX_ROUNDS {
@@ -519,10 +523,7 @@ fn run_tools(
             other => serde_json::to_string_pretty(other).unwrap_or_default(),
         };
         let content = match image {
-            Some(Value::String(data)) => json!([
-                { "type": "text", "text": text },
-                { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": data } },
-            ]),
+            Some(Value::String(data)) => json!([{ "type": "text", "text": text }, image_block(&data)]),
             _ => Value::String(text),
         };
         let mut result = Map::new();
@@ -535,6 +536,10 @@ fn run_tools(
         results.push(Value::Object(result));
     }
     results
+}
+
+pub(crate) fn image_block(data: &str) -> Value {
+    json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": data } })
 }
 
 fn tool_error(id: &str, message: &str) -> Value {

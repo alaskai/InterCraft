@@ -217,3 +217,18 @@ fn missing_claude_gives_a_clear_error() {
     let (result, _) = send(&mut chat, "ok");
     assert!(format!("{:#}", result.unwrap_err()).contains("couldn't start Claude Code"));
 }
+
+#[test]
+fn pictures_travel_with_the_message() {
+    setup();
+    let mut chat = new_chat();
+    let mut events = Vec::new();
+    let images = ["QUJD".to_owned(), "REVG".to_owned()];
+    let result = chat.send_with_images("pictures please", &images, &mut NoTools, &mut |e| events.push(e), &AtomicBool::new(false));
+    result.unwrap();
+    assert_eq!(text_of(&events), "saw 2 picture(s)");
+    // A message without pictures is still sent as plain text.
+    let (result, events) = send(&mut chat, "pictures again");
+    result.unwrap();
+    assert_eq!(text_of(&events), "saw 0 picture(s)");
+}

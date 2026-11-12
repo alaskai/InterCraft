@@ -443,3 +443,25 @@ fn nothing_is_sent_to_an_unsafe_address_or_without_a_model() {
     assert!(send(&mut chat, "hi").result.unwrap_err().to_string().contains("choose a model"));
     assert_eq!(server.count(), 0);
 }
+
+#[test]
+fn a_users_picture_is_sent_only_to_a_model_that_can_see() {
+    let reply = || Reply::Stream(vec![text("ok"), finish("stop")]);
+    let images = ["QUJD".to_owned()];
+    for vision in [true, false] {
+        let server = Server::start(vec![reply(), reply()]);
+        let mut chat = chat(&server, vision);
+        chat.send_with_images("my sketch", &images, &mut Tools::default(), &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        let message = server.body(0)["messages"][1].clone();
+        if vision {
+            assert_eq!(message["content"][0]["text"], "my sketch");
+            assert_eq!(message["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        } else {
+            let text = message["content"].as_str().expect("plain text for a text-only model");
+            assert!(text.starts_with("my sketch") && text.contains("unable to read images"));
+            assert!(!text.contains("QUJD"));
+        }
+        send(&mut chat, "and then?").ok();
+        assert_history_is_valid(&server.body(1));
+    }
+}

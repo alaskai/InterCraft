@@ -195,14 +195,23 @@ impl ClaudeCodeChat {
 }
 
 impl ChatSession for ClaudeCodeChat {
-    fn send(
+    fn send_with_images(
         &mut self,
         text: &str,
+        images: &[String],
         _tools: &mut dyn ToolExecutor, // Claude Code calls the InterCraft tools itself, over MCP.
         on_event: &mut dyn FnMut(ChatEvent),
         cancel: &AtomicBool,
     ) -> Result<()> {
-        let line = json!({ "type": "user", "message": { "role": "user", "content": text } });
+        // Plain text stays a plain string. With pictures the content becomes a list of blocks.
+        let content = if images.is_empty() {
+            Value::from(text)
+        } else {
+            let mut blocks: Vec<Value> = images.iter().map(|data| crate::anthropic::image_block(data)).collect();
+            blocks.push(json!({ "type": "text", "text": text }));
+            Value::from(blocks)
+        };
+        let line = json!({ "type": "user", "message": { "role": "user", "content": content } });
         let running = self.spawn()?;
         if writeln!(running.stdin, "{line}").and_then(|()| running.stdin.flush()).is_err() {
             return Err(self.died());

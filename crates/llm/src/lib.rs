@@ -70,6 +70,19 @@ pub trait ChatSession: Send {
         tools: &mut dyn ToolExecutor,
         on_event: &mut dyn FnMut(ChatEvent),
         cancel: &AtomicBool,
+    ) -> Result<()> {
+        self.send_with_images(text, &[], tools, on_event, cancel)
+    }
+
+    /// Like `send`, with pictures (base64 PNG) that go to the model alongside the text,
+    /// for example a sketch the user drew.
+    fn send_with_images(
+        &mut self,
+        text: &str,
+        images: &[String],
+        tools: &mut dyn ToolExecutor,
+        on_event: &mut dyn FnMut(ChatEvent),
+        cancel: &AtomicBool,
     ) -> Result<()>;
 
     /// Forget the conversation so far.

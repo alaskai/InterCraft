@@ -323,7 +323,7 @@ fn describe(before: &Content, after: &Content) -> String {
                 continue;
             };
             let code_changed = before.code.get(&w.file) != after.code.get(&f.file);
-            if code_changed || w.label != f.label || w.prompt != f.prompt || w.why != f.why {
+            if code_changed || w.label != f.label || w.prompt != f.prompt || w.why != f.why || w.labels != f.labels {
                 changes.push(format!("Edit '{}'", f.label));
             } else if w.params != f.params {
                 let changed: Vec<_> = f.params.iter().filter(|(k, v)| w.params.get(*k) != Some(*v)).collect();

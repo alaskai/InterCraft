@@ -34,6 +34,8 @@ Working method:
 - If a feature fails, the error is in the report and the change stays saved. Fix it with edit_feature, or remove it with delete_feature.
 - Prefer set_param for dimension changes. Later features rebuild automatically.
 - Pass the user's request in `prompt` when adding a feature. It is shown on their timeline.
+- Use standard design terms where they fit (fillet, chamfer, boss, rib, counterbore, countersink, clearance hole, press fit, wall thickness, overhang). The app explains them to the user when they appear in a label or why.
+- Give the params plain names in `labels` (e.g. {"bore_d": "Bore diameter"}), so beginners see words rather than code names.
 - Give every feature a `why`: one plain sentence on the design reason (what it does for the part, or the rule behind a number), written for someone new to CAD. For example: "Sized at 8.2 mm so the 8 mm rod slides in with a little clearance." It is shown on the timeline and teaches the user.
 - State which values you measured from a report and which you assumed.
 
@@ -300,6 +302,7 @@ pub fn definitions() -> Value {
                     "params": params,
                     "prompt": { "type": "string", "description": "The user's request that led to this feature. Shown on their timeline." },
                     "why": { "type": "string", "description": "One plain sentence on the design reason behind this feature, for someone new to CAD." },
+                    "labels": { "type": "object", "description": "Plain names for the params, shown to beginners, e.g. {\"bore_d\": \"Bore diameter\"}. Up to 40 characters each." },
                     "after": { "type": "string", "description": "Insert after this feature id. Omit to add at the end." },
                 },
                 "required": ["part", "label", "code"],
@@ -318,6 +321,7 @@ pub fn definitions() -> Value {
                     "params": params,
                     "prompt": { "type": "string" },
                     "why": { "type": "string", "description": "One plain sentence on the design reason." },
+                    "labels": { "type": "object", "description": "Plain names for the params. Replaces all of them." },
                 },
                 "required": ["part", "feature_id"],
             },
@@ -567,6 +571,7 @@ impl ToolHost {
                         params: optional_params(args)?.unwrap_or_default(),
                         prompt: optional_text(args, "prompt").unwrap_or_default().to_owned(),
                         why: optional_text(args, "why").unwrap_or_default().to_owned(),
+                        labels: optional_labels(args)?.unwrap_or_default(),
                         after: optional_text(args, "after").map(str::to_owned),
                     },
                 )?;
@@ -586,6 +591,7 @@ impl ToolHost {
                         params: optional_params(args)?,
                         prompt: optional_text(args, "prompt").map(str::to_owned),
                         why: optional_text(args, "why").map(str::to_owned),
+                        labels: optional_labels(args)?,
                     },
                 )?;
                 project.save()?;
@@ -829,6 +835,9 @@ impl ToolHost {
                 if !feature.why.is_empty() {
                     entry["why"] = feature.why.clone().into();
                 }
+                if !feature.labels.is_empty() {
+                    entry["labels"] = json!(feature.labels);
+                }
             }
             match by_id.get(id) {
                 Some(result) if result.ok => {
@@ -968,6 +977,18 @@ fn request_view(project: &Path, view: &str, args: &Value) -> Result<Vec<u8>> {
         let _ = std::fs::remove_file(leftover);
     }
     result
+}
+
+/// Parameter labels: an object of short strings.
+fn optional_labels(args: &Value) -> Result<Option<std::collections::BTreeMap<String, String>>> {
+    let Some(value) = args.get("labels").filter(|v| !v.is_null()) else { return Ok(None) };
+    let object = value.as_object().context("'labels' must be an object like {\"bore_d\": \"Bore diameter\"}")?;
+    let mut labels = std::collections::BTreeMap::new();
+    for (name, label) in object {
+        let label = label.as_str().with_context(|| format!("the label for '{name}' must be text"))?;
+        labels.insert(name.clone(), label.trim().to_owned());
+    }
+    Ok(Some(labels))
 }
 
 /// Three numbers, e.g. a position.

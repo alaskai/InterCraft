@@ -5,6 +5,7 @@
 mod caption;
 mod chat;
 mod fit;
+mod glossary;
 mod measure;
 mod menus;
 mod params;
@@ -789,6 +790,15 @@ impl State {
         }
     }
 
+    /// Explanations of the design terms in some text, unless the user asked for the
+    /// terse experience.
+    fn glossary_tip(&self, text: &str) -> Option<String> {
+        if self.chat.explain() == settings::Explain::Expert {
+            return None;
+        }
+        glossary::hover_for(text)
+    }
+
     /// Send a question to the chat for the user, and say so if it can't go yet.
     pub(crate) fn ask_chat(&mut self, question: &str) {
         if !self.chat.ask(question) {
@@ -1410,7 +1420,10 @@ impl State {
             if self.selected_step.is_none() { " (latest)" } else { "" }
         ));
         ui.horizontal(|ui| {
-            ui.heading(&step.label);
+            let heading = ui.heading(&step.label);
+            if let Some(tip) = self.glossary_tip(&step.label) {
+                heading.on_hover_text(tip);
+            }
             let ready = self.chat.can_ask();
             let hint = if ready {
                 "Ask the model what this step does and why it is designed this way"
@@ -1428,7 +1441,10 @@ impl State {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Why:");
-                ui.label(step.why);
+                let why = ui.label(step.why);
+                if let Some(tip) = self.glossary_tip(step.why) {
+                    why.on_hover_text(tip);
+                }
             });
         }
         if !step.prompt.is_empty() {
@@ -1442,7 +1458,8 @@ impl State {
             egui::Grid::new("params").num_columns(2).show(ui, |ui| {
                 for (name, value) in params {
                     let key = (part.name.as_str(), step.id);
-                    if let Some(edit) = params::param_row(ui, key, name, value, editable, drag, self.simple) {
+                    let label = step.labels.and_then(|l| l.get(name)).map(String::as_str);
+                    if let Some(edit) = params::param_row(ui, key, name, value, editable, drag, self.simple, label) {
                         commit = Some(InspectorAction::Param(edit));
                     }
                 }
@@ -1549,7 +1566,10 @@ impl State {
                         let text = egui::RichText::new(shorten(shown, 90)).italics().weak();
                         ui.add(egui::Label::new(text).wrap());
                     });
-                    let hover = [step.why, step.prompt].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
+                    let mut hover = [step.why, step.prompt].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
+                    if let Some(tip) = self.glossary_tip(&format!("{} {}", step.label, step.why)) {
+                        hover = if hover.is_empty() { tip } else { format!("{hover}\n\n{tip}") };
+                    }
                     let response = if hover.is_empty() { response } else { response.on_hover_text(hover) };
                     if response.clicked() {
                         clicked = Some(if selected { None } else { Some(step.id.to_owned()) });
@@ -1776,6 +1796,8 @@ struct Step<'a> {
     prompt: &'a str,
     /// The design reason, if the model gave one.
     why: &'a str,
+    /// Plain names for the parameters.
+    labels: Option<&'a std::collections::BTreeMap<String, String>>,
     file: &'a str,
     params: Option<&'a intercraft_core::Params>,
     /// The snippet. An imported shape has none.
@@ -1791,6 +1813,7 @@ fn steps(part: &Part) -> Vec<Step<'_>> {
             label: format!("Imported {name}"),
             prompt: "Starting shape from an imported STEP file.",
             why: "",
+            labels: None,
             file: source,
             params: None,
             code: None,
@@ -1801,6 +1824,7 @@ fn steps(part: &Part) -> Vec<Step<'_>> {
         label: f.label.clone(),
         prompt: &f.prompt,
         why: &f.why,
+        labels: Some(&f.labels),
         file: &f.file,
         params: Some(&f.params),
         code: Some(&f.code),

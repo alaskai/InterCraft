@@ -57,7 +57,8 @@ On first launch InterCraft asks whether you're new to CAD. You can change both c
 | Setting | What it changes |
 |---|---|
 | Explanations: Beginner, Standard or Expert | How much the model explains as it works, and how much the hover text on its actions says. Beginner explains every step and design term in plain words. Expert is terse: numbers and decisions only. |
-| Layout: Simple or Advanced | Simple keeps the chat and the 3D view to the front and hides code, file paths and raw parameter names (bore_d shows as "Bore d"). Moving a part sits behind "Move part". Advanced shows everything. |
+| Design terms | Hover a step to see plain explanations of terms like fillet, boss, clearance hole or overhang. Not shown at Expert level. |
+| Layout: Simple or Advanced | Simple keeps the chat and the 3D view to the front and hides code, file paths and raw parameter names. Parameters show the plain names the model gives them ("Bore diameter"), or the code name made readable ("Bore d"). Moving a part sits behind "Move part". Advanced shows everything. |
 
 ### Panels
 

@@ -61,13 +61,24 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let text = msg["message"]["content"].as_str().unwrap_or_default().to_owned();
+        // Content is a plain string, or a list of blocks when pictures come with it.
+        let content = &msg["message"]["content"];
+        let blocks = content.as_array().map(Vec::as_slice).unwrap_or_default();
+        let pictures = blocks.iter().filter(|b| b["type"] == "image" && b["source"]["media_type"] == "image/png").count();
+        let text = match content.as_str() {
+            Some(text) => text.to_owned(),
+            None => blocks.iter().find_map(|b| b["text"].as_str()).unwrap_or_default().to_owned(),
+        };
         out(json!({"type": "system", "subtype": "init", "session_id": session, "model": "fake-model"}));
         let word = text.split_whitespace().next().unwrap_or_default();
 
         match word {
             "lockdown" => {
                 stream_text(&lockdown.to_string(), Value::Null);
+                result(&session, true, "");
+            }
+            "pictures" => {
+                stream_text(&format!("saw {pictures} picture(s)"), Value::Null);
                 result(&session, true, "");
             }
             "echo" => {

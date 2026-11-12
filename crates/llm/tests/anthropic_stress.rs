@@ -524,3 +524,19 @@ impl Run {
         last["messages"].to_string()
     }
 }
+
+#[test]
+fn pictures_travel_with_the_message() {
+    let mut chat = new_chat();
+    let mut tools = Tools { calls: Vec::new() };
+    let images = ["QUJD".to_owned()];
+    let token = "scenario:text#picture";
+    chat.send_with_images(token, &images, &mut tools, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+    let request = &requests_for(token)[0];
+    let content = request["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["source"], json!({ "type": "base64", "media_type": "image/png", "data": "QUJD" }));
+    assert_eq!(content[1]["text"], token);
+    // The picture stays in the history, and the next message is accepted.
+    let (after, _, _) = send(&mut chat, "scenario:text#after-picture");
+    after.unwrap();
+}

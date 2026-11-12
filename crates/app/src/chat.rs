@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::settings::{self, KeySource, Provider, Settings, EFFORTS};
 
 enum Command {
-    Send(String),
+    Send { text: String, images: Vec<String> },
     Reset,
     Configure(Config),
 }
@@ -45,7 +45,8 @@ enum Reply {
 }
 
 enum Message {
-    User(String),
+    /// The text, and whether a sketch went with it.
+    User(String, bool),
     Assistant { model: String, items: Vec<Item> },
     Notice(String),
     Error(String),
@@ -90,6 +91,8 @@ pub struct ChatPanel {
     messages: Vec<Message>,
     markdown: egui_commonmark::CommonMarkCache,
     input: String,
+    /// A sketch waiting to go with the next message: base64 PNG and its written summary.
+    sketch: Option<(String, String)>,
     usage: Usage,
     ctx: egui::Context,
 }
@@ -119,6 +122,7 @@ impl ChatPanel {
             messages: Vec::new(),
             markdown: Default::default(),
             input: String::new(),
+            sketch: None,
             usage: Usage::default(),
             ctx,
         };
@@ -232,17 +236,20 @@ impl ChatPanel {
         self.settings.openai_model = model.to_owned();
     }
 
-    /// Put text in the message box (after anything already typed) for the user to send.
-    pub fn add_to_input(&mut self, text: &str) {
-        if !self.input.is_empty() && !self.input.ends_with('\n') {
-            self.input.push('\n');
-        }
-        self.input.push_str(text);
+    /// Hold a sketch to go with the next message. It replaces one already waiting.
+    pub fn attach_sketch(&mut self, png_base64: String, summary: String) {
+        self.sketch = Some((png_base64, summary));
     }
 
+    /// The sketch waiting to be sent, as (base64 PNG, summary).
     #[cfg(test)]
-    pub fn input(&self) -> &str {
-        &self.input
+    pub fn attached_sketch(&self) -> Option<&(String, String)> {
+        self.sketch.as_ref()
+    }
+
+    /// A reply is being written, so nothing new can be sent or attached yet.
+    pub fn busy(&self) -> bool {
+        self.busy
     }
 
     /// One line describing the chat setup, for the panel header.
@@ -273,7 +280,7 @@ impl ChatPanel {
     /// `context` is a short note about what the user is looking at, sent with their message.
     fn send(&mut self, context: Option<String>) {
         let text = self.input.trim().to_owned();
-        if text.is_empty() || self.busy {
+        if (text.is_empty() && self.sketch.is_none()) || self.busy || !self.ready() {
             return;
         }
         self.input.clear();
@@ -284,14 +291,23 @@ impl ChatPanel {
         if self.busy || !self.ready() {
             return;
         }
-        self.messages.push(Message::User(text.clone()));
-        let full = match context {
-            Some(context) => format!("{text}\n\n[{context}]"),
-            None => text,
-        };
+        let sketch = self.sketch.take();
+        self.messages.push(Message::User(text.clone(), sketch.is_some()));
+        let mut full = text;
+        let mut images = Vec::new();
+        if let Some((png, summary)) = sketch {
+            // The summary goes along in words, so the labels and numbers survive even
+            // if the model reads the picture badly or can't read pictures at all.
+            let said = if full.is_empty() { "See my sketch.".to_owned() } else { full };
+            full = format!("{said}\n\n[Attached sketch]\n{summary}");
+            images.push(png);
+        }
+        if let Some(context) = context {
+            full = format!("{full}\n\n[{context}]");
+        }
         self.cancel.store(false, Ordering::Relaxed);
         self.busy = true;
-        let _ = self.worker().send(Command::Send(full));
+        let _ = self.worker().send(Command::Send { text: full, images });
     }
 
     /// Drain replies from the worker. Returns the part the model last touched, so the
@@ -419,7 +435,7 @@ impl ChatPanel {
                         self.cancel.store(true, Ordering::Relaxed);
                     }
                 } else {
-                    let can_send = !self.input.trim().is_empty() && self.ready();
+                    let can_send = (!self.input.trim().is_empty() || self.sketch.is_some()) && self.ready();
                     if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() || (enter && can_send) {
                         self.send(context.clone());
                     }
@@ -429,6 +445,14 @@ impl ChatPanel {
                     self.usage = Usage::default();
                     if self.worker.is_some() {
                         let _ = self.worker().send(Command::Reset);
+                    }
+                }
+                // On the same line as the buttons, so attaching never pushes them out of view.
+                if self.sketch.is_some() {
+                    ui.separator();
+                    ui.label("Sketch attached").on_hover_text("It goes with your next message, as a picture and a written summary");
+                    if ui.small_button("Remove").clicked() {
+                        self.sketch = None;
                     }
                 }
             });
@@ -460,7 +484,7 @@ impl ChatPanel {
                 // Questions can only be answered on the newest reply, once it has finished.
                 let newest = self.messages.iter().rposition(|m| matches!(m, Message::Assistant { .. }));
                 let open = newest.filter(|&i| {
-                    !self.busy && !self.messages[i + 1..].iter().any(|m| matches!(m, Message::User(_)))
+                    !self.busy && !self.messages[i + 1..].iter().any(|m| matches!(m, Message::User(..)))
                 });
                 for (i, message) in self.messages.iter_mut().enumerate() {
                     answered |= message_ui(ui, message, &mut self.markdown, open == Some(i));
@@ -791,14 +815,19 @@ fn message_ui(
 ) -> bool {
     let mut answered = false;
     match message {
-        Message::User(text) => {
+        Message::User(text, sketch) => {
             egui::Frame::new()
                 .fill(ui.visuals().selection.bg_fill.gamma_multiply(0.3))
                 .corner_radius(6.0)
                 .inner_margin(8)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(text.as_str());
+                    if !text.is_empty() {
+                        ui.label(text.as_str());
+                    }
+                    if *sketch {
+                        ui.weak("Sent with a sketch");
+                    }
                 });
         }
         Message::Assistant { model, items } => {
@@ -1037,7 +1066,7 @@ fn run_worker(
 
     for command in commands {
         match command {
-            Command::Send(text) => {
+            Command::Send { text, images } => {
                 let mut on_event = |event| {
                     let _ = replies.send(Reply::Event(event));
                     ctx.request_repaint();
@@ -1047,7 +1076,7 @@ fn run_worker(
                     Provider::ClaudeCode => &mut claude_code,
                     Provider::OpenAi => &mut openai,
                 };
-                let reply = match chat.send(&text, &mut tools, &mut on_event, &cancel) {
+                let reply = match chat.send_with_images(&text, &images, &mut tools, &mut on_event, &cancel) {
                     Ok(()) => None,
                     Err(e) if e.is::<Cancelled>() => Some(Reply::Stopped),
                     Err(e) => Some(Reply::Failed(format!("{e:#}"))),

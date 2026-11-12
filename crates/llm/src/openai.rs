@@ -239,9 +239,10 @@ impl OpenAiChat {
 }
 
 impl ChatSession for OpenAiChat {
-    fn send(
+    fn send_with_images(
         &mut self,
         text: &str,
+        images: &[String],
         tools: &mut dyn ToolExecutor,
         on_event: &mut dyn FnMut(ChatEvent),
         cancel: &AtomicBool,
@@ -251,7 +252,21 @@ impl ChatSession for OpenAiChat {
             bail!("choose a model in Settings");
         }
         let definitions = tools.definitions();
-        self.messages.push(json!({ "role": "user", "content": text }));
+        if images.is_empty() {
+            self.messages.push(json!({ "role": "user", "content": text }));
+        } else if self.settings.vision {
+            let mut content = vec![json!({ "type": "text", "text": text })];
+            content.extend(images.iter().map(|data| {
+                json!({ "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{data}") } })
+            }));
+            self.messages.push(json!({ "role": "user", "content": content }));
+        } else {
+            // The words still describe the sketch, so a text-only model isn't left guessing.
+            let note = "(A picture was attached, but this model is set as unable to read images, so only the description above was sent.)";
+            self.messages.push(json!({ "role": "user", "content": format!("{text}
+
+{note}") }));
+        }
 
         for round in 0..MAX_ROUNDS {
             if cancel.load(Ordering::Relaxed) {

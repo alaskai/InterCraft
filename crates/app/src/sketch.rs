@@ -1,124 +1,87 @@
-// The sketch panel: draw a flat profile on a millimetre grid, then extrude it into
-// a part or hand its exact coordinates to the chat. Shapes drawn inside another
-// shape become holes. Everything snaps to the grid, so the numbers are exact.
+// The sketch panel: a rough drawing pad for showing the model what you mean.
+// Draw freehand or with simple shapes, add labels and dimensions, give each colour
+// a meaning, and optionally draw over a flat view of the model. The sketch goes to
+// the chat as a picture plus a written summary. It is never turned into geometry.
 
 use eframe::egui;
-use serde_json::{json, Value};
 
 use crate::measure::mm;
 
 type Point = [f64; 2];
 
+/// Pens. The name is what the model reads in the colour key.
+pub const COLOURS: [(&str, egui::Color32); 6] = [
+    ("red", egui::Color32::from_rgb(235, 80, 80)),
+    ("orange", egui::Color32::from_rgb(240, 160, 50)),
+    ("green", egui::Color32::from_rgb(90, 200, 110)),
+    ("blue", egui::Color32::from_rgb(90, 160, 245)),
+    ("purple", egui::Color32::from_rgb(190, 130, 240)),
+    ("white", egui::Color32::from_rgb(235, 235, 235)),
+];
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Shape {
-    /// A closed outline, in drawing order.
-    Polygon(Vec<Point>),
-    /// Two opposite corners.
-    Rect(Point, Point),
-    Circle { centre: Point, radius: f64 },
+pub enum Item {
+    /// A freehand line.
+    Stroke { points: Vec<Point>, colour: usize },
+    Line { a: Point, b: Point, arrow: bool, colour: usize },
+    Rect { a: Point, b: Point, colour: usize },
+    Circle { centre: Point, radius: f64, colour: usize },
+    Label { at: Point, text: String, colour: usize },
+    /// A dimension line. `text` is what the user wrote on it. Empty shows the drawn length.
+    Dimension { a: Point, b: Point, text: String, colour: usize },
 }
 
-impl Shape {
-    /// A point on the shape's edge, used to tell which other shapes it sits inside.
-    fn anchor(&self) -> Point {
+impl Item {
+    fn colour(&self) -> usize {
         match self {
-            Shape::Polygon(points) => points[0],
-            Shape::Rect(a, _) => *a,
-            Shape::Circle { centre, radius } => [centre[0] + radius, centre[1]],
+            Item::Stroke { colour, .. }
+            | Item::Line { colour, .. }
+            | Item::Rect { colour, .. }
+            | Item::Circle { colour, .. }
+            | Item::Label { colour, .. }
+            | Item::Dimension { colour, .. } => *colour,
         }
     }
 
-    fn outline(&self) -> Vec<Point> {
+    /// Distance in mm from a point to the item, for the eraser.
+    fn distance_to(&self, p: Point) -> f64 {
         match self {
-            Shape::Polygon(points) => points.clone(),
-            Shape::Rect(a, b) => vec![*a, [b[0], a[1]], *b, [a[0], b[1]]],
-            Shape::Circle { centre, radius } => (0..48)
-                .map(|i| {
-                    let angle = i as f64 / 48.0 * std::f64::consts::TAU;
-                    [centre[0] + radius * angle.cos(), centre[1] + radius * angle.sin()]
-                })
-                .collect(),
-        }
-    }
-
-    /// Strictly inside, so shapes that only share an edge don't count as nested.
-    fn contains(&self, p: Point) -> bool {
-        match self {
-            Shape::Circle { centre, radius } => distance(*centre, p) < radius - 1e-9,
-            Shape::Rect(a, b) => {
-                let (lo, hi) = ([a[0].min(b[0]), a[1].min(b[1])], [a[0].max(b[0]), a[1].max(b[1])]);
-                p[0] > lo[0] + 1e-9 && p[0] < hi[0] - 1e-9 && p[1] > lo[1] + 1e-9 && p[1] < hi[1] - 1e-9
+            Item::Stroke { points, .. } => points.windows(2).map(|w| to_segment(p, w[0], w[1])).fold(f64::MAX, f64::min),
+            Item::Line { a, b, .. } | Item::Dimension { a, b, .. } => to_segment(p, *a, *b),
+            Item::Rect { a, b, .. } => {
+                let corners = [*a, [b[0], a[1]], *b, [a[0], b[1]]];
+                (0..4).map(|i| to_segment(p, corners[i], corners[(i + 1) % 4])).fold(f64::MAX, f64::min)
             }
-            Shape::Polygon(points) => {
-                // Ray casting. A point on the outline itself is not inside.
-                let mut inside = false;
-                for (i, a) in points.iter().enumerate() {
-                    let b = points[(i + 1) % points.len()];
-                    if on_segment(*a, b, p) {
-                        return false;
-                    }
-                    if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0] {
-                        inside = !inside;
-                    }
-                }
-                inside
-            }
+            Item::Circle { centre, radius, .. } => (distance(*centre, p) - radius).abs(),
+            Item::Label { at, .. } => distance(*at, p),
         }
     }
 
-    fn area(&self) -> f64 {
-        match self {
-            Shape::Circle { radius, .. } => std::f64::consts::PI * radius * radius,
-            Shape::Rect(a, b) => ((b[0] - a[0]) * (b[1] - a[1])).abs(),
-            Shape::Polygon(points) => {
-                let twice: f64 = (0..points.len())
-                    .map(|i| {
-                        let (a, b) = (points[i], points[(i + 1) % points.len()]);
-                        a[0] * b[1] - b[0] * a[1]
-                    })
-                    .sum();
-                twice.abs() / 2.0
-            }
-        }
-    }
-
-    /// One line with the exact numbers, for the chat.
+    /// One line for the written summary.
     fn describe(&self) -> String {
+        let at = |p: &Point| format!("({}, {})", mm(round1(p[0])), mm(round1(p[1])));
+        let colour = COLOURS[self.colour()].0;
         match self {
-            Shape::Polygon(points) => {
-                let list: Vec<String> = points.iter().map(|p| format!("({}, {})", mm(p[0]), mm(p[1]))).collect();
-                format!("closed polygon through {}", list.join(", "))
+            Item::Stroke { points, .. } => {
+                let (lo, hi) = bounds(points);
+                format!("{colour} freehand line from {} to {}, within {} to {}", at(&points[0]), at(&points[points.len() - 1]), at(&lo), at(&hi))
             }
-            Shape::Rect(a, b) => format!(
-                "rectangle {} x {} mm, corners ({}, {}) and ({}, {})",
-                mm((b[0] - a[0]).abs()),
-                mm((b[1] - a[1]).abs()),
-                mm(a[0].min(b[0])),
-                mm(a[1].min(b[1])),
-                mm(a[0].max(b[0])),
-                mm(a[1].max(b[1]))
-            ),
-            Shape::Circle { centre, radius } => {
-                format!("circle of diameter {} mm, centre ({}, {})", mm(radius * 2.0), mm(centre[0]), mm(centre[1]))
+            Item::Line { a, b, arrow: true, .. } => format!("{colour} arrow from {} pointing to {}", at(a), at(b)),
+            Item::Line { a, b, .. } => format!("{colour} line from {} to {}", at(a), at(b)),
+            Item::Rect { a, b, .. } => {
+                let (lo, hi) = bounds(&[*a, *b]);
+                format!("{colour} rectangle {} x {} mm, corners {} and {}", mm(round1(hi[0] - lo[0])), mm(round1(hi[1] - lo[1])), at(&lo), at(&hi))
             }
-        }
-    }
-
-    /// build123d code for the shape as a flat face.
-    fn code(&self) -> String {
-        match self {
-            Shape::Polygon(points) => {
-                let list: Vec<String> = points.iter().map(|p| format!("({}, {})", mm(p[0]), mm(p[1]))).collect();
-                format!("Polygon({}, align=None)", list.join(", "))
+            Item::Circle { centre, radius, .. } => format!("{colour} circle, diameter {} mm, centre {}", mm(round1(radius * 2.0)), at(centre)),
+            Item::Label { at: p, text, .. } => format!("{colour} label \"{text}\" at {}", at(p)),
+            Item::Dimension { a, b, text, .. } => {
+                let drawn = mm(round1(distance(*a, *b)));
+                if text.trim().is_empty() {
+                    format!("{colour} dimension of {drawn} mm between {} and {}", at(a), at(b))
+                } else {
+                    format!("{colour} dimension marked \"{}\" between {} and {} (drawn {drawn} mm long)", text.trim(), at(a), at(b))
+                }
             }
-            Shape::Rect(a, b) => format!(
-                "Pos({}, {}) * Rectangle({}, {})",
-                mm((a[0] + b[0]) / 2.0),
-                mm((a[1] + b[1]) / 2.0),
-                mm((b[0] - a[0]).abs()),
-                mm((b[1] - a[1]).abs())
-            ),
-            Shape::Circle { centre, radius } => format!("Pos({}, {}) * Circle({})", mm(centre[0]), mm(centre[1]), mm(*radius)),
         }
     }
 }
@@ -127,245 +90,324 @@ fn distance(a: Point, b: Point) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
-fn on_segment(a: Point, b: Point, p: Point) -> bool {
-    let cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
-    let within = p[0] >= a[0].min(b[0]) - 1e-9 && p[0] <= a[0].max(b[0]) + 1e-9 && p[1] >= a[1].min(b[1]) - 1e-9 && p[1] <= a[1].max(b[1]) + 1e-9;
-    cross.abs() < 1e-9 && within
+fn to_segment(p: Point, a: Point, b: Point) -> f64 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    distance(p, [a[0] + dx * t, a[1] + dy * t])
 }
 
-/// Which shapes are holes: those sitting inside an odd number of other shapes.
-pub fn holes(shapes: &[Shape]) -> Vec<bool> {
-    shapes
-        .iter()
-        .enumerate()
-        .map(|(i, shape)| {
-            let anchor = shape.anchor();
-            let depth = shapes.iter().enumerate().filter(|(j, other)| *j != i && other.contains(anchor)).count();
-            depth % 2 == 1
-        })
-        .collect()
+fn bounds(points: &[Point]) -> (Point, Point) {
+    let fold = |pick: fn(f64, f64) -> f64, start: f64| [0, 1].map(|i| points.iter().map(|p| p[i]).fold(start, pick));
+    (fold(f64::min, f64::MAX), fold(f64::max, f64::MIN))
 }
 
-/// Area of material: outlines minus holes, in mm².
-pub fn area(shapes: &[Shape]) -> f64 {
-    shapes.iter().zip(holes(shapes)).map(|(s, hole)| if hole { -s.area() } else { s.area() }).sum()
+fn round1(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
 }
 
-/// The sketch in words and exact numbers, to put in a chat message.
-pub fn describe(shapes: &[Shape]) -> String {
-    let mut text = String::from("Sketch from the sketch panel (XY plane, mm, exact):\n");
-    for (shape, hole) in shapes.iter().zip(holes(shapes)) {
-        text += &format!("- {}: {}\n", if hole { "hole" } else { "outline" }, shape.describe());
-    }
-    text
+/// How a flat view of the model maps onto the sketch: which model axis runs along
+/// sketch X and sketch Y, and whether it is reversed.
+pub fn view_axes(view: &str) -> Option<[(usize, f64); 2]> {
+    Some(match view {
+        "top" => [(0, 1.0), (1, 1.0)],
+        "bottom" => [(0, 1.0), (1, -1.0)],
+        "front" => [(0, 1.0), (2, 1.0)],
+        "back" => [(0, -1.0), (2, 1.0)],
+        "right" => [(1, 1.0), (2, 1.0)],
+        "left" => [(1, -1.0), (2, 1.0)],
+        _ => return None,
+    })
 }
 
-/// What to do with the extruded sketch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Start a new part from it.
-    NewPart,
-    /// Add it to the selected part.
-    Add,
-    /// Cut it out of the selected part.
-    Cut,
+fn axis_name((axis, sign): (usize, f64)) -> String {
+    format!("{}{}", if sign < 0.0 { "-" } else { "" }, ["X", "Y", "Z"][axis])
 }
 
-/// A feature made from the sketch: label, snippet and parameters.
-pub struct SketchFeature {
-    pub mode: Mode,
-    pub label: String,
-    pub code: String,
-    pub params: serde_json::Map<String, Value>,
-}
-
-/// The build123d snippet that extrudes the sketch. Height and start level are
-/// parameters, so they can be dragged in the Inspector afterwards.
-pub fn feature(shapes: &[Shape], mode: Mode, height: f64) -> Option<SketchFeature> {
-    let is_hole = holes(shapes);
-    let join = |want_hole: bool| -> Vec<String> {
-        shapes.iter().zip(&is_hole).filter(|(_, hole)| **hole == want_hole).map(|(s, _)| s.code()).collect()
-    };
-    let (outlines, cut_outs) = (join(false), join(true));
-    if outlines.is_empty() {
-        return None;
-    }
-    let mut code = String::from("# Drawn in the sketch panel: XY plane, mm.\n");
-    code += &format!("profile = {}\n", outlines[0]);
-    for outline in &outlines[1..] {
-        code += &format!("profile += {outline}\n");
-    }
-    for hole in &cut_outs {
-        code += &format!("profile -= {hole}\n");
-    }
-    code += "body = Pos(0, 0, p[\"z\"]) * extrude(profile, p[\"height\"])\n";
-    code += match mode {
-        Mode::NewPart => "part = body\n",
-        Mode::Add => "part = body if part is None else part + body\n",
-        Mode::Cut => "part = part - body\n",
-    };
-    let label = match mode {
-        Mode::Cut => "Sketched cut",
-        _ => "Sketched extrude",
-    };
-    let params = json!({ "height": height, "z": 0 }).as_object().cloned().unwrap_or_default();
-    Some(SketchFeature { mode, label: label.to_owned(), code, params })
+/// A flat picture of the model behind the sketch, at true scale.
+pub struct Backdrop {
+    pub view: String,
+    texture: egui::TextureHandle,
+    /// Middle of the picture in sketch coordinates, and half its side, in mm.
+    centre: Point,
+    half: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tool {
+    Pen,
     Line,
+    Arrow,
     Rectangle,
     Circle,
+    Label,
+    Dimension,
     Erase,
 }
 
+/// Getting the finished sketch out as a picture takes a couple of frames.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Capture {
+    Idle,
+    /// The user pressed Attach. The next frame is drawn clean and photographed.
+    Requested,
+    /// Waiting for the screenshot of this area of the window.
+    Waiting(egui::Rect),
+}
+
 pub enum SketchAction {
-    /// Put this text in the chat box.
-    ToChat(String),
-    Feature(SketchFeature),
+    /// Draw over this view of the model, or over nothing.
+    Backdrop(Option<String>),
 }
 
 pub struct Sketch {
-    pub shapes: Vec<Shape>,
+    pub items: Vec<Item>,
+    /// What each colour stands for, as typed by the user.
+    pub meanings: [String; COLOURS.len()],
     tool: Tool,
-    /// Points placed so far for the shape being drawn.
-    draft: Vec<Point>,
-    /// Grid step in mm.
-    snap: f64,
-    /// Pixels per mm.
+    colour: usize,
+    snap: bool,
+    /// Where the current drag started, and the freehand points collected so far.
+    drag_start: Option<Point>,
+    pen: Vec<Point>,
+    /// The label or dimension whose text is being typed.
+    editing: Option<usize>,
+    /// Pixels per mm, and where the origin sits relative to the middle of the canvas.
     zoom: f32,
-    /// Where the sketch origin sits, as an offset from the centre of the canvas.
     pan: egui::Vec2,
-    pub height: f64,
+    pub backdrop: Option<Backdrop>,
+    pub capture: Capture,
 }
 
 impl Default for Sketch {
     fn default() -> Self {
-        Self { shapes: Vec::new(), tool: Tool::Line, draft: Vec::new(), snap: 1.0, zoom: 6.0, pan: egui::Vec2::ZERO, height: 5.0 }
+        Self {
+            items: Vec::new(),
+            meanings: Default::default(),
+            tool: Tool::Pen,
+            colour: 0,
+            snap: true,
+            drag_start: None,
+            pen: Vec::new(),
+            editing: None,
+            zoom: 6.0,
+            pan: egui::Vec2::ZERO,
+            backdrop: None,
+            capture: Capture::Idle,
+        }
     }
 }
-
-const CLOSE_RADIUS: f32 = 9.0;
 
 impl Sketch {
     pub fn to_screen(&self, rect: egui::Rect, p: Point) -> egui::Pos2 {
         rect.center() + self.pan + egui::vec2(p[0] as f32, -p[1] as f32) * self.zoom
     }
 
-    fn to_sketch(&self, rect: egui::Rect, pos: egui::Pos2) -> Point {
+    fn to_sketch(&self, rect: egui::Rect, pos: egui::Pos2, snap: bool) -> Point {
         let v = (pos - rect.center() - self.pan) / self.zoom;
-        let snap = |x: f32| (f64::from(x) / self.snap).round() * self.snap;
-        [snap(v.x), snap(-v.y)]
+        let fix = |x: f32| if snap { f64::from(x).round() } else { round1(f64::from(x)) };
+        [fix(v.x), fix(-v.y)]
     }
 
-    /// A click on the canvas at a snapped point. `closing` is true when the click
-    /// landed on the first point of the outline being drawn.
-    fn click(&mut self, p: Point, closing: bool) {
+    /// Put a flat picture of the model behind the sketch. `centre` is the middle of
+    /// the picture in model coordinates and `half` is half its side in mm.
+    pub fn set_backdrop(&mut self, ctx: &egui::Context, view: &str, pixels: &[u8], size: u32, centre: [f32; 3], half: f32) {
+        let Some(axes) = view_axes(view) else { return };
+        let image = egui::ColorImage::from_rgba_unmultiplied([size as usize; 2], pixels);
+        let texture = ctx.load_texture("sketch backdrop", image, egui::TextureOptions::LINEAR);
+        let along = |(axis, sign): (usize, f64)| f64::from(centre[axis]) * sign;
+        self.backdrop = Some(Backdrop { view: view.to_owned(), texture, centre: [along(axes[0]), along(axes[1])], half: f64::from(half) });
+        // Frame the picture.
+        self.pan = egui::vec2(-along(axes[0]) as f32, along(axes[1]) as f32) * self.zoom;
+    }
+
+    /// The sketch in words, sent with the picture so a model that reads images
+    /// poorly, or not at all, still gets the labels, numbers and colour key.
+    pub fn describe(&self) -> String {
+        let mut text = String::from(
+            "The user drew this sketch to show what they want. It is rough: treat positions and sizes as approximate unless a dimension or label says otherwise. Coordinates are in mm.\n",
+        );
+        match self.backdrop.as_ref().and_then(|b| Some((b, view_axes(&b.view)?))) {
+            Some((backdrop, axes)) => {
+                text += &format!(
+                    "It is drawn over the {} view of the model at true scale: sketch X is model {}, sketch Y is model {}.\n",
+                    backdrop.view,
+                    axis_name(axes[0]),
+                    axis_name(axes[1])
+                );
+            }
+            None => text += "It is drawn on a blank grid, not over the model.\n",
+        }
+        let used: Vec<usize> = (0..COLOURS.len()).filter(|c| self.items.iter().any(|i| i.colour() == *c)).collect();
+        let key: Vec<String> = used
+            .iter()
+            .filter(|c| !self.meanings[**c].trim().is_empty())
+            .map(|c| format!("{} = {}", COLOURS[*c].0, self.meanings[*c].trim()))
+            .collect();
+        if !key.is_empty() {
+            text += &format!("Colour key: {}.\n", key.join("; "));
+        }
+        for (heading, wanted) in [("Labels", 0), ("Dimensions", 1), ("Drawn", 2)] {
+            let lines: Vec<String> = self
+                .items
+                .iter()
+                .filter(|item| match item {
+                    Item::Label { .. } => wanted == 0,
+                    Item::Dimension { .. } => wanted == 1,
+                    _ => wanted == 2,
+                })
+                .map(|item| format!("- {}\n", item.describe()))
+                .collect();
+            if !lines.is_empty() {
+                text += &format!("{heading}:\n{}", lines.concat());
+            }
+        }
+        text
+    }
+
+    /// Finish a drag from `a` to `b` with the current tool.
+    fn finish_drag(&mut self, a: Point, b: Point) {
+        let colour = self.colour;
+        if a == b && self.tool != Tool::Pen {
+            return;
+        }
         match self.tool {
-            Tool::Line => {
-                if closing && self.draft.len() >= 3 {
-                    self.shapes.push(Shape::Polygon(std::mem::take(&mut self.draft)));
-                } else if self.draft.last() != Some(&p) && !closing {
-                    self.draft.push(p);
+            Tool::Pen => {
+                let points = std::mem::take(&mut self.pen);
+                if points.len() >= 2 {
+                    self.items.push(Item::Stroke { points, colour });
                 }
             }
-            Tool::Rectangle | Tool::Circle => match self.draft.pop() {
-                None => self.draft.push(p),
-                Some(first) if first == p => self.draft.push(first),
-                Some(first) if self.tool == Tool::Rectangle => {
-                    // A rectangle needs both a width and a height.
-                    if first[0] != p[0] && first[1] != p[1] {
-                        self.shapes.push(Shape::Rect(first, p));
-                    } else {
-                        self.draft.push(first);
-                    }
-                }
-                Some(first) => self.shapes.push(Shape::Circle { centre: first, radius: distance(first, p) }),
-            },
+            Tool::Line => self.items.push(Item::Line { a, b, arrow: false, colour }),
+            Tool::Arrow => self.items.push(Item::Line { a, b, arrow: true, colour }),
+            Tool::Rectangle => self.items.push(Item::Rect { a, b, colour }),
+            Tool::Circle => self.items.push(Item::Circle { centre: a, radius: distance(a, b), colour }),
+            Tool::Dimension => {
+                self.items.push(Item::Dimension { a, b, text: String::new(), colour });
+                self.editing = Some(self.items.len() - 1);
+            }
+            Tool::Label | Tool::Erase => {}
+        }
+    }
+
+    fn click(&mut self, p: Point) {
+        match self.tool {
+            Tool::Label => {
+                self.items.push(Item::Label { at: p, text: String::new(), colour: self.colour });
+                self.editing = Some(self.items.len() - 1);
+            }
             Tool::Erase => {
-                // The smallest shape under the click, so a hole can be picked inside its outline.
-                let hit = self
-                    .shapes
+                // Whatever is nearest, within a few pixels.
+                let reach = f64::from(10.0 / self.zoom);
+                let nearest = self
+                    .items
                     .iter()
                     .enumerate()
-                    .filter(|(_, s)| s.contains(p) || s.anchor() == p)
-                    .min_by(|a, b| a.1.area().total_cmp(&b.1.area()))
-                    .map(|(i, _)| i);
-                if let Some(i) = hit {
-                    self.shapes.remove(i);
+                    .map(|(i, item)| (i, item.distance_to(p)))
+                    .filter(|(_, d)| *d <= reach)
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((i, _)) = nearest {
+                    self.items.remove(i);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Stop typing. A label left empty is dropped.
+    fn finish_editing(&mut self) {
+        if let Some(i) = self.editing.take() {
+            if matches!(self.items.get(i), Some(Item::Label { text, .. }) if text.trim().is_empty()) {
+                self.items.remove(i);
             }
         }
     }
 
-    /// Finish the outline being drawn, if it has enough points.
-    fn close(&mut self) {
-        if self.tool == Tool::Line && self.draft.len() >= 3 {
-            self.shapes.push(Shape::Polygon(std::mem::take(&mut self.draft)));
-        }
-    }
-
-    fn undo(&mut self) {
-        if self.draft.pop().is_none() {
-            self.shapes.pop();
-        }
-    }
-
-    pub fn ui(&mut self, ui: &mut egui::Ui, selected_part: Option<&str>) -> Option<SketchAction> {
+    pub fn ui(&mut self, ui: &mut egui::Ui, can_attach: bool) -> Option<SketchAction> {
         let mut action = None;
         ui.horizontal_wrapped(|ui| {
             for (tool, name, hint) in [
-                (Tool::Line, "Line", "Click points. Click the first point again, or press Enter, to close the outline."),
-                (Tool::Rectangle, "Rectangle", "Click two opposite corners."),
-                (Tool::Circle, "Circle", "Click the centre, then a point on the circle."),
-                (Tool::Erase, "Erase", "Click inside a shape to remove it."),
+                (Tool::Pen, "Pen", "Drag to draw freehand"),
+                (Tool::Line, "Line", "Drag from one end to the other"),
+                (Tool::Arrow, "Arrow", "Drag from the tail to the thing it points at"),
+                (Tool::Rectangle, "Rectangle", "Drag from corner to corner"),
+                (Tool::Circle, "Circle", "Drag from the centre outwards"),
+                (Tool::Label, "Label", "Click where the text should go, then type"),
+                (Tool::Dimension, "Dimension", "Drag between two points, then type the size you want (or leave it as drawn)"),
+                (Tool::Erase, "Erase", "Click something to remove it"),
             ] {
                 if ui.selectable_label(self.tool == tool, name).on_hover_text(hint).clicked() {
+                    self.finish_editing();
                     self.tool = tool;
-                    self.draft.clear();
                 }
             }
             ui.separator();
-            ui.label("Grid");
-            for step in [0.5, 1.0, 5.0] {
-                if ui.selectable_label(self.snap == step, format!("{} mm", mm(step))).clicked() {
-                    self.snap = step;
+            for (i, (name, colour)) in COLOURS.iter().enumerate() {
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                ui.painter().rect_filled(rect.shrink(2.0), 3.0, *colour);
+                if self.colour == i {
+                    ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(2.0, ui.visuals().strong_text_color()), egui::StrokeKind::Inside);
                 }
-            }
-            ui.separator();
-            let anything = !self.shapes.is_empty() || !self.draft.is_empty();
-            if ui.add_enabled(anything, egui::Button::new("Undo")).on_hover_text("Remove the last point or shape (Backspace)").clicked() {
-                self.undo();
-            }
-            if ui.add_enabled(anything, egui::Button::new("Clear")).clicked() {
-                self.shapes.clear();
-                self.draft.clear();
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{name} pen")));
+                if response.on_hover_text(*name).clicked() {
+                    self.colour = i;
+                }
             }
         });
         ui.horizontal_wrapped(|ui| {
-            let ready = !self.shapes.is_empty();
-            ui.label("Height");
-            ui.add(egui::DragValue::new(&mut self.height).speed(0.1).range(0.1..=10_000.0).suffix(" mm"));
-            let mut extrude = |ui: &mut egui::Ui, enabled: bool, text: String, hint: &str, mode: Mode| {
-                if ui.add_enabled(enabled, egui::Button::new(text)).on_hover_text(hint).clicked() {
-                    action = feature(&self.shapes, mode, self.height).map(SketchAction::Feature);
-                }
+            ui.checkbox(&mut self.snap, "Snap to 1 mm").on_hover_text("Shapes, labels and dimensions land on the grid. The pen never snaps.");
+            ui.separator();
+            ui.label("Draw over");
+            let current = self.backdrop.as_ref().map_or("nothing", |b| b.view.as_str()).to_owned();
+            egui::ComboBox::from_id_salt("sketch backdrop")
+                .selected_text(current.as_str())
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(self.backdrop.is_none(), "nothing").clicked() {
+                        action = Some(SketchAction::Backdrop(None));
+                    }
+                    for view in ["top", "front", "right", "back", "left", "bottom"] {
+                        if ui.selectable_label(current == view, view).clicked() {
+                            action = Some(SketchAction::Backdrop(Some(view.to_owned())));
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Put a flat view of the model behind the sketch, at true scale, to draw on one of its faces");
+            if self.backdrop.is_some() && ui.button("Refresh").on_hover_text("Take the picture again after the model changed").clicked() {
+                action = Some(SketchAction::Backdrop(Some(current)));
+            }
+            ui.separator();
+            let anything = !self.items.is_empty();
+            if ui.add_enabled(anything, egui::Button::new("Undo")).clicked() {
+                self.editing = None;
+                self.items.pop();
+            }
+            if ui.add_enabled(anything, egui::Button::new("Clear")).clicked() {
+                self.editing = None;
+                self.items.clear();
+            }
+            let hint = if can_attach {
+                "Attach the sketch to your next chat message, as a picture with a written summary"
+            } else {
+                "Wait for the current reply to finish"
             };
-            extrude(ui, ready, "New part".to_owned(), "Extrude the sketch as a new part", Mode::NewPart);
-            let name = selected_part.unwrap_or("part");
-            let has_part = ready && selected_part.is_some();
-            extrude(ui, has_part, format!("Add to {name}"), "Extrude the sketch and join it to the selected part", Mode::Add);
-            extrude(ui, has_part, format!("Cut from {name}"), "Extrude the sketch and cut it out of the selected part", Mode::Cut);
-            if ui.add_enabled(ready, egui::Button::new("Send to chat")).on_hover_text("Put the sketch's exact coordinates in the chat box").clicked() {
-                action = Some(SketchAction::ToChat(describe(&self.shapes)));
+            if ui.add_enabled(anything && can_attach, egui::Button::new("Attach to chat")).on_hover_text(hint).clicked() {
+                self.finish_editing();
+                self.capture = Capture::Requested;
             }
         });
+        self.colour_key_ui(ui);
 
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::CLICK | egui::Sense::DRAG);
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Sketch canvas"));
         if rect.width() < 20.0 || rect.height() < 20.0 {
             return action;
+        }
+        let clean = self.capture != Capture::Idle;
+        if self.capture == Capture::Requested {
+            // This frame is drawn without the cursor and then photographed.
+            self.capture = Capture::Waiting(rect);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
 
         if response.dragged_by(egui::PointerButton::Secondary) || response.dragged_by(egui::PointerButton::Middle) {
@@ -381,240 +423,363 @@ impl Sketch {
                 self.pan = pos - rect.center() - before * self.zoom;
             }
         }
-        let cursor = hover.map(|pos| self.to_sketch(rect, pos));
-        let over_first = hover.zip(self.draft.first()).is_some_and(|(pos, first)| {
-            self.tool == Tool::Line && self.draft.len() >= 3 && self.to_screen(rect, *first).distance(pos) < CLOSE_RADIUS
-        });
-        if response.double_clicked() {
-            self.close();
-        } else if response.clicked() {
-            if let Some(p) = response.interact_pointer_pos().map(|pos| self.to_sketch(rect, pos)) {
-                self.click(p, over_first);
+
+        let snap = self.snap && self.tool != Tool::Pen;
+        let pointer = response.interact_pointer_pos().or(hover);
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            self.finish_editing();
+            // The press position, not where the pointer has got to since.
+            let origin = ui.input(|i| i.pointer.press_origin()).or(pointer);
+            self.drag_start = origin.map(|pos| self.to_sketch(rect, pos, snap));
+            self.pen.clear();
+            if let (Tool::Pen, Some(pos)) = (self.tool, origin) {
+                self.pen.push(self.to_sketch(rect, pos, false));
             }
         }
-        if response.hovered() && !ui.ctx().egui_wants_keyboard_input() {
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.close();
+        if response.dragged_by(egui::PointerButton::Primary) && self.tool == Tool::Pen {
+            if let Some(pos) = pointer {
+                let p = self.to_sketch(rect, pos, false);
+                // Skip points that barely moved, so a stroke stays light.
+                let moved = self.pen.last().is_none_or(|last| distance(*last, p) * f64::from(self.zoom) > 2.0);
+                if moved {
+                    self.pen.push(p);
+                }
             }
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.draft.clear();
+        }
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
+            if let (Some(a), Some(pos)) = (self.drag_start.take(), pointer) {
+                let b = self.to_sketch(rect, pos, snap);
+                self.finish_drag(a, b);
             }
-            if ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
-                self.undo();
+        } else if response.clicked() {
+            let was_editing = self.editing.is_some();
+            self.finish_editing();
+            // A click that only ends typing doesn't also start a new label.
+            if let (Some(pos), false) = (pointer, was_editing && self.tool == Tool::Label) {
+                let p = self.to_sketch(rect, pos, snap);
+                self.click(p);
             }
+        }
+        if response.hovered() && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
+            self.items.pop();
         }
 
-        self.paint(ui, rect, cursor, over_first);
+        let cursor = hover.filter(|_| !clean).map(|pos| self.to_sketch(rect, pos, snap));
+        let preview = self.drag_start.zip(pointer.map(|pos| self.to_sketch(rect, pos, snap)));
+        self.paint(ui, rect, cursor, preview);
+        self.text_box(ui, rect);
         action
     }
 
-    fn paint(&self, ui: &egui::Ui, rect: egui::Rect, cursor: Option<Point>, over_first: bool) {
-        let painter = ui.painter_at(rect);
-        let visuals = ui.visuals();
-        painter.rect_filled(rect, 0.0, visuals.extreme_bg_color);
+    /// One box per colour in use, for saying what it stands for.
+    fn colour_key_ui(&mut self, ui: &mut egui::Ui) {
+        let used: Vec<usize> = (0..COLOURS.len()).filter(|c| self.items.iter().any(|i| i.colour() == *c)).collect();
+        // Always there, so the canvas doesn't jump when the first line is drawn.
+        ui.horizontal_wrapped(|ui| {
+            // The same height with or without text boxes in it.
+            ui.set_min_height(24.0);
+            ui.label("Colour key").on_hover_text("Say what each colour means, for example \"cut away\" or \"keep clear\"");
+            if used.is_empty() {
+                ui.weak("Each colour you draw with can be given a meaning here.");
+            }
+            for c in used {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 2.0, COLOURS[c].1);
+                let field = egui::TextEdit::singleline(&mut self.meanings[c]).hint_text(format!("what {} means", COLOURS[c].0)).desired_width(130.0);
+                let response = ui.add(field);
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, format!("{} meaning", COLOURS[c].0)));
+            }
+        });
+    }
 
-        // Grid: fine lines when they are far enough apart to read, bold every 10 mm.
-        let faint = visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.45);
-        for (step, color) in [(1.0_f32, faint), (10.0, visuals.widgets.noninteractive.bg_stroke.color)] {
+    /// The text box for the label or dimension being typed, placed on the canvas.
+    fn text_box(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let Some(i) = self.editing else { return };
+        let (at, drawn) = match self.items.get(i) {
+            Some(Item::Label { at, .. }) => (*at, None),
+            Some(Item::Dimension { a, b, .. }) => ([(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0], Some(distance(*a, *b))),
+            _ => {
+                self.editing = None;
+                return;
+            }
+        };
+        let pos = self.to_screen(rect, at);
+        let Some(Item::Label { text, .. } | Item::Dimension { text, .. }) = self.items.get_mut(i) else { return };
+        let hint = match drawn {
+            Some(length) => format!("{} (as drawn)", mm(round1(length))),
+            None => "label".to_owned(),
+        };
+        let area = egui::Rect::from_min_size(pos + egui::vec2(-4.0, -12.0), egui::vec2(150.0, 22.0));
+        let response = ui.put(area, egui::TextEdit::singleline(text).hint_text(hint).char_limit(80));
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Sketch text"));
+        if response.lost_focus() {
+            self.finish_editing();
+        } else if !response.has_focus() {
+            response.request_focus();
+        }
+    }
+
+    fn paint(&self, ui: &egui::Ui, rect: egui::Rect, cursor: Option<Point>, preview: Option<(Point, Point)>) {
+        let painter = ui.painter_at(rect);
+        // Always dark, like the model pictures, so the pen colours read the same in both themes.
+        let background = egui::Color32::from_gray(28);
+        let ink = egui::Color32::from_gray(225);
+        painter.rect_filled(rect, 0.0, background);
+
+        // Grid: fine lines when they are far enough apart to read, bolder every 10 mm.
+        for (step, shade) in [(1.0_f32, 38), (10.0, 58)] {
             let gap = step * self.zoom;
             if gap < 7.0 {
                 continue;
             }
+            let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(shade));
             let origin = rect.center() + self.pan;
             let mut x = origin.x + ((rect.left() - origin.x) / gap).ceil() * gap;
             while x < rect.right() {
-                painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(1.0, color));
+                painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
                 x += gap;
             }
             let mut y = origin.y + ((rect.top() - origin.y) / gap).ceil() * gap;
             while y < rect.bottom() {
-                painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(1.0, color));
+                painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
                 y += gap;
             }
         }
-        let origin = self.to_screen(rect, [0.0, 0.0]);
-        let (red, green) = (egui::Color32::from_rgb(220, 70, 70), egui::Color32::from_rgb(70, 180, 80));
-        painter.line_segment([egui::pos2(rect.left(), origin.y), egui::pos2(rect.right(), origin.y)], egui::Stroke::new(1.0, red.gamma_multiply(0.6)));
-        painter.line_segment([egui::pos2(origin.x, rect.top()), egui::pos2(origin.x, rect.bottom())], egui::Stroke::new(1.0, green.gamma_multiply(0.6)));
-
-        let solid = egui::Color32::from_rgb(70, 130, 215);
-        let hole = egui::Color32::from_rgb(235, 150, 50);
-        let text = egui::FontId::proportional(12.0);
-        // Outlines first, so a hole's blank fill always ends up on top of its outline.
-        let mut order: Vec<(&Shape, bool)> = self.shapes.iter().zip(holes(&self.shapes)).collect();
-        order.sort_by_key(|(_, is_hole)| *is_hole);
-        for (shape, is_hole) in order {
-            let color = if is_hole { hole } else { solid };
-            let points: Vec<egui::Pos2> = shape.outline().into_iter().map(|p| self.to_screen(rect, p)).collect();
-            // Only rectangles and circles are filled: the fill assumes a convex shape.
-            if !matches!(shape, Shape::Polygon(_)) {
-                let fill = if is_hole { visuals.extreme_bg_color } else { solid.gamma_multiply(0.22) };
-                painter.add(egui::Shape::convex_polygon(points.clone(), fill, egui::Stroke::NONE));
-            }
-            painter.add(egui::Shape::closed_line(points, egui::Stroke::new(2.0, color)));
-            let (label, at) = match shape {
-                Shape::Circle { centre, radius } => (format!("Ø {}", mm(radius * 2.0)), *centre),
-                Shape::Rect(a, b) => (
-                    format!("{} x {}", mm((b[0] - a[0]).abs()), mm((b[1] - a[1]).abs())),
-                    [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0],
-                ),
-                Shape::Polygon(points) => {
-                    let n = points.len() as f64;
-                    (format!("{} mm²", mm(shape.area())), [points.iter().map(|p| p[0]).sum::<f64>() / n, points.iter().map(|p| p[1]).sum::<f64>() / n])
-                }
-            };
-            // A rectangle's size sits in its top left corner, clear of anything drawn inside it.
-            let (pos, align) = match shape {
-                Shape::Rect(a, b) => {
-                    let corner = self.to_screen(rect, [a[0].min(b[0]), a[1].max(b[1])]);
-                    (corner + egui::vec2(5.0, 4.0), egui::Align2::LEFT_TOP)
-                }
-                _ => (self.to_screen(rect, at), egui::Align2::CENTER_CENTER),
-            };
-            painter.text(pos, align, label, text.clone(), color);
+        if let Some(backdrop) = &self.backdrop {
+            let (c, h) = (backdrop.centre, backdrop.half);
+            let area = egui::Rect::from_two_pos(self.to_screen(rect, [c[0] - h, c[1] + h]), self.to_screen(rect, [c[0] + h, c[1] - h]));
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(backdrop.texture.id(), area, uv, egui::Color32::WHITE);
         }
 
-        // The shape being drawn, following the cursor.
-        let draft_stroke = egui::Stroke::new(1.5, visuals.strong_text_color());
-        match (self.tool, self.draft.as_slice(), cursor) {
-            (Tool::Line, points, _) if !points.is_empty() => {
-                let mut line: Vec<egui::Pos2> = points.iter().map(|p| self.to_screen(rect, *p)).collect();
-                if let Some(c) = cursor {
-                    line.push(self.to_screen(rect, c));
-                    let last = points[points.len() - 1];
-                    let mid = self.to_screen(rect, [(last[0] + c[0]) / 2.0, (last[1] + c[1]) / 2.0]);
-                    painter.text(mid + egui::vec2(0.0, -10.0), egui::Align2::CENTER_CENTER, mm(distance(last, c)), text.clone(), visuals.strong_text_color());
-                }
-                painter.add(egui::Shape::line(line, draft_stroke));
-                for p in points {
-                    painter.circle_filled(self.to_screen(rect, *p), 3.0, visuals.strong_text_color());
-                }
-                if over_first {
-                    painter.circle_stroke(self.to_screen(rect, points[0]), CLOSE_RADIUS, egui::Stroke::new(2.0, green));
-                }
-            }
-            (Tool::Rectangle, [first], Some(c)) => {
-                let corners = egui::Rect::from_two_pos(self.to_screen(rect, *first), self.to_screen(rect, c));
-                painter.rect_stroke(corners, 0.0, draft_stroke, egui::StrokeKind::Middle);
-                let size = format!("{} x {}", mm((c[0] - first[0]).abs()), mm((c[1] - first[1]).abs()));
-                painter.text(corners.center(), egui::Align2::CENTER_CENTER, size, text.clone(), visuals.strong_text_color());
-            }
-            (Tool::Circle, [centre], Some(c)) => {
-                let radius = distance(*centre, c);
-                painter.circle_stroke(self.to_screen(rect, *centre), radius as f32 * self.zoom, draft_stroke);
-                painter.text(self.to_screen(rect, *centre), egui::Align2::CENTER_CENTER, format!("Ø {}", mm(radius * 2.0)), text.clone(), visuals.strong_text_color());
-            }
-            _ => {}
+        let font = egui::FontId::proportional(13.0);
+        for item in &self.items {
+            self.paint_item(&painter, rect, item, &font);
         }
+        // What the current drag would make.
+        if let Some((a, b)) = preview {
+            let colour = self.colour;
+            let ghost = match self.tool {
+                Tool::Pen => Some(Item::Stroke { points: self.pen.clone(), colour }),
+                Tool::Line => Some(Item::Line { a, b, arrow: false, colour }),
+                Tool::Arrow => Some(Item::Line { a, b, arrow: true, colour }),
+                Tool::Rectangle => Some(Item::Rect { a, b, colour }),
+                Tool::Circle => Some(Item::Circle { centre: a, radius: distance(a, b), colour }),
+                Tool::Dimension => Some(Item::Dimension { a, b, text: String::new(), colour }),
+                Tool::Label | Tool::Erase => None,
+            };
+            if let Some(ghost) = ghost.filter(|g| !matches!(g, Item::Stroke { points, .. } if points.len() < 2)) {
+                self.paint_item(&painter, rect, &ghost, &font);
+            }
+        }
+
+        // Legend, scale and axes are part of the picture the model gets.
+        let mut line = rect.left_top() + egui::vec2(8.0, 6.0);
+        for (c, (name, colour)) in COLOURS.iter().enumerate() {
+            let meaning = self.meanings[c].trim();
+            if meaning.is_empty() || !self.items.iter().any(|i| i.colour() == c) {
+                continue;
+            }
+            painter.rect_filled(egui::Rect::from_min_size(line + egui::vec2(0.0, 3.0), egui::vec2(10.0, 10.0)), 2.0, *colour);
+            painter.text(line + egui::vec2(16.0, 0.0), egui::Align2::LEFT_TOP, format!("{name}: {meaning}"), font.clone(), ink);
+            line.y += 17.0;
+        }
+        let bar_mm = [1.0_f32, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0].into_iter().find(|m| m * self.zoom >= 50.0).unwrap_or(1000.0);
+        let start = rect.left_bottom() + egui::vec2(10.0, -12.0);
+        let end = start + egui::vec2(bar_mm * self.zoom, 0.0);
+        painter.line_segment([start, end], egui::Stroke::new(2.0, ink));
+        for tick in [start, end] {
+            painter.line_segment([tick + egui::vec2(0.0, -4.0), tick + egui::vec2(0.0, 4.0)], egui::Stroke::new(2.0, ink));
+        }
+        painter.text(end + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER, format!("{bar_mm} mm"), font.clone(), ink);
+        let axes = self.backdrop.as_ref().and_then(|b| view_axes(&b.view)).map_or(["X".to_owned(), "Y".to_owned()], |a| a.map(axis_name));
+        let view = self.backdrop.as_ref().map_or(String::new(), |b| format!("{} view   ", b.view));
+        let caption = format!("{view}right: {}   up: {}", axes[0], axes[1]);
+        painter.text(rect.right_bottom() + egui::vec2(-8.0, -6.0), egui::Align2::RIGHT_BOTTOM, caption, font.clone(), ink);
 
         if let Some(c) = cursor {
-            painter.circle_filled(self.to_screen(rect, c), 2.5, visuals.strong_text_color());
-            let readout = format!("X {}  Y {} mm", mm(c[0]), mm(c[1]));
-            painter.text(rect.left_bottom() + egui::vec2(8.0, -6.0), egui::Align2::LEFT_BOTTOM, readout, text.clone(), visuals.text_color());
+            painter.circle_filled(self.to_screen(rect, c), 2.5, ink);
+            let readout = format!("{}, {}", mm(c[0]), mm(c[1]));
+            painter.text(rect.right_top() + egui::vec2(-8.0, 6.0), egui::Align2::RIGHT_TOP, readout, font.clone(), egui::Color32::from_gray(150));
         }
-        if self.shapes.is_empty() && self.draft.is_empty() {
-            let hint = "Draw an outline on the grid. A shape drawn inside another becomes a hole.\nRight drag pans, scroll zooms.";
-            painter.text(rect.center_top() + egui::vec2(0.0, 14.0), egui::Align2::CENTER_TOP, hint, text, visuals.weak_text_color());
-        } else {
-            let summary = format!("{} mm² of material", mm(area(&self.shapes)));
-            painter.text(rect.right_bottom() + egui::vec2(-8.0, -6.0), egui::Align2::RIGHT_BOTTOM, summary, text, visuals.text_color());
+        if self.items.is_empty() && self.drag_start.is_none() {
+            let hint = "Draw what you mean, roughly. Add labels and dimensions, give colours a meaning,\nthen attach it to a chat message. Right drag pans, scroll zooms.";
+            painter.text(rect.center_top() + egui::vec2(0.0, 30.0), egui::Align2::CENTER_TOP, hint, font, egui::Color32::from_gray(150));
         }
     }
+
+    fn paint_item(&self, painter: &egui::Painter, rect: egui::Rect, item: &Item, font: &egui::FontId) {
+        let colour = COLOURS[item.colour()].1;
+        let stroke = egui::Stroke::new(2.5, colour);
+        let at = |p: &Point| self.to_screen(rect, *p);
+        match item {
+            Item::Stroke { points, .. } => {
+                painter.add(egui::Shape::line(points.iter().map(at).collect(), stroke));
+            }
+            Item::Line { a, b, arrow, .. } => {
+                painter.line_segment([at(a), at(b)], stroke);
+                if *arrow {
+                    arrow_head(painter, at(a), at(b), stroke);
+                }
+            }
+            Item::Rect { a, b, .. } => {
+                painter.rect_stroke(egui::Rect::from_two_pos(at(a), at(b)), 0.0, stroke, egui::StrokeKind::Middle);
+            }
+            Item::Circle { centre, radius, .. } => {
+                painter.circle_stroke(at(centre), *radius as f32 * self.zoom, stroke);
+            }
+            Item::Label { at: p, text, .. } => {
+                let shown = if text.is_empty() { " " } else { text.as_str() };
+                let galley = painter.layout_no_wrap(shown.to_owned(), font.clone(), colour);
+                let pos = at(p) + egui::vec2(0.0, -galley.size().y / 2.0);
+                // A dark plate keeps the words readable over the model picture.
+                let plate = egui::Rect::from_min_size(pos, galley.size()).expand2(egui::vec2(4.0, 2.0));
+                painter.rect_filled(plate, 3.0, egui::Color32::from_black_alpha(190));
+                painter.galley(pos, galley, colour);
+            }
+            Item::Dimension { a, b, text, .. } => {
+                let (sa, sb) = (at(a), at(b));
+                let thin = egui::Stroke::new(1.5, colour);
+                painter.line_segment([sa, sb], thin);
+                arrow_head(painter, sa, sb, thin);
+                arrow_head(painter, sb, sa, thin);
+                let shown = if text.trim().is_empty() { format!("{} mm", mm(round1(distance(*a, *b)))) } else { text.trim().to_owned() };
+                let galley = painter.layout_no_wrap(shown, font.clone(), colour);
+                let pos = sa + (sb - sa) * 0.5 - galley.size() / 2.0;
+                let plate = egui::Rect::from_min_size(pos, galley.size()).expand2(egui::vec2(4.0, 2.0));
+                painter.rect_filled(plate, 3.0, egui::Color32::from_black_alpha(210));
+                painter.galley(pos, galley, colour);
+            }
+        }
+    }
+}
+
+fn arrow_head(painter: &egui::Painter, from: egui::Pos2, tip: egui::Pos2, stroke: egui::Stroke) {
+    let back = (from - tip).normalized();
+    if !back.is_finite() {
+        return;
+    }
+    for turn in [0.45_f32, -0.45] {
+        let (sin, cos) = turn.sin_cos();
+        let wing = egui::vec2(back.x * cos - back.y * sin, back.x * sin + back.y * cos) * 10.0;
+        painter.line_segment([tip, tip + wing], stroke);
+    }
+}
+
+/// Cut the sketch out of a screenshot of the whole window. Returns RGBA pixels with
+/// their width and height, halved if large so the picture stays a sensible size.
+pub fn crop(image: &egui::ColorImage, area: egui::Rect, pixels_per_point: f32) -> Option<(Vec<u8>, u32, u32)> {
+    let [width, height] = image.size;
+    let clamp = |v: f32, max: usize| (v * pixels_per_point).round().clamp(0.0, max as f32) as usize;
+    let (x0, x1) = (clamp(area.left(), width), clamp(area.right(), width));
+    let (y0, y1) = (clamp(area.top(), height), clamp(area.bottom(), height));
+    if x1 <= x0 + 8 || y1 <= y0 + 8 {
+        return None;
+    }
+    let step = if x1 - x0 > 1600 || y1 - y0 > 1600 { 2 } else { 1 };
+    let mut pixels = Vec::new();
+    for y in (y0..y1).step_by(step) {
+        for x in (x0..x1).step_by(step) {
+            let [r, g, b, _] = image.pixels[y * width + x].to_array();
+            pixels.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    Some((pixels, (x1 - x0).div_ceil(step) as u32, (y1 - y0).div_ceil(step) as u32))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn plate_with_holes() -> Vec<Shape> {
-        vec![
-            Shape::Rect([0.0, 0.0], [40.0, 20.0]),
-            Shape::Circle { centre: [10.0, 10.0], radius: 4.0 },
-            Shape::Polygon(vec![[26.0, 6.0], [34.0, 6.0], [30.0, 14.0]]),
-            // Not inside anything: a second outline.
-            Shape::Circle { centre: [60.0, 10.0], radius: 5.0 },
-        ]
+    fn annotated() -> Sketch {
+        let items = vec![
+            Item::Rect { a: [0.0, 0.0], b: [40.0, 20.0], colour: 3 },
+            Item::Circle { centre: [10.0, 10.0], radius: 4.0, colour: 0 },
+            Item::Line { a: [30.0, 30.0], b: [10.0, 14.0], arrow: true, colour: 0 },
+            Item::Label { at: [31.0, 31.0], text: "M4 hole here".into(), colour: 0 },
+            Item::Dimension { a: [0.0, -5.0], b: [40.0, -5.0], text: "60".into(), colour: 5 },
+            Item::Dimension { a: [45.0, 0.0], b: [45.0, 20.0], text: String::new(), colour: 5 },
+            Item::Stroke { points: vec![[1.04, 2.0], [3.0, 5.0], [8.0, 4.0]], colour: 2 },
+        ];
+        let mut sketch = Sketch { items, ..Default::default() };
+        sketch.meanings[0] = "cut away".into();
+        sketch.meanings[3] = " the existing plate ".into();
+        // A meaning for a colour that isn't used is left out.
+        sketch.meanings[4] = "unused".into();
+        sketch
     }
 
     #[test]
-    fn shapes_inside_another_are_holes() {
-        let shapes = plate_with_holes();
-        assert_eq!(holes(&shapes), [false, true, true, false]);
-        let expected = 800.0 - std::f64::consts::PI * 16.0 - 32.0 + std::f64::consts::PI * 25.0;
-        assert!((area(&shapes) - expected).abs() < 1e-9);
-        // An island inside a hole is material again.
-        let mut nested = shapes.clone();
-        nested.push(Shape::Circle { centre: [10.0, 10.0], radius: 1.0 });
-        assert!(!holes(&nested)[4]);
-        // Shapes that only touch are not nested.
-        let touching = [Shape::Rect([0.0, 0.0], [10.0, 10.0]), Shape::Rect([10.0, 0.0], [20.0, 10.0])];
-        assert_eq!(holes(&touching), [false, false]);
+    fn the_summary_carries_the_key_labels_and_dimensions() {
+        let text = annotated().describe();
+        assert!(text.contains("drawn on a blank grid"));
+        assert!(text.contains("Colour key: red = cut away; blue = the existing plate.\n"), "{text}");
+        assert!(!text.contains("unused"));
+        assert!(text.contains("Labels:\n- red label \"M4 hole here\" at (31, 31)\n"));
+        assert!(text.contains("- white dimension marked \"60\" between (0, -5) and (40, -5) (drawn 40 mm long)\n"));
+        assert!(text.contains("- white dimension of 20 mm between (45, 0) and (45, 20)\n"));
+        assert!(text.contains("- blue rectangle 40 x 20 mm, corners (0, 0) and (40, 20)\n"));
+        assert!(text.contains("- red circle, diameter 8 mm, centre (10, 10)\n"));
+        assert!(text.contains("- red arrow from (30, 30) pointing to (10, 14)\n"));
+        assert!(text.contains("- green freehand line from (1, 2) to (8, 4), within (1, 2) to (8, 5)\n"));
+        assert!(text.contains("approximate unless a dimension or label says otherwise"));
     }
 
     #[test]
-    fn the_snippet_extrudes_outlines_and_cuts_holes() {
-        let made = feature(&plate_with_holes(), Mode::NewPart, 5.0).unwrap();
-        assert_eq!(made.label, "Sketched extrude");
-        assert_eq!(made.params["height"], 5.0);
-        let lines: Vec<&str> = made.code.lines().collect();
-        assert_eq!(lines[1], "profile = Pos(20, 10) * Rectangle(40, 20)");
-        assert_eq!(lines[2], "profile += Pos(60, 10) * Circle(5)");
-        assert_eq!(lines[3], "profile -= Pos(10, 10) * Circle(4)");
-        assert_eq!(lines[4], "profile -= Polygon((26, 6), (34, 6), (30, 14), align=None)");
-        assert_eq!(lines[6], "part = body");
-        assert!(feature(&plate_with_holes(), Mode::Cut, 2.0).unwrap().code.ends_with("part = part - body\n"));
-        assert!(feature(&[], Mode::NewPart, 5.0).is_none());
-    }
+    fn drags_and_clicks_make_items() {
+        let mut sketch = Sketch { tool: Tool::Rectangle, ..Default::default() };
+        sketch.finish_drag([0.0, 0.0], [0.0, 0.0]);
+        assert!(sketch.items.is_empty(), "a click with a shape tool draws nothing");
+        sketch.finish_drag([0.0, 0.0], [30.0, 20.0]);
+        sketch.tool = Tool::Arrow;
+        sketch.colour = 1;
+        sketch.finish_drag([5.0, 5.0], [9.0, 9.0]);
+        assert_eq!(sketch.items[1], Item::Line { a: [5.0, 5.0], b: [9.0, 9.0], arrow: true, colour: 1 });
 
-    #[test]
-    fn the_description_gives_exact_numbers() {
-        let text = describe(&plate_with_holes());
-        assert!(text.contains("- outline: rectangle 40 x 20 mm, corners (0, 0) and (40, 20)"));
-        assert!(text.contains("- hole: circle of diameter 8 mm, centre (10, 10)"));
-        assert!(text.contains("- hole: closed polygon through (26, 6), (34, 6), (30, 14)"));
-    }
+        // A dimension opens its text box, and an empty label is dropped.
+        sketch.tool = Tool::Dimension;
+        sketch.finish_drag([0.0, 0.0], [30.0, 0.0]);
+        assert_eq!(sketch.editing, Some(2));
+        sketch.finish_editing();
+        assert_eq!(sketch.items.len(), 3, "an untyped dimension stays, showing its drawn length");
+        sketch.tool = Tool::Label;
+        sketch.click([4.0, 4.0]);
+        sketch.finish_editing();
+        assert_eq!(sketch.items.len(), 3);
 
-    #[test]
-    fn clicks_build_shapes() {
-        let mut sketch = Sketch::default();
-        for p in [[0.0, 0.0], [30.0, 0.0], [30.0, 0.0], [30.0, 20.0]] {
-            sketch.click(p, false);
-        }
-        assert_eq!(sketch.draft.len(), 3, "a repeated click adds no point");
-        sketch.click([0.0, 0.0], true);
-        assert_eq!(sketch.shapes, [Shape::Polygon(vec![[0.0, 0.0], [30.0, 0.0], [30.0, 20.0]])]);
-
-        sketch.tool = Tool::Rectangle;
-        sketch.click([2.0, 2.0], false);
-        sketch.click([2.0, 9.0], false);
-        assert_eq!(sketch.shapes.len(), 1, "a rectangle with no width isn't made");
-        sketch.click([8.0, 6.0], false);
-        assert_eq!(sketch.shapes[1], Shape::Rect([2.0, 2.0], [8.0, 6.0]));
-
-        sketch.tool = Tool::Circle;
-        sketch.click([20.0, 5.0], false);
-        sketch.click([23.0, 5.0], false);
-        assert_eq!(sketch.shapes[2], Shape::Circle { centre: [20.0, 5.0], radius: 3.0 });
-
-        // Erase picks the smallest shape under the click, then undo removes the last one.
+        // The eraser takes the nearest thing within reach, and nothing when far away.
         sketch.tool = Tool::Erase;
-        sketch.click([5.0, 4.0], false);
-        assert_eq!(sketch.shapes.len(), 2);
-        assert!(matches!(sketch.shapes[1], Shape::Circle { .. }));
-        sketch.undo();
-        assert_eq!(sketch.shapes.len(), 1);
+        sketch.click([100.0, 100.0]);
+        assert_eq!(sketch.items.len(), 3);
+        sketch.click([30.0, 10.0]);
+        assert!(!sketch.items.iter().any(|i| matches!(i, Item::Rect { .. })), "the rectangle's edge was clicked");
     }
 
     #[test]
-    fn the_grid_snaps_both_ways() {
-        let mut sketch = Sketch::default();
+    fn views_map_onto_the_sketch_axes() {
+        assert_eq!(view_axes("front"), Some([(0, 1.0), (2, 1.0)]));
+        assert_eq!(view_axes("left").map(|a| a.map(axis_name)), Some(["-Y".to_owned(), "Z".to_owned()]));
+        assert_eq!(view_axes("iso"), None);
+    }
+
+    #[test]
+    fn the_sketch_is_cut_out_of_the_screenshot() {
+        let mut image = egui::ColorImage::filled([40, 30], egui::Color32::BLACK);
+        image.pixels[12 * 40 + 20] = egui::Color32::from_rgb(9, 8, 7);
+        let area = egui::Rect::from_min_max(egui::pos2(10.0, 5.0), egui::pos2(15.0, 10.0));
+        // At 2 pixels per point the area covers pixels 20..30 by 10..20.
+        let (pixels, width, height) = crop(&image, area, 2.0).unwrap();
+        assert_eq!((width, height), (10, 10));
+        assert_eq!(&pixels[(2 * 10) * 4..(2 * 10) * 4 + 4], &[9, 8, 7, 255]);
+        assert!(crop(&image, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), 2.0).is_none());
+    }
+
+    #[test]
+    fn positions_round_trip_and_snap() {
+        let sketch = Sketch::default();
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(600.0, 400.0));
-        let p = [12.0, -7.0];
-        assert_eq!(sketch.to_sketch(rect, sketch.to_screen(rect, p)), p);
-        // A point between grid lines lands on the nearest one.
         let near = sketch.to_screen(rect, [12.3, -6.8]);
-        assert_eq!(sketch.to_sketch(rect, near), [12.0, -7.0]);
-        sketch.snap = 0.5;
-        assert_eq!(sketch.to_sketch(rect, near), [12.5, -7.0]);
+        assert_eq!(sketch.to_sketch(rect, near, true), [12.0, -7.0]);
+        assert_eq!(sketch.to_sketch(rect, near, false), [12.3, -6.8]);
     }
 }

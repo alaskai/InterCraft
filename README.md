@@ -29,7 +29,8 @@ py -3.11 -m venv "$env:LOCALAPPDATA\InterCraft\venv"
 
 Set `INTERCRAFT_PYTHON` if you want to use a different interpreter.
 
-`workerequirements.lock` lists the exact version of every package in that environment. Install from it instead when you want the same versions CI tests and audits.
+`worker
+equirements.lock` lists the exact version of every package in that environment. Install from it instead when you want the same versions CI tests and audits.
 
 If the repo sits in a synced folder (OneDrive, Dropbox), keep Cargo's build output outside it with a local `.cargo/config.toml` (not tracked by Git):
 
@@ -55,7 +56,7 @@ To see the live update, leave the app open and change a value in `examples/brack
 |---|---|
 | Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it, click the eye to hide or show it, and right-click for Show only this, Show all, Rename, Duplicate, Lock, Unlock and Delete. Delete removes the selected part while the pointer is over the list. |
 | Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. Right-click a step to move it earlier or later, rename it or delete it. |
-| Sketch | A millimetre grid for drawing flat profiles, in a tab beside the 3D view. See Sketching below. |
+| Sketch | A drawing pad for rough, annotated sketches that go to the model with a chat message, in a tab beside the 3D view. See Sketching below. |
 | Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. Placement, at the top, moves and turns the selected part in the assembly the same way. Code shows the step's snippet. Edit it and press Apply (Ctrl+Enter) to save and rebuild, or Revert to drop the edit. |
 
 ### Menus
@@ -90,21 +91,21 @@ Turn on Measure and click a corner, edge or face. Corners and edges snap when th
 
 ### Sketching
 
-The Sketch tab is a 2D canvas on the XY plane. Everything snaps to the grid (0.5, 1 or 5 mm), so what you draw has exact numbers.
+The Sketch tab is a rough drawing pad for showing the model what you mean. It is not a CAD sketcher and nothing drawn on it becomes geometry. The model reads it and builds the part itself.
 
 | Tool | How |
 |---|---|
-| Line | Click points for an outline. Click the first point again, press Enter or double click to close it. |
-| Rectangle | Click two opposite corners. |
-| Circle | Click the centre, then a point on the circle. |
-| Erase | Click inside a shape to remove it. |
+| Pen | Drag to draw freehand. |
+| Line, Arrow, Rectangle, Circle | Drag from one point to the other. |
+| Label | Click where the text should go, then type. |
+| Dimension | Drag between two points, then type the size you want. Leave it empty to show the length as drawn. |
+| Erase | Click something to remove it. |
 
-A shape drawn inside another becomes a hole, shown in orange. Right drag pans, scroll zooms, Backspace removes the last point or shape and Esc cancels the shape being drawn.
+There are six pen colours. Give a colour a meaning in the Colour key row (for example red for "cut away" and blue for "keep clear") and the key appears on the sketch as a legend. Right drag pans, scroll zooms and Backspace removes the last thing drawn.
 
-Then use the sketch one of two ways:
+**Draw over** puts a flat view of the model (top, front, right, back, left or bottom) behind the sketch at true scale, so you can mark up one of its faces. Sketch positions then match the model's own coordinates on that view.
 
-- **Extrude it.** New part makes a part from it, and Add to or Cut from changes the selected part. The step it adds has `height` and `z` parameters, so you can drag both in the Inspector afterwards.
-- **Send to chat.** Puts the exact coordinates in the chat box as text, so you can tell the model what to do with the profile ("revolve this", "use it as the base and add a lip").
+**Attach to chat** adds the sketch to your next message. The model receives a picture of it and a written summary: which view it was drawn over, the colour key, every label and dimension, and the rough position of each shape. The summary means the labels and numbers still get through to a model that can't read images.
 
 ### Section view
 
@@ -275,11 +276,11 @@ Done:
 8. Section view, part placement, rename and duplicate, fit check, and pictures for the model
 9. Reordering, renaming and editing the code of steps, and CI
 10. OpenAI-compatible chat (OpenAI, OpenRouter, Ollama, LM Studio)
-11. Sketch panel: draw a profile, extrude it or send it to the chat
+11. Sketch panel: rough annotated sketches, drawn on a blank grid or over a view of the model, sent to the model with a message
 
 Next:
 
-- Sketching on a face of a part, and arcs and fillets in sketches
+- Sketching over any face picked in the 3D view, not only the six standard views
 - OS-level isolation for the geometry worker
 - Memory cap and stuck-build watchdog on macOS and Linux
 - Before and after overlay

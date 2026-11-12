@@ -659,54 +659,118 @@ fn openai_compatible_server_settings() {
     h.get_by_label_contains("must start with https://");
 }
 
+fn drag(h: &mut Harness<'static, App>, from: egui::Pos2, to: egui::Pos2) {
+    h.hover_at(from);
+    h.step();
+    h.drag_at(from);
+    h.step();
+    // Two moves, so the pen has something between the ends.
+    h.hover_at(from + (to - from) * 0.5);
+    h.step();
+    h.hover_at(to);
+    h.step();
+    h.drop_at(to);
+    h.step();
+    h.step();
+}
+
 #[test]
-fn a_sketch_becomes_a_part_and_a_cut() {
+fn a_sketch_over_the_model_goes_to_the_chat() {
     let _one = one_at_a_time();
     let project = example_project("sketch");
     let mut h = harness(&project);
     wait_until(&mut h, "the first build", built);
 
-    // Draw on the real canvas: a 30 x 20 rectangle with an 8 mm circle inside it.
     let tab = h.state().dock.find_tab(&Tab::Sketch).expect("the sketch tab is in the layout");
     h.state_mut().dock.set_active_tab(tab).expect("the tab can be shown");
     h.step();
     h.step();
-    let canvas = h.get_by_label("Sketch canvas").rect();
-    let at = |h: &Harness<'static, App>, p: [f64; 2]| h.state().state.sketch.to_screen(canvas, p);
-    click(&mut h, "Rectangle");
-    for p in [[0.0, 0.0], [30.0, 20.0]] {
-        let pos = at(&h, p);
-        click_at(&mut h, pos);
-    }
-    click(&mut h, "Circle");
-    for p in [[10.0, 10.0], [14.0, 10.0]] {
-        let pos = at(&h, p);
-        click_at(&mut h, pos);
-    }
-    let shapes = h.state().state.sketch.shapes.clone();
-    assert_eq!(shapes, [sketch::Shape::Rect([0.0, 0.0], [30.0, 20.0]), sketch::Shape::Circle { centre: [10.0, 10.0], radius: 4.0 }]);
-    assert_eq!(sketch::holes(&shapes), [false, true]);
-    shot(&mut h, "sketch_canvas");
 
-    // New part: the volume is the sketch's area times the height.
-    click(&mut h, "New part");
-    wait_until(&mut h, "the sketched part", |app| built(app) && latest_volume(app, "Sketch", "f010").is_some());
-    let expected = (600.0 - std::f64::consts::PI * 16.0) * 5.0;
-    let volume = latest_volume(h.state(), "Sketch", "f010").unwrap();
-    assert!((volume - expected).abs() < 0.01, "{volume} vs {expected}");
-    assert_eq!(h.state().state.selected_part.as_deref(), Some("Sketch"));
-    assert_eq!(h.state().state.history.undo_label(), Some("Add part 'Sketch'"), "one undo step");
-
-    // Cut the same sketch 2 mm deep out of that part: the plate loses a 2 mm layer.
-    h.state_mut().state.sketch.height = 2.0;
+    // Draw over the top view. The bracket is 40 x 30, centred on the origin.
+    let ctx = h.ctx.clone();
+    h.state_mut().state.set_sketch_backdrop(&ctx, Some("top".into()));
     h.step();
-    click(&mut h, "Cut from Sketch");
-    wait_until(&mut h, "the cut", |app| built(app) && latest_volume(app, "Sketch", "f020").is_some());
-    let after = latest_volume(h.state(), "Sketch", "f020").unwrap();
-    assert!((after - expected * 3.0 / 5.0).abs() < 0.01, "{after}");
+    h.step();
+    let canvas = h.get_by_label("Sketch canvas").rect();
+    let at = |h: &Harness<'static, App>, p: [f64; 2]| {
+        // Drawing must not move the canvas, or the sketch would jump under the pen.
+        assert_eq!(h.get_by_label("Sketch canvas").rect(), canvas, "the canvas moved");
+        h.state().state.sketch.to_screen(canvas, p)
+    };
 
-    // Send to chat puts the exact numbers in the message box.
-    click(&mut h, "Send to chat");
-    let message = h.state().state.chat.input().to_owned();
-    assert!(message.contains("rectangle 30 x 20 mm") && message.contains("hole: circle of diameter 8 mm"), "{message}");
+    // A red circle where a hole should go, a blue freehand line, and an arrow.
+    click(&mut h, "Circle");
+    let (a, b) = (at(&h, [-10.0, 5.0]), at(&h, [-7.0, 5.0]));
+    drag(&mut h, a, b);
+    click(&mut h, "blue pen");
+    click(&mut h, "Pen");
+    let (a, b) = (at(&h, [5.0, -10.0]), at(&h, [15.0, -4.0]));
+    drag(&mut h, a, b);
+    click(&mut h, "red pen");
+    click(&mut h, "Arrow");
+    let (a, b) = (at(&h, [-25.0, 22.0]), at(&h, [-11.0, 7.0]));
+    drag(&mut h, a, b);
+    // A dimension across the part: drawn 40 long, marked as the 50 the user wants.
+    click(&mut h, "Dimension");
+    let (a, b) = (at(&h, [-20.0, -18.0]), at(&h, [20.0, -18.0]));
+    drag(&mut h, a, b);
+    h.get_by_label("Sketch text").type_text("50");
+    h.step();
+    h.key_press(egui::Key::Enter);
+    h.step();
+    h.step();
+
+    let items = h.state().state.sketch.items.clone();
+    assert_eq!(items.len(), 4, "{items:?}");
+    assert_eq!(items[0], sketch::Item::Circle { centre: [-10.0, 5.0], radius: 3.0, colour: 0 });
+    assert!(matches!(&items[1], sketch::Item::Stroke { points, colour: 3 } if points.len() >= 3));
+    assert!(matches!(&items[2], sketch::Item::Line { arrow: true, colour: 0, .. }));
+    assert_eq!(items[3], sketch::Item::Dimension { a: [-20.0, -18.0], b: [20.0, -18.0], text: "50".into(), colour: 0 });
+
+    // Colours get a meaning, which also shows as a legend on the picture.
+    h.get_by_label("red meaning").click();
+    h.step();
+    h.get_by_label("red meaning").type_text("new M4 hole");
+    h.step();
+    h.step();
+    h.state_mut().state.sketch.meanings[3] = "keep this area clear".into();
+    h.step();
+    shot(&mut h, "sketch_annotated");
+
+    // Attach: the app asks the window for a screenshot and cuts the canvas out of it.
+    // If this harness doesn't deliver one by itself, hand it over the way a window would.
+    click(&mut h, "Attach to chat");
+    let frame = h.render().expect("render");
+    let size = [frame.width() as usize, frame.height() as usize];
+    if h.state().state.sketch.capture != sketch::Capture::Idle {
+        let image = std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied(size, frame.as_raw()));
+        h.event(egui::Event::Screenshot { viewport_id: egui::ViewportId::ROOT, user_data: Default::default(), image });
+        h.step();
+        h.step();
+    }
+    assert_eq!(h.state().state.sketch.capture, sketch::Capture::Idle);
+    let area = canvas;
+
+    let (png, summary) = h.state().state.chat.attached_sketch().cloned().expect("the sketch is attached");
+    assert!(summary.contains("drawn over the top view of the model at true scale: sketch X is model X, sketch Y is model Y"), "{summary}");
+    assert!(summary.contains("Colour key: red = new M4 hole; blue = keep this area clear."), "{summary}");
+    assert!(summary.contains("red circle, diameter 6 mm, centre (-10, 5)"), "{summary}");
+    assert!(summary.contains("red dimension marked \"50\" between (-20, -18) and (20, -18) (drawn 40 mm long)"), "{summary}");
+    h.get_by_label("Sketch attached");
+
+    // The picture is the canvas, cut out of the window, with the drawing in it.
+    assert!(png.starts_with("iVBORw0KGgo"), "base64 of a PNG header");
+    let (pixels, width, height) = sketch::crop(&egui::ColorImage::from_rgba_unmultiplied(size, frame.as_raw()), area, 1.0).unwrap();
+    assert_eq!((width, height), (area.width().round() as u32, area.height().round() as u32));
+    let red = pixels.as_chunks::<4>().0.iter().filter(|p| p[0] > 200 && p[1] < 110 && p[2] < 110).count();
+    assert!(red > 150, "the red drawing is in the picture ({red} red pixels)");
+    std::fs::write(std::env::temp_dir().join("intercraft-ui").join("sketch_sent.rgba"), &pixels).unwrap();
+
+    // Remove takes it off again.
+    shot(&mut h, "sketch_attached");
+    // The Send button is still on screen with the attachment showing.
+    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 860.0));
+    assert!(window.contains_rect(h.get_by_label("Send").rect()), "Send was pushed out of view");
+    click(&mut h, "Remove");
+    assert!(h.state().state.chat.attached_sketch().is_none());
 }

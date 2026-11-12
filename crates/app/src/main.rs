@@ -8,6 +8,7 @@ mod fit;
 mod glossary;
 mod measure;
 mod menus;
+mod print_panel;
 mod params;
 mod settings;
 mod sketch;
@@ -135,6 +136,8 @@ struct State {
     measure: measure::MeasureTool,
     /// The fit check panel, while it is open.
     fit: Option<fit::FitCheck>,
+    /// The print check panel for the selected part, while it is open.
+    print_check: Option<print_panel::PrintCheck>,
     sketch: sketch::Sketch,
 
     exports_pending: usize,
@@ -189,6 +192,7 @@ impl App {
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
             measure: measure::MeasureTool::default(),
             fit: None,
+            print_check: None,
             sketch: sketch::Sketch::default(),
             exports_pending: 0,
             exported: Vec::new(),
@@ -254,6 +258,7 @@ impl eframe::App for App {
         self.state.sync_meshes();
         // Both of these need the meshes of the latest build, so they come after the sync.
         self.state.run_fit();
+        self.state.run_print_check();
         self.state.serve_views();
         // The project name can also change on disk, so check it after each reload.
         if std::mem::take(&mut self.title_dirty) || self.state.project_renamed() {
@@ -623,7 +628,7 @@ impl State {
             }
         }
 
-        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(620.0, 30.0));
+        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(720.0, 30.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
             egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -635,6 +640,10 @@ impl State {
                     }
                     if ui.selectable_label(self.viewport.show_edges, "Edges").on_hover_text("Show edges (E)").clicked() {
                         self.viewport.show_edges = !self.viewport.show_edges;
+                    }
+                    let printing = self.print_check.is_some();
+                    if ui.selectable_label(printing, "Print check").on_hover_text("Check the selected part for 3D printing").clicked() {
+                        self.toggle_print_check();
                     }
                     if ui.selectable_label(self.fit.is_some(), "Fit check").on_hover_text("Find clashes and gaps between parts").clicked() {
                         self.toggle_fit();
@@ -655,6 +664,7 @@ impl State {
 
         self.section_panel(ui, rect);
         self.fit_panel(ui, rect);
+        self.print_panel(ui, rect);
         self.caption_ui(ui, rect);
 
         if !self.measure.active {
@@ -838,6 +848,66 @@ impl State {
         }
     }
 
+    pub(crate) fn toggle_print_check(&mut self) {
+        self.print_check = match (&self.print_check, &self.selected_part) {
+            (None, Some(part)) => Some(print_panel::PrintCheck::new(part.clone())),
+            (None, None) => {
+                self.worker_status = "Select a part to check it for printing.".to_owned();
+                None
+            }
+            (Some(_), _) => None,
+        };
+    }
+
+    /// Send the print check once the part has been built.
+    fn run_print_check(&mut self) {
+        let Some(check) = &mut self.print_check else { return };
+        // Follow the selection, so the check is always about the part in view.
+        if let Some(selected) = self.selected_part.as_ref().filter(|s| **s != check.part) {
+            *check = print_panel::PrintCheck::new(selected.clone());
+        }
+        if !check.wants_run() || !self.building.is_empty() || self.param_drag.is_some() {
+            return;
+        }
+        let Some(key) = self.shown.get(&check.part).and_then(|p| Mesh::key_of(p)) else {
+            check.result(Err("This part hasn't built yet.".to_owned()));
+            return;
+        };
+        match self.worker.as_mut().map(|w| w.request_print_check(&key, 1.2, [0.0, 0.0, 1.0])) {
+            Some(Ok(id)) => check.sent(id),
+            Some(Err(e)) => check.result(Err(format!("{e:#}"))),
+            None => check.result(Err("The geometry worker isn't running.".to_owned())),
+        }
+    }
+
+    /// The print check's findings, bottom left of the viewport, with numbered markers.
+    fn print_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let can_ask = self.chat.can_ask();
+        let Some(check) = &mut self.print_check else { return };
+        let painter = ui.painter_at(rect);
+        for (number, at, kind) in check.markers() {
+            let Some(spot) = self.viewport.project(at) else { continue };
+            let colour = match kind.as_str() {
+                "thin wall" => egui::Color32::from_rgb(235, 80, 80),
+                "small hole" => egui::Color32::from_rgb(240, 160, 50),
+                _ => egui::Color32::from_rgb(190, 130, 240),
+            };
+            painter.circle(spot, 9.0, colour, egui::Stroke::new(1.5, egui::Color32::WHITE));
+            painter.text(spot, egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::proportional(11.0), egui::Color32::WHITE);
+        }
+        let panel = egui::Rect::from_min_size(rect.left_bottom() + egui::vec2(60.0, -238.0), egui::vec2(380.0, 230.0));
+        let mut action = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(360.0);
+                action = check.panel_ui(ui, can_ask);
+            });
+        });
+        if let Some(print_panel::PrintAction::Ask(question)) = action {
+            self.ask_chat(&question);
+        }
+    }
+
     pub(crate) fn toggle_fit(&mut self) {
         self.fit = match self.fit {
             None => Some(fit::FitCheck::default()),
@@ -1000,6 +1070,9 @@ impl State {
                     fit.invalidate();
                     self.viewport.set_overlays(&[]);
                 }
+                if let Some(check) = &mut self.print_check {
+                    check.invalidate();
+                }
                 self.rebuild_all();
             }
             // Keep showing the last good project. A half-saved file shouldn't blank the view.
@@ -1076,7 +1149,17 @@ impl State {
                     self.results.retain(|(p, _), e| p != &part || !e.stale);
                 }
                 GeoEvent::Measured { id, data } => self.measure.result(id, Ok(data)),
-                GeoEvent::Inspected { .. } | GeoEvent::Info { .. } => {}
+                GeoEvent::Info { id, data } => {
+                    if let Some(check) = self.print_check.as_mut().filter(|c| c.waiting_for(id)) {
+                        check.result(Ok(data));
+                    }
+                }
+                GeoEvent::Error { id: Some(id), error } if self.print_check.as_ref().is_some_and(|c| c.waiting_for(id)) => {
+                    if let Some(check) = &mut self.print_check {
+                        check.result(Err(error));
+                    }
+                }
+                GeoEvent::Inspected { .. } => {}
                 GeoEvent::Fitted { id, data } => {
                     if let Some(fit) = self.fit.as_mut().filter(|f| f.waiting_for(id)) {
                         let meshes: Vec<Mesh> = fit::overlap_meshes(&data).iter().filter_map(|p| Mesh::load(p).ok()).collect();

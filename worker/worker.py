@@ -23,6 +23,7 @@ import numpy as np
 import build123d
 
 import parts_library
+import print_check
 import sandbox
 
 LINEAR_TOL = 0.05  # mm
@@ -406,6 +407,11 @@ def main():
                 inspect(req)
             elif req.get("cmd") == "fit":
                 fit(req)
+            elif req.get("cmd") == "print_check":
+                shape = cached_shape(req["mesh"])
+                min_wall = float(req.get("min_wall") or 1.2)
+                up = req.get("up") or [0, 0, 1]
+                send({"id": req["id"], "event": "info", "data": print_check.check(shape, min_wall, up)})
             elif req.get("cmd") == "fastener_info":
                 send({"id": req["id"], "event": "info", "data": parts_library.fastener_info(str(req["size"]))})
             else:

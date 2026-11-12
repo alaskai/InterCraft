@@ -464,3 +464,33 @@ fn standard_parts_and_sizes_come_from_the_tables() {
     assert_eq!(nut["features"][0]["status"], "built", "{nut}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn print_check_finds_thin_walls_small_holes_and_overhangs() {
+    if !worker_available() {
+        return;
+    }
+    let _one = one_at_a_time();
+    let (mut host, dir) = project("print");
+    host.call("add_part", &json!({ "name": "Tray" })).unwrap();
+    // A 20 x 20 x 10 block, hollowed to leave a 0.8 mm wall on one side, a 1.5 mm pin
+    // hole, and a ledge sticking out 10 mm above the bed.
+    let code = "part = Box(20, 20, 10) - Pos(0, 0.6, 1) * Box(18.4, 17.2, 10) - Pos(8, -8, 0) * Cylinder(0.75, 30) + Pos(15, 0, 4) * Box(10, 6, 2)";
+    add(&mut host, "Tray", "Body", code).unwrap();
+    let check = host.call("print_check", &json!({ "part": "Tray" })).unwrap();
+    let kinds: Vec<&str> = check["problems"].as_array().unwrap().iter().map(|p| p["kind"].as_str().unwrap()).collect();
+    assert!(kinds.contains(&"thin wall"), "{check}");
+    assert!(kinds.contains(&"small hole"), "{check}");
+    assert!(kinds.contains(&"overhang"), "{check}");
+    let thinnest = check["problems"].as_array().unwrap().iter().filter_map(|p| p["thickness"].as_f64()).fold(f64::MAX, f64::min);
+    assert!((thinnest - 0.8).abs() < 0.01, "{check}");
+    assert_eq!(check["ok"], false);
+
+    // Printed upside down, the ledge rests on nothing above it: no overhang from it.
+    host.call("add_part", &json!({ "name": "Cube" })).unwrap();
+    add(&mut host, "Cube", "Body", "part = Box(20, 20, 20)").unwrap();
+    let fine = host.call("print_check", &json!({ "part": "Cube" })).unwrap();
+    assert_eq!(fine["ok"], true, "{fine}");
+    assert!(host.call("print_check", &json!({ "part": "Cube", "up": [0, 0, 0] })).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

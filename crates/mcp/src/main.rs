@@ -19,10 +19,17 @@ fn main() -> Result<()> {
     };
     server.warm_up();
 
-    let stdin = std::io::stdin();
+    let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
+    let mut raw = Vec::new();
+    loop {
+        // Read bytes, not lines: a line that isn't valid UTF-8 must be an error reply,
+        // not the end of the server.
+        raw.clear();
+        if stdin.read_until(b'\n', &mut raw)? == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&raw);
         if line.trim().is_empty() {
             continue;
         }

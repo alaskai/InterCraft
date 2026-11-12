@@ -235,6 +235,26 @@ impl State {
     }
 
     fn drain_worker_events(&mut self) {
+        // A step that never finishes (usually an endless loop) would freeze the view forever.
+        if self.worker.as_ref().is_some_and(|w| w.stuck()) {
+            let parts: HashSet<String> = std::mem::take(&mut self.building);
+            for ((part, _), entry) in self.results.iter_mut() {
+                if entry.stale && parts.contains(part) {
+                    entry.stale = false;
+                    entry.result.ok = false;
+                    entry.result.error = Some(format!(
+                        "Stopped after {} s without finishing. An endless loop in a snippet is the usual cause.",
+                        intercraft_geo::build_timeout().as_secs()
+                    ));
+                }
+            }
+            if let Some(worker) = self.worker.as_mut() {
+                self.worker_status = match worker.restart() {
+                    Ok(()) => "A build step took too long and was stopped. The geometry worker restarted.".to_owned(),
+                    Err(e) => format!("Worker restart failed: {e:#}"),
+                };
+            }
+        }
         loop {
             let Some(event) = self.worker.as_mut().and_then(|w| w.try_recv()) else { break };
             match event {

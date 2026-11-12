@@ -22,11 +22,12 @@ sys.stdout = sys.stderr
 import numpy as np
 import build123d
 
+import sandbox
+
 LINEAR_TOL = 0.05  # mm
 ANGULAR_TOL = 0.3  # rad
 
-_base_ns = {"math": math}
-exec("from build123d import *", _base_ns)
+_base_ns = sandbox.build_namespace()
 
 # chained hash -> (shape, report, mesh path)
 _cache = {}
@@ -97,13 +98,11 @@ def make_report(shape, volume_before):
 
 
 def run_feature(prev_shape, feature):
-    ns = dict(_base_ns)
-    ns["part"] = prev_shape
-    ns["p"] = feature.get("params", {})
-    exec(compile(feature["code"], feature.get("id", "feature"), "exec"), ns)
-    shape = ns.get("part")
+    shape = sandbox.run(feature["code"], prev_shape, feature.get("params", {}), _base_ns, feature.get("id", "feature"))
     if shape is None:
         raise ValueError("snippet finished without assigning `part`")
+    if not isinstance(shape, build123d.Shape):
+        raise ValueError(f"`part` must be a build123d shape, not {type(shape).__name__}")
     return shape
 
 

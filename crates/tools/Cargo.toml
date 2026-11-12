@@ -9,3 +9,6 @@ intercraft-geo = { path = "../geo" }
 anyhow.workspace = true
 serde_json.workspace = true
 dirs = "7"
+
+[dev-dependencies]
+intercraft-geo = { path = "../geo" }

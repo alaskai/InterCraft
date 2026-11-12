@@ -7,7 +7,7 @@ use egui::containers::menu::{MenuButton, MenuConfig};
 use egui_dock::{DockState, NodeIndex};
 use intercraft_geo::ExportFormat;
 
-use crate::settings::Settings;
+use crate::settings::{Explain, Layout, Settings};
 use crate::{App, Tab};
 
 /// Where new projects go unless the user picks somewhere else.
@@ -19,14 +19,15 @@ pub fn default_projects_dir() -> PathBuf {
 }
 
 /// Viewport in the middle, parts and inspector on the left, chat on the right, timeline below.
-pub fn default_dock() -> DockState<Tab> {
+/// The simple layout gives the 3D view and chat more room and the timeline less.
+pub fn default_dock(simple: bool) -> DockState<Tab> {
     // The sketch canvas shares the middle with the 3D view, as a second tab.
     let mut dock = DockState::new(vec![Tab::Viewport, Tab::Sketch]);
     let tree = dock.main_surface_mut();
     let [centre, _right] = tree.split_right(NodeIndex::root(), 0.76, vec![Tab::Chat]);
     let [centre, left] = tree.split_left(centre, 0.22, vec![Tab::Parts]);
     tree.split_below(left, 0.5, vec![Tab::Inspector, Tab::Brief]);
-    tree.split_below(centre, 0.80, vec![Tab::Timeline]);
+    tree.split_below(centre, if simple { 0.86 } else { 0.80 }, vec![Tab::Timeline]);
     dock
 }
 
@@ -271,8 +272,12 @@ impl App {
                 }
             }
         }
+        let mut simple = self.state.simple;
+        if ui.checkbox(&mut simple, "Simple layout").on_hover_text("Hide code, file paths and raw parameter names").changed() {
+            self.set_experience(self.state.chat.explain(), simple);
+        }
         if ui.button("Reset layout").clicked() {
-            self.dock = default_dock();
+            self.dock = default_dock(self.state.simple);
             ui.close();
         }
         ui.separator();
@@ -295,6 +300,75 @@ impl App {
         }
     }
 
+    /// Explanation level and layout, in Settings.
+    fn experience_choice(&mut self, ui: &mut egui::Ui) {
+        let (mut explain, mut simple) = (self.state.chat.explain(), self.state.simple);
+        egui::Grid::new("experience").num_columns(2).show(ui, |ui| {
+            ui.label("Explanations");
+            ui.horizontal(|ui| {
+                for level in Explain::ALL {
+                    ui.selectable_value(&mut explain, level, level.name()).on_hover_text(level.hint());
+                }
+            });
+            ui.end_row();
+            ui.label("Layout");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut simple, true, "Simple").on_hover_text("Chat and the 3D view first. Code, file paths and raw parameter names hidden.");
+                ui.selectable_value(&mut simple, false, "Advanced").on_hover_text("Everything: code, timeline detail and placement");
+            });
+            ui.end_row();
+        });
+        if (explain, simple) != (self.state.chat.explain(), self.state.simple) {
+            self.set_experience(explain, simple);
+        }
+    }
+
+    /// Apply and save an explanation level and layout. A layout change resets the panels.
+    pub(crate) fn set_experience(&mut self, explain: Explain, simple: bool) {
+        let layout = if simple { Layout::Simple } else { Layout::Advanced };
+        let _ = Settings::update(|s| {
+            s.explain = explain;
+            s.layout = layout;
+            s.onboarded = true;
+        });
+        self.state.chat.set_explain(explain);
+        if simple != self.state.simple {
+            self.state.simple = simple;
+            self.dock = default_dock(simple);
+        }
+    }
+
+    /// The one-time question on first launch.
+    pub(crate) fn first_run_window(&mut self, ctx: &egui::Context) {
+        if !self.first_run {
+            return;
+        }
+        let mut choice = None;
+        egui::Window::new("Welcome to InterCraft")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Describe what you want to make and watch it being designed. How much should InterCraft explain?");
+                ui.add_space(8.0);
+                if ui.add_sized([360.0, 34.0], egui::Button::new("I'm new to CAD")).clicked() {
+                    choice = Some((Explain::Beginner, true));
+                }
+                ui.weak("Plain-language explanations of every step, and a simpler layout.");
+                ui.add_space(6.0);
+                if ui.add_sized([360.0, 34.0], egui::Button::new("I know CAD")).clicked() {
+                    choice = Some((Explain::Expert, false));
+                }
+                ui.weak("Terse answers, with code, parameters and the full timeline on show.");
+                ui.add_space(6.0);
+                ui.weak("You can change this any time in Settings.");
+            });
+        if let Some((explain, simple)) = choice {
+            self.first_run = false;
+            self.set_experience(explain, simple);
+        }
+    }
+
     pub(crate) fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_open;
         egui::Window::new("Settings")
@@ -305,6 +379,10 @@ impl App {
             .show(ctx, |ui| {
                 ui.heading("Chat");
                 self.state.chat.settings_contents(ui);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.heading("Experience");
+                self.experience_choice(ui);
                 ui.add_space(8.0);
                 ui.separator();
                 ui.heading("Appearance");

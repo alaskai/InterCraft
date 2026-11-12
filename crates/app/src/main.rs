@@ -111,8 +111,10 @@ struct State {
     history: HistoryInfo,
     /// A parameter being dragged in the Inspector, previewed but not saved yet.
     param_drag: Option<params::ParamDrag>,
-    /// The Rename part window: the part, the name typed so far, and any error.
-    rename: Option<(String, String, Option<String>)>,
+    /// The Rename window: what is being renamed, the name typed so far, and any error.
+    rename: Option<(RenameTarget, String, Option<String>)>,
+    /// A step's code being edited in the Inspector, not applied yet.
+    code_draft: Option<CodeDraft>,
 
     viewport: Viewport,
     chat: chat::ChatPanel,
@@ -161,6 +163,7 @@ impl App {
             history: HistoryInfo::default(),
             param_drag: None,
             rename: None,
+            code_draft: None,
             viewport: Viewport::new(render_state),
             chat: chat::ChatPanel::new(cc.egui_ctx.clone(), project_dir.clone()),
             measure: measure::MeasureTool::default(),
@@ -436,18 +439,60 @@ impl State {
         }
     }
 
-    /// The small window for typing a part's new name.
+    fn rename_step(&mut self, part: &str, feature: &str, label: &str) -> anyhow::Result<()> {
+        let edit = intercraft_core::FeatureEdit { label: Some(label.to_owned()), ..Default::default() };
+        self.edit_project(|p| p.edit_feature(part, feature, edit).and_then(|()| p.save()))?;
+        self.worker_status = format!("Renamed the step to '{label}'");
+        Ok(())
+    }
+
+    /// Move a step one place earlier (-1) or later (+1) on the timeline.
+    pub(crate) fn move_step(&mut self, part: &str, feature: &str, by: isize) {
+        let result = self.edit_project(|p| {
+            let features = &p.part(part)?.features;
+            let from = features.iter().position(|f| f.id == feature).ok_or_else(|| anyhow::anyhow!("that step is gone"))?;
+            let to = from.checked_add_signed(by).filter(|to| *to < features.len());
+            let to = to.ok_or_else(|| anyhow::anyhow!("it is already at that end"))?;
+            // After the step it swaps with when moving later, after the one before that when moving earlier.
+            let after = if by > 0 { Some(features[to].id.clone()) } else { to.checked_sub(1).map(|i| features[i].id.clone()) };
+            p.move_feature(part, feature, after.as_deref())?;
+            p.save()
+        });
+        match result {
+            Ok(()) => self.worker_status = "Moved the step. Ctrl+Z undoes it.".to_owned(),
+            Err(e) => self.worker_status = format!("Couldn't move that step: {e:#}"),
+        }
+    }
+
+    /// Save code edited in the Inspector and rebuild from that step.
+    pub(crate) fn apply_code(&mut self, part: &str, feature: &str, code: String) {
+        let edit = intercraft_core::FeatureEdit { code: Some(code), ..Default::default() };
+        match self.edit_project(|p| p.edit_feature(part, feature, edit).and_then(|()| p.save())) {
+            Ok(()) => {
+                // The next frame starts a fresh draft from what was saved.
+                self.code_draft = None;
+                self.worker_status = "Applied the code. Ctrl+Z undoes it.".to_owned();
+            }
+            Err(e) => self.worker_status = format!("Couldn't apply the code: {e:#}"),
+        }
+    }
+
+    /// The small window for typing a new name for a part or a step.
     fn rename_window(&mut self, ctx: &egui::Context) {
-        let Some((part, mut name, mut error)) = self.rename.take() else { return };
+        let Some((target, mut name, mut error)) = self.rename.take() else { return };
+        let (title, hint, current) = match &target {
+            RenameTarget::Part(part) => ("Rename part", "Letters, digits, _ and -", part.clone()),
+            RenameTarget::Step { label, .. } => ("Rename step", "A short name for the step", label.clone()),
+        };
         let mut open = true;
         let mut done = false;
-        egui::Window::new("Rename part")
+        egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                let field = ui.add(egui::TextEdit::singleline(&mut name).hint_text("Letters, digits, _ and -"));
+                let field = ui.add(egui::TextEdit::singleline(&mut name).hint_text(hint));
                 if !field.has_focus() && !field.lost_focus() {
                     field.request_focus();
                 }
@@ -456,10 +501,14 @@ impl State {
                 }
                 let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ui.button("Rename").clicked() || enter {
-                    if name.trim() == part {
+                    if name.trim() == current {
                         done = true;
                     } else {
-                        match self.rename_part(&part, name.trim()) {
+                        let result = match &target {
+                            RenameTarget::Part(part) => self.rename_part(part, name.trim()),
+                            RenameTarget::Step { part, feature, .. } => self.rename_step(part, feature, name.trim()),
+                        };
+                        match result {
                             Ok(()) => done = true,
                             Err(e) => error = Some(capitalise(&format!("{e:#}"))),
                         }
@@ -467,7 +516,7 @@ impl State {
                 }
             });
         if open && !done {
-            self.rename = Some((part, name, error));
+            self.rename = Some((target, name, error));
         }
     }
 
@@ -1156,7 +1205,7 @@ impl State {
             Some(PartAction::ShowAll) => self.show_all(),
             Some(PartAction::Kind(name, kind)) => self.set_part_kind(&name, kind),
             Some(PartAction::Delete(name)) => self.delete_part(&name),
-            Some(PartAction::Rename(name)) => self.rename = Some((name.clone(), name, None)),
+            Some(PartAction::Rename(name)) => self.rename = Some((RenameTarget::Part(name.clone()), name, None)),
             Some(PartAction::Duplicate(name)) => self.duplicate_part(&name),
             Some(PartAction::Import) => self.import_step_dialog(),
             None => {}
@@ -1166,15 +1215,24 @@ impl State {
 
     fn inspector_ui(&mut self, ui: &mut egui::Ui) {
         let mut drag = self.param_drag.take();
-        let commit = self.inspector_contents(ui, &mut drag);
+        let mut draft = self.code_draft.take();
+        let action = self.inspector_contents(ui, &mut drag, &mut draft);
         self.param_drag = drag;
-        if let Some(commit) = commit {
-            self.commit_param(commit);
+        self.code_draft = draft;
+        match action {
+            Some(InspectorAction::Param(commit)) => self.commit_param(commit),
+            Some(InspectorAction::Code { part, feature, code }) => self.apply_code(&part, &feature, code),
+            None => {}
         }
     }
 
-    /// Draws the Inspector. Returns a parameter edit to save, if there was one.
-    fn inspector_contents(&self, ui: &mut egui::Ui, drag: &mut Option<params::ParamDrag>) -> Option<params::ParamCommit> {
+    /// Draws the Inspector. Returns an edit to save, if there was one.
+    fn inspector_contents(
+        &self,
+        ui: &mut egui::Ui,
+        drag: &mut Option<params::ParamDrag>,
+        draft: &mut Option<CodeDraft>,
+    ) -> Option<InspectorAction> {
         let Some((_, part)) = self.selected_part() else {
             ui.weak("Select a part to see its steps.");
             return None;
@@ -1186,7 +1244,7 @@ impl State {
             .default_open(part.placement().is_some())
             .show(ui, |ui| {
                 egui::Grid::new("placement").num_columns(2).show(ui, |ui| {
-                    commit = params::placement_rows(ui, part, drag);
+                    commit = params::placement_rows(ui, part, drag).map(InspectorAction::Param);
                 });
                 ui.weak("X, Y, Z in mm, then degrees about each axis.");
             });
@@ -1224,13 +1282,22 @@ impl State {
                 for (name, value) in params {
                     let key = (part.name.as_str(), step.id);
                     if let Some(edit) = params::param_row(ui, key, name, value, editable, drag) {
-                        commit = Some(edit);
+                        commit = Some(InspectorAction::Param(edit));
                     }
                 }
             });
             if drag.as_ref().is_some_and(|d| d.part == part.name) {
                 ui.weak("Previewing. Let go to save.");
             }
+        }
+
+        if let Some(code) = step.code {
+            let editable = part.kind == PartKind::Design;
+            egui::CollapsingHeader::new("Code").id_salt("step code").show(ui, |ui| {
+                if let Some(code) = code_editor(ui, draft, (&part.name, step.id), code, editable) {
+                    commit = Some(InspectorAction::Code { part: part.name.clone(), feature: step.id.to_owned(), code });
+                }
+            });
         }
 
         ui.separator();
@@ -1295,8 +1362,13 @@ impl State {
         ui.add_space(4.0);
 
         let part_name = part.name.clone();
+        let editable = part.kind == PartKind::Design;
+        let features = part.features.len();
+        let first_feature = steps(part).len() - features;
         let mut clicked = None;
         let mut delete = None;
+        let mut shift = None;
+        let mut rename = None;
         egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 for (i, step) in steps(part).iter().enumerate() {
@@ -1322,10 +1394,29 @@ impl State {
                     response.context_menu(|ui| {
                         if step.id == intercraft_geo::IMPORT_STEP_ID {
                             ui.weak("This is the imported shape.\nDelete the part to remove it.");
-                        } else if ui.button("Delete step").clicked() {
-                            delete = Some(step.id.to_owned());
-                            ui.close();
+                            return;
                         }
+                        // Position among the features, which is what can be reordered.
+                        let at = i - first_feature;
+                        ui.add_enabled_ui(editable, |ui| {
+                            if ui.add_enabled(at > 0, egui::Button::new("Move earlier")).clicked() {
+                                shift = Some((step.id.to_owned(), -1));
+                                ui.close();
+                            }
+                            if ui.add_enabled(at + 1 < features, egui::Button::new("Move later")).clicked() {
+                                shift = Some((step.id.to_owned(), 1));
+                                ui.close();
+                            }
+                            if ui.button("Rename...").clicked() {
+                                rename = Some((step.id.to_owned(), step.label.clone()));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Delete step").clicked() {
+                                delete = Some(step.id.to_owned());
+                                ui.close();
+                            }
+                        });
                     });
                 }
 
@@ -1344,7 +1435,87 @@ impl State {
         if let Some(id) = delete {
             self.delete_step(&part_name, &id);
         }
+        if let Some((id, by)) = shift {
+            self.move_step(&part_name, &id, by);
+        }
+        if let Some((feature, label)) = rename {
+            let target = RenameTarget::Step { part: part_name, feature, label: label.clone() };
+            self.rename = Some((target, label, None));
+        }
+        self.rename_window(ui.ctx());
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RenameTarget {
+    Part(String),
+    Step { part: String, feature: String, label: String },
+}
+
+/// An edit made in the Inspector, saved once the panel is drawn.
+enum InspectorAction {
+    Param(params::ParamCommit),
+    Code { part: String, feature: String, code: String },
+}
+
+/// A step's snippet as typed in the Inspector, until it is applied.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CodeDraft {
+    part: String,
+    feature: String,
+    /// The saved code this draft started from.
+    original: String,
+    pub(crate) text: String,
+}
+
+/// The code box of the selected step. Returns the code to save when Apply is pressed.
+fn code_editor(
+    ui: &mut egui::Ui,
+    draft: &mut Option<CodeDraft>,
+    (part, feature): (&str, &str),
+    saved: &str,
+    editable: bool,
+) -> Option<String> {
+    // Start again from the saved code when another step is picked, or when the file
+    // changed and nothing has been typed here.
+    let stale = draft.as_ref().is_none_or(|d| {
+        d.part != part || d.feature != feature || (d.text == d.original && d.original != saved)
+    });
+    if stale {
+        *draft = Some(CodeDraft { part: part.into(), feature: feature.into(), original: saved.into(), text: saved.into() });
+    }
+    let d = draft.as_mut()?;
+    let edited = d.text != d.original;
+
+    let rows = d.text.lines().count().clamp(4, 18);
+    let editor = egui::TextEdit::multiline(&mut d.text).code_editor().desired_rows(rows).desired_width(f32::INFINITY);
+    let response = ui.add_enabled(editable, editor);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, editable, "Step code"));
+    if !editable {
+        ui.weak("Unlock the part to change its code.");
+        return None;
+    }
+    if d.original != saved {
+        ui.colored_label(ui.visuals().warn_fg_color, "This step changed while you were editing it.");
+        if ui.small_button("Load the new version").clicked() {
+            *draft = None;
+            return None;
+        }
+    }
+    let mut apply = false;
+    ui.horizontal(|ui| {
+        let shortcut = response.has_focus() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
+        apply = ui.add_enabled(edited, egui::Button::new("Apply")).on_hover_text("Save and rebuild (Ctrl+Enter)").clicked()
+            || (edited && shortcut);
+        if ui.add_enabled(edited, egui::Button::new("Revert")).clicked() {
+            d.text = d.original.clone();
+        }
+        if edited {
+            ui.weak("Not applied yet");
+        }
+    });
+    ui.weak("build123d. Reads and reassigns `part`. Parameters are in `p`.");
+    apply.then(|| d.text.clone())
 }
 
 /// What a click in the parts list asked for, applied once the list is drawn.
@@ -1403,6 +1574,8 @@ struct Step<'a> {
     prompt: &'a str,
     file: &'a str,
     params: Option<&'a intercraft_core::Params>,
+    /// The snippet. An imported shape has none.
+    code: Option<&'a str>,
 }
 
 fn steps(part: &Part) -> Vec<Step<'_>> {
@@ -1415,6 +1588,7 @@ fn steps(part: &Part) -> Vec<Step<'_>> {
             prompt: "Starting shape from an imported STEP file.",
             file: source,
             params: None,
+            code: None,
         });
     }
     list.extend(part.features.iter().map(|f| Step {
@@ -1423,6 +1597,7 @@ fn steps(part: &Part) -> Vec<Step<'_>> {
         prompt: &f.prompt,
         file: &f.file,
         params: Some(&f.params),
+        code: Some(&f.code),
     }));
     list
 }

@@ -54,8 +54,8 @@ To see the live update, leave the app open and change a value in `examples/brack
 | Panel | What it shows |
 |---|---|
 | Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it, click the eye to hide or show it, and right-click for Show only this, Show all, Rename, Duplicate, Lock, Unlock and Delete. Delete removes the selected part while the pointer is over the list. |
-| Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. Right-click a step to delete it. |
-| Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. Placement, at the top, moves and turns the selected part in the assembly the same way. |
+| Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. Right-click a step to move it earlier or later, rename it or delete it. |
+| Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. Placement, at the top, moves and turns the selected part in the assembly the same way. Code shows the step's snippet. Edit it and press Apply (Ctrl+Enter) to save and rebuild, or Revert to drop the edit. |
 
 ### Menus
 
@@ -155,6 +155,7 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `add_feature` | Adds one modelling step and builds it |
 | `edit_feature` | Changes a feature's code, label or parameters |
 | `set_param` | Changes one dimension |
+| `move_feature` | Changes the order of a part's features |
 | `delete_feature` | Removes a feature |
 | `delete_part` | Removes a design part (reference parts can only be removed by you) |
 | `place_part` | Moves or turns a design part in the assembly |
@@ -251,5 +252,6 @@ Every push and pull request runs both suites on Windows in GitHub Actions, toget
 8. Undo and history, hiding and deleting parts and steps (done)
 9. Editing parameters in the Inspector with a live preview (done)
 10. Section view, part placement, rename and duplicate, fit check, and pictures for the model (done)
-11. Sketch panel
-12. Before and after overlay
+11. Reordering, renaming and editing the code of steps, and CI (done)
+12. Sketch panel
+13. Before and after overlay

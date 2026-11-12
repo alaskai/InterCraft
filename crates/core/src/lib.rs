@@ -443,6 +443,28 @@ impl LoadedProject {
         Ok(())
     }
 
+    /// Move a feature so it comes straight after `after`, or first when `after` is None.
+    pub fn move_feature(&mut self, part_name: &str, id: &str, after: Option<&str>) -> Result<()> {
+        if after == Some(id) {
+            bail!("a feature can't be moved after itself");
+        }
+        let part = self.design_part_mut(part_name)?;
+        let find = |features: &[Feature], wanted: &str| {
+            features.iter().position(|f| f.id == wanted).with_context(|| format!("no feature '{wanted}' in '{part_name}'"))
+        };
+        let from = find(&part.features, id)?;
+        if let Some(after) = after {
+            find(&part.features, after)?;
+        }
+        let feature = part.features.remove(from);
+        let to = match after {
+            Some(after) => find(&part.features, after)? + 1,
+            None => 0,
+        };
+        part.features.insert(to, feature);
+        Ok(())
+    }
+
     pub fn delete_feature(&mut self, part_name: &str, id: &str) -> Result<()> {
         let dir = self.dir.clone();
         let part = self.design_part_mut(part_name)?;
@@ -789,6 +811,27 @@ mod tests {
         // An unmoved part writes no placement at all.
         let text = std::fs::read_to_string(p.dir.join("project.json")).unwrap();
         assert_eq!(text.matches("\"position\"").count(), 1);
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn features_can_be_reordered() {
+        let mut p = temp_project("reorder");
+        p.add_part("P").unwrap();
+        for label in ["A", "B", "C"] {
+            p.add_feature("P", feature(label, None)).unwrap();
+        }
+        let order = |p: &LoadedProject| p.project.parts[0].features.iter().map(|f| f.label.clone()).collect::<String>();
+        p.move_feature("P", "f030", None).unwrap();
+        assert_eq!(order(&p), "CAB");
+        p.move_feature("P", "f030", Some("f020")).unwrap();
+        assert_eq!(order(&p), "ABC");
+        p.move_feature("P", "f010", Some("f020")).unwrap();
+        assert_eq!(order(&p), "BAC");
+        assert!(p.move_feature("P", "f010", Some("f010")).is_err());
+        assert!(p.move_feature("P", "f010", Some("f999")).is_err());
+        assert!(p.move_feature("P", "f999", None).is_err());
+        assert_eq!(order(&p), "BAC", "a refused move changes nothing");
         std::fs::remove_dir_all(&p.dir).unwrap();
     }
 

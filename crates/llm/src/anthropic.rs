@@ -551,7 +551,7 @@ fn api_url() -> String {
     }
 }
 
-fn is_local_url(url: &str) -> bool {
+pub(crate) fn is_local_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) else {
         return false;
     };

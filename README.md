@@ -109,12 +109,13 @@ The history lives in the project's `.intercraft/history` folder, one snapshot pe
 
 ## Driving it from an LLM
 
-There are three ways in. All use the same tools, so the model behaves the same either way.
+There are four ways in. All use the same tools, so the model behaves the same either way.
 
 | Route | Who it suits | Billing |
 |---|---|---|
 | Chat panel with an API key | Anyone with an Anthropic API key | Your API account |
 | Chat panel through Claude Code | Claude Pro or Max subscribers with Claude Code installed | Your subscription |
+| Chat panel with an OpenAI-compatible server | OpenAI or OpenRouter accounts, or a local model in Ollama or LM Studio | That service, or nothing for a local model |
 | MCP server from an agent app | People who work in Claude Code, Codex CLI, Gemini CLI or Cursor | Whatever that app uses |
 
 ### Built-in chat
@@ -123,6 +124,7 @@ There are three ways in. All use the same tools, so the model behaves the same e
 2. Choose what to use:
    - **Anthropic API key.** Paste a key and press Save. It is stored in the system credential store (Windows Credential Manager, macOS Keychain or Secret Service on Linux), never in a file. If `ANTHROPIC_API_KEY` is set, that is used instead. Pick a model and effort (Claude Opus 5.5 at high effort is the default).
    - **Claude Code (your subscription).** Needs Claude Code installed and signed in (run `claude` once in a terminal). InterCraft starts your own Claude Code in the background and shows its replies here. Pick a model or keep your Claude Code default.
+   - **OpenAI-compatible server.** Set the server address (Pick lists OpenAI, OpenRouter, Ollama and LM Studio), type the model's id on that server, and save a key if the server needs one. Each server has its own saved key, so a key is never sent to a server it wasn't saved for. The address must be HTTPS unless the server runs on this computer. Tick "This model can read images" only for models that can, since that is what lets them use `view_model`. Small local models often struggle with tool calls, so expect better results from larger ones.
 3. Describe the part. Enter sends, Shift+Enter starts a new line, Stop ends the reply.
 
 While it works you see its short notes between steps, each tool call with its result (green for built, red for failed), and the viewer follows the part being edited. Replies are formatted (headings, lists, tables, code). When a choice is genuinely yours, the model can ask with clickable options, and your pick goes back as your next message. The size of the last request and how much came from the prompt cache show under the buttons.
@@ -220,7 +222,7 @@ flowchart LR
 | `crates/geo` | `GeometryBackend` trait and the Python worker client |
 | `crates/app` | Window, docked panels and the 3D viewport |
 | `crates/tools` | The editing tools and model guide, shared by the chat panel and the MCP server |
-| `crates/llm` | Provider-neutral chat interface and the Anthropic client |
+| `crates/llm` | Provider-neutral chat interface, with clients for the Anthropic API, Claude Code and OpenAI-compatible servers |
 | `crates/mcp` | MCP server that exposes the tools |
 | `worker` | Runs the snippets, caches each step, writes meshes and reports |
 
@@ -242,16 +244,22 @@ Every push and pull request runs both suites on Windows in GitHub Actions, toget
 
 ## Roadmap
 
-1. Viewer with live rebuild from files (done)
-2. Tool API and MCP server so an LLM can drive it (done)
-3. Built-in chat panel with the Anthropic API or your own Claude Code (done)
-4. Menus, project navigation, rich text and choice questions (done)
-5. STEP import, edge display, measuring tool, and inspect and measure tools for the model (done)
-6. OS-level isolation for the geometry worker
-7. OpenAI-compatible client (OpenAI, OpenRouter, local models through Ollama or LM Studio)
-8. Undo and history, hiding and deleting parts and steps (done)
-9. Editing parameters in the Inspector with a live preview (done)
-10. Section view, part placement, rename and duplicate, fit check, and pictures for the model (done)
-11. Reordering, renaming and editing the code of steps, and CI (done)
-12. Sketch panel
-13. Before and after overlay
+Done:
+
+1. Viewer with live rebuild from files
+2. Tool API and MCP server so an LLM can drive it
+3. Built-in chat panel with the Anthropic API or your own Claude Code
+4. Menus, project navigation, rich text and choice questions
+5. STEP import, edge display, measuring tool, and inspect and measure tools for the model
+6. Undo and history, hiding and deleting parts and steps
+7. Editing parameters in the Inspector with a live preview
+8. Section view, part placement, rename and duplicate, fit check, and pictures for the model
+9. Reordering, renaming and editing the code of steps, and CI
+10. OpenAI-compatible chat (OpenAI, OpenRouter, Ollama, LM Studio)
+
+Next:
+
+- Sketch panel
+- OS-level isolation for the geometry worker
+- Memory cap and stuck-build watchdog on macOS and Linux
+- Before and after overlay

@@ -627,3 +627,34 @@ fn steps_can_be_moved_renamed_and_recoded() {
     h.state_mut().state.undo();
     wait_until(&mut h, "the undo to rebuild", built);
 }
+
+#[test]
+fn openai_compatible_server_settings() {
+    let _one = one_at_a_time();
+    let project = example_project("server");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    // No model yet: the chat says what is missing instead of offering to send.
+    h.state_mut().state.chat.use_server("http://localhost:11434/v1", "");
+    h.step();
+    h.get_by_label_contains("Ollama (this computer) · no model chosen");
+    h.get_by_label_contains("set the server address and a model");
+
+    h.state_mut().state.chat.use_server("http://localhost:11434/v1", "qwen3:14b");
+    h.step();
+    h.get_by_label_contains("qwen3:14b · Ollama (this computer)");
+    h.state_mut().settings_open = true;
+    h.step();
+    h.step();
+    for label in ["Server", "Images", "This model can read images", "None saved for this server"] {
+        assert!(h.get_all_by_label_contains(label).count() >= 1, "settings are missing {label}");
+    }
+    shot(&mut h, "settings_server");
+
+    // An address that would send a key in the clear is called out.
+    h.state_mut().state.chat.use_server("http://example.com/v1", "m");
+    h.step();
+    h.step();
+    h.get_by_label_contains("must start with https://");
+}

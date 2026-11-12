@@ -998,3 +998,20 @@ fn design_terms_and_parameter_names_are_explained() {
     // Not the code name made readable ("Radius"): the model's label wins.
     assert_eq!(h.query_all_by_label("Radius").count(), 0);
 }
+
+#[test]
+fn print_check_marks_problems_on_the_part() {
+    let _one = one_at_a_time();
+    let project = example_project("print");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    click(&mut h, "Print check");
+    wait_until(&mut h, "the print check", |app| app.state.print_check.as_ref().is_some_and(|c| !c.markers().is_empty()));
+    // The bracket's 1 mm clamp slit cuts a thin bridge above the bore.
+    let markers = h.state().state.print_check.as_ref().unwrap().markers();
+    assert!(markers.iter().any(|(_, _, kind)| kind == "thin wall" || kind == "overhang"), "{markers:?}");
+    h.get_by_label("Print check: RodBracket");
+    shot(&mut h, "print_check");
+    click(&mut h, "Print check");
+    assert!(h.state().state.print_check.is_none());
+}

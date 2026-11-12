@@ -331,6 +331,19 @@ impl PythonWorker {
         self.wait_for(id)
     }
 
+    /// Check a built shape for 3D printing, without waiting. The answer arrives as
+    /// `GeoEvent::Info` with this id.
+    pub fn request_print_check(&mut self, mesh_key: &str, min_wall: f64, up: [f64; 3]) -> Result<u64> {
+        let id = self.next_id;
+        self.send(serde_json::json!({ "cmd": "print_check", "mesh": mesh_key, "min_wall": min_wall, "up": up }))?;
+        Ok(id)
+    }
+
+    pub fn print_check_blocking(&mut self, mesh_key: &str, min_wall: f64, up: [f64; 3]) -> Result<serde_json::Value> {
+        let id = self.request_print_check(mesh_key, min_wall, up)?;
+        self.wait_for(id)
+    }
+
     /// Real sizes for a metric screw size ("M4"): clearance holes, tap drill, head,
     /// nut and heat-set insert, from the ISO tables in bd_warehouse.
     pub fn fastener_info_blocking(&mut self, size: &str) -> Result<serde_json::Value> {

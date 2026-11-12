@@ -95,6 +95,7 @@ New projects go in `Documents\InterCraft Projects` unless you pick another folde
 | Hide or show the selected part | H |
 | Section view | S, or the Section button |
 | Fit check | The Fit check button |
+| Print check | The Print check button |
 
 ### Measuring
 
@@ -127,6 +128,16 @@ Section cuts the model open with a plane across X, Y or Z. Drag the slider to mo
 Each part has a placement: a position in mm and a rotation in degrees about X, Y and Z. Set it under Placement in the Inspector. Features never see the placement. A snippet always works in the part's own frame, so moving a part can't break it. Right-click a part to duplicate or rename it.
 
 Fit check compares every pair of visible parts on the real CAD shapes. A pair either clashes, with the overlapping volume listed and drawn in red through the parts, or is clear, with the smallest gap listed. Hover a row to see where the gap is. The check runs again by itself after each change while its panel is open.
+
+### Print check
+
+Print check looks at the selected part the way a 3D printer will, with +Z up:
+
+- **Thin walls** under 1.2 mm, about three widths of a 0.4 mm nozzle.
+- **Round holes** under 2 mm, which tend to print rough or close up.
+- **Overhangs** steeper than 45° that would need support.
+
+Each problem is numbered on the part. **Ask why** sends it to the chat, so the model can explain why it matters and suggest a fix. The panel also gives a rough PLA weight, and it checks again after every change while it is open. The model has the same check as `print_check` and is told to run it before calling a printed part done.
 
 ### Importing STEP files
 
@@ -202,6 +213,7 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `duplicate_part`, `rename_part` | Copies or renames a part |
 | `fastener_info` | Real sizes for a metric screw from the ISO tables: clearance holes, tap drill, head, nut and heat-set insert hole |
 | `add_standard_part` | Adds a real screw, nut, washer, heat-set insert or ball bearing as its own part |
+| `print_check` | Thin walls, small holes and overhangs that would need support, with positions and a rough PLA weight |
 | `check_fit` | Clashes (with volume) and clearances between parts |
 | `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing one part. The six side views are drawn flat, like a drawing |
 | `undo`, `redo` | Step back or forward through the project history |

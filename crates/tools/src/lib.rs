@@ -54,6 +54,7 @@ Standard parts and fits:
 - Never size a screw hole, nut trap, insert hole or bearing seat from memory. Call fastener_info for the size (e.g. "M4") and use its numbers.
 - Clearance holes: normal fit for most parts; loose for 3D printed holes, which print a little small. Heat-set insert holes: use the insert's hole diameter and make the hole a little deeper than the insert.
 - Printed fits: about 0.2 to 0.3 mm of clearance for parts that slide or turn, about 0.1 mm interference for a press fit in PLA. Say which rule you used in the feature's why.
+- Before saying a printed part is done, run print_check and fix what it finds, or tell the user why it is fine (for example, an overhang that will face up when printed).
 - add_standard_part adds a real screw, nut, washer, insert or bearing as its own part, so check_fit can test it against your design. In snippets, standard_part(kind, size, length) and clearance_hole(size, fit) give the same parts and hole sizes.
 
 Undo:
@@ -477,6 +478,19 @@ pub fn definitions() -> Value {
             },
         },
         {
+            "name": "print_check",
+            "description": "Check a part for 3D printing: walls thinner than the minimum (default 1.2 mm), round holes under 2 mm, and surfaces overhanging more than 45 degrees that would need support, each with its position, plus a rough PLA weight. Positions are in the part's own frame. Run it before calling a printed part done.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "part": part,
+                    "min_wall": { "type": "number", "description": "Thinnest wall allowed, in mm. About three times the nozzle width; 1.2 for a 0.4 mm nozzle." },
+                    "up": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Which way is up on the printer, in the part's frame. Default [0, 0, 1]." },
+                },
+                "required": ["part"],
+            },
+        },
+        {
             "name": "fastener_info",
             "description": "Real sizes for a metric screw size from the ISO tables: clearance hole diameters (close, normal, loose), tap drill, socket head diameter and height, hex nut across flats and thickness, and the heat-set insert hole. Use it instead of remembering sizes.",
             "inputSchema": {
@@ -739,6 +753,21 @@ impl ToolHost {
                     result["projection"] = "Flat, without perspective: shapes keep their true proportions and you can't see the walls of a hole that runs straight through.".into();
                 }
                 Ok(result)
+            }
+            "print_check" => {
+                let part = project.part(text(args, "part")?)?.clone();
+                let min_wall = args.get("min_wall").and_then(Value::as_f64).unwrap_or(1.2);
+                if !(0.2..=20.0).contains(&min_wall) {
+                    bail!("min_wall must be between 0.2 and 20 mm");
+                }
+                let up = optional_triple(args, "up")?.unwrap_or([0.0, 0.0, 1.0]);
+                if up.iter().all(|v| *v == 0.0) {
+                    bail!("'up' must point somewhere, like [0, 0, 1]");
+                }
+                let key = self.built_key(&project.dir, &part, None, false)?;
+                let mut data = self.with_worker(|w| w.print_check_blocking(&key, min_wall, up))?;
+                data["part"] = part.name.into();
+                Ok(data)
             }
             "fastener_info" => {
                 let size = standard_size(text(args, "size")?)?;

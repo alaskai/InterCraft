@@ -976,7 +976,9 @@ impl State {
                 let history = loaded.history();
                 // A new change that the chat panel didn't make: say what it was.
                 let newest = history.entries.iter().find(|e| Some(e.number) == history.head);
-                let fresh = newest.is_some_and(|e| self.history.head.is_some_and(|old| e.number > old));
+                // Not on the first load, and not for history that was already there.
+                let reloading = self.project.is_some();
+                let fresh = reloading && newest.is_some_and(|e| self.history.head.is_none_or(|old| e.number > old));
                 if let (true, false, Some(entry)) = (fresh, self.chat.busy(), newest) {
                     self.outside_caption.set(entry.label.clone());
                     self.outside_caption.finish();

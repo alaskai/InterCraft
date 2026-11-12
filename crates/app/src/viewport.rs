@@ -262,6 +262,11 @@ pub struct Shot {
 /// Side of a snapshot in pixels. A multiple of 64, so rows need no padding to read back.
 pub const SHOT_SIZE: u32 = 768;
 
+/// How far back the camera sits to frame a box with a little room around it.
+fn framing_distance(lo: Vec3, hi: Vec3) -> f32 {
+    ((hi - lo).length() * 1.4).max(1.0)
+}
+
 fn orbit(yaw: f32, pitch: f32) -> Vec3 {
     Vec3::new(pitch.cos() * yaw.cos(), pitch.cos() * yaw.sin(), pitch.sin())
 }
@@ -728,6 +733,13 @@ impl Viewport {
         self.frame = Some(Frame { view_proj, inverse: view_proj.inverse(), rect });
     }
 
+    /// What a flat snapshot of the whole model covers: its centre in model space and
+    /// half the side of the square it shows, in mm. None when nothing is built.
+    pub fn flat_frame(&self) -> Option<([f32; 3], f32)> {
+        let (lo, hi) = self.bounds_of(Show::All)?;
+        Some((((lo + hi) * 0.5).to_array(), framing_distance(lo, hi) * (45f32.to_radians() * 0.5).tan()))
+    }
+
     /// Render the model to an image of SHOT_SIZE x SHOT_SIZE pixels, as RGBA bytes.
     /// The user's own view is left exactly as it was.
     pub fn snapshot(&self, shot: &Shot) -> anyhow::Result<Vec<u8>> {
@@ -745,7 +757,7 @@ impl Viewport {
                 target: (lo + hi) * 0.5,
                 yaw,
                 pitch,
-                distance: ((hi - lo).length() * 1.4).max(1.0),
+                distance: framing_distance(lo, hi),
                 aspect: 1.0,
                 background: 0.11,
                 section: shot.section,

@@ -215,6 +215,13 @@ impl eframe::App for App {
         if std::mem::take(&mut self.state.chat.wants_settings) {
             self.settings_open = true;
         }
+        // A screenshot only ever arrives because the sketch panel asked for one.
+        let screenshot = ctx.input(|i| {
+            i.events.iter().find_map(|e| if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None })
+        });
+        if let Some(image) = screenshot {
+            self.state.attach_sketch(&image, ctx.pixels_per_point());
+        }
         self.state.drain_worker_events();
         // Follow the part the chat model is editing, so its steps show as they land.
         if let Some(part) = self.state.chat.poll() {
@@ -698,66 +705,45 @@ impl State {
     }
 
     fn take_view(&self, request: &intercraft_tools::ViewRequest) -> anyhow::Result<Vec<u8>> {
-        let degrees = |yaw: f32, pitch: f32| Some((yaw.to_radians(), pitch.to_radians()));
-        let direction = match request.view.as_str() {
-            "iso" => degrees(-50.0, 28.0),
-            "front" => degrees(-90.0, 0.0),
-            "back" => degrees(90.0, 0.0),
-            "right" => degrees(0.0, 0.0),
-            "left" => degrees(180.0, 0.0),
-            "top" => degrees(-90.0, 88.8),
-            "bottom" => degrees(-90.0, -88.8),
-            _ => None,
-        };
+        let direction = view_direction(&request.view);
         let section = request.section.map(|(axis, offset, flip)| viewport::Section { axis, offset: offset as f32, flip });
         // Side views are drawn flat, like a drawing. The angled ones keep perspective.
         let flat = direction.is_some() && request.view != "iso";
         let shot = viewport::Shot { direction, only: request.part.clone(), section, flat };
         let pixels = self.viewport.snapshot(&shot)?;
 
-        let mut bytes = Vec::new();
-        let mut encoder = png::Encoder::new(&mut bytes, viewport::SHOT_SIZE, viewport::SHOT_SIZE);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header()?;
-        writer.write_image_data(&pixels)?;
-        writer.finish()?;
-        Ok(bytes)
+        encode_png(&pixels, viewport::SHOT_SIZE, viewport::SHOT_SIZE)
     }
 
-    /// Turn the sketch into a feature: a new part, or added to or cut from the selected one.
-    pub(crate) fn sketch_feature(&mut self, made: sketch::SketchFeature) {
-        let selected = self.selected_part.clone();
-        let result = self.edit_project(|p| {
-            let part = match (made.mode, selected) {
-                (sketch::Mode::NewPart, _) => {
-                    let taken = |name: &str| p.project.parts.iter().any(|part| part.name.eq_ignore_ascii_case(name));
-                    let name = (1..).map(|n| if n == 1 { "Sketch".to_owned() } else { format!("Sketch_{n}") }).find(|n| !taken(n));
-                    let name = name.unwrap_or_default();
-                    p.add_part(&name)?;
-                    name
-                }
-                (_, Some(part)) => part,
-                (_, None) => anyhow::bail!("select a part first"),
-            };
-            let new = intercraft_core::NewFeature {
-                label: made.label,
-                code: made.code,
-                params: made.params,
-                prompt: "Drawn in the sketch panel.".to_owned(),
-                after: None,
-            };
-            p.add_feature(&part, new)?;
-            p.save()?;
-            Ok(part)
-        });
-        match result {
-            Ok(part) => {
-                self.worker_status = format!("Extruded the sketch into '{part}'. Drag height and z in the Inspector to adjust.");
-                self.selected_part = Some(part);
-                self.selected_step = None;
+    /// Put a flat view of the model behind the sketch, or take it away.
+    pub(crate) fn set_sketch_backdrop(&mut self, ctx: &egui::Context, view: Option<String>) {
+        let Some(view) = view else {
+            self.sketch.backdrop = None;
+            return;
+        };
+        let shot = viewport::Shot { direction: view_direction(&view), only: None, section: None, flat: true };
+        match (self.viewport.flat_frame(), self.viewport.snapshot(&shot)) {
+            (Some((centre, half)), Ok(pixels)) => {
+                self.sketch.set_backdrop(ctx, &view, &pixels, viewport::SHOT_SIZE, centre, half);
+                self.worker_status = format!("Drawing over the {view} view, at true scale.");
             }
-            Err(e) => self.worker_status = format!("Couldn't use the sketch: {e:#}"),
+            (_, Err(e)) => self.worker_status = format!("Couldn't draw over the {view} view: {e:#}"),
+            (None, _) => self.worker_status = "There is no built part to draw over yet.".to_owned(),
+        }
+    }
+
+    /// The screenshot asked for by Attach to chat has arrived: cut the sketch out of
+    /// it and hand it to the chat with the written summary.
+    pub(crate) fn attach_sketch(&mut self, image: &egui::ColorImage, pixels_per_point: f32) {
+        let sketch::Capture::Waiting(area) = self.sketch.capture else { return };
+        self.sketch.capture = sketch::Capture::Idle;
+        let png = sketch::crop(image, area, pixels_per_point).and_then(|(pixels, width, height)| encode_png(&pixels, width, height).ok());
+        match png {
+            Some(png) => {
+                self.chat.attach_sketch(intercraft_tools::base64(&png), self.sketch.describe());
+                self.worker_status = "The sketch is attached. Type what you want in the chat and send.".to_owned();
+            }
+            None => self.worker_status = "Couldn't take a picture of the sketch.".to_owned(),
         }
     }
 
@@ -1557,6 +1543,33 @@ fn code_editor(
     apply.then(|| d.text.clone())
 }
 
+/// Camera direction of a named view, as (yaw, pitch) in radians. None for the user's own view.
+fn view_direction(view: &str) -> Option<(f32, f32)> {
+    let degrees = |yaw: f32, pitch: f32| Some((yaw.to_radians(), pitch.to_radians()));
+    match view {
+        "iso" => degrees(-50.0, 28.0),
+        "front" => degrees(-90.0, 0.0),
+        "back" => degrees(90.0, 0.0),
+        "right" => degrees(0.0, 0.0),
+        "left" => degrees(180.0, 0.0),
+        // Just off straight down, where the camera's "up" would be undefined.
+        "top" => degrees(-90.0, 89.9),
+        "bottom" => degrees(-90.0, -89.9),
+        _ => None,
+    }
+}
+
+fn encode_png(pixels: &[u8], width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(pixels)?;
+    writer.finish()?;
+    Ok(bytes)
+}
+
 /// What a click in the parts list asked for, applied once the list is drawn.
 enum PartAction {
     Select(String),
@@ -1739,14 +1752,10 @@ impl TabViewer for State {
                 self.chat.ui(ui, context);
             }
             Tab::Sketch => {
-                let selected = self.selected_part.clone();
-                match self.sketch.ui(ui, selected.as_deref()) {
-                    Some(sketch::SketchAction::Feature(made)) => self.sketch_feature(made),
-                    Some(sketch::SketchAction::ToChat(text)) => {
-                        self.chat.add_to_input(&text);
-                        self.worker_status = "The sketch is in the chat box. Say what to do with it and send.".to_owned();
-                    }
-                    None => {}
+                let can_attach = !self.chat.busy();
+                if let Some(sketch::SketchAction::Backdrop(view)) = self.sketch.ui(ui, can_attach) {
+                    let ctx = ui.ctx().clone();
+                    self.set_sketch_backdrop(&ctx, view);
                 }
             }
         }

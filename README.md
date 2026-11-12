@@ -55,9 +55,9 @@ To see the live update, leave the app open and change a value in `examples/brack
 | Panel | What it shows |
 |---|---|
 | Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it, click the eye to hide or show it, and right-click for Show only this, Show all, Rename, Duplicate, Lock, Unlock and Delete. Delete removes the selected part while the pointer is over the list. |
-| Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. Right-click a step to move it earlier or later, rename it or delete it. |
+| Timeline | The steps of the selected part, oldest first. Each card shows why the step is there (the design reason the model gave), or the prompt that made it. Click a step to see the part as it was then, or Latest to go back. Right-click a step to move it earlier or later, rename it or delete it. |
 | Sketch | A drawing pad for rough, annotated sketches that go to the model with a chat message, in a tab beside the 3D view. See Sketching below. |
-| Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. Placement, at the top, moves and turns the selected part in the assembly the same way. Code shows the step's snippet. Edit it and press Apply (Ctrl+Enter) to save and rebuild, or Revert to drop the edit. |
+| Inspector | The selected step's design reason ("Why"), prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. Placement, at the top, moves and turns the selected part in the assembly the same way. Code shows the step's snippet. Edit it and press Apply (Ctrl+Enter) to save and rebuild, or Revert to drop the edit. |
 
 ### Menus
 

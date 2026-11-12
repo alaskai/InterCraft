@@ -53,6 +53,7 @@ To see the live update, leave the app open and change a value in `examples/brack
 |---|---|
 | Parts | Every part in the project, with its viewport colour, build status and volume. Click one to select it, click the eye to hide or show it, and right-click for Show only this, Show all, Rename, Duplicate, Lock, Unlock and Delete. Delete removes the selected part while the pointer is over the list. |
 | Timeline | The steps of the selected part, oldest first, with the prompt that made each one. Click a step to see the part as it was then, or Latest to go back. Right-click a step to move it earlier or later, rename it or delete it. |
+| Sketch | A millimetre grid for drawing flat profiles, in a tab beside the 3D view. See Sketching below. |
 | Inspector | The selected step's prompt, parameters and numbers (volume, change, size, faces, build time). Drag a number to change it and watch the part rebuild as you drag. It is saved when you let go, as one undo step. Click a number to type an exact value. Placement, at the top, moves and turns the selected part in the assembly the same way. Code shows the step's snippet. Edit it and press Apply (Ctrl+Enter) to save and rebuild, or Revert to drop the edit. |
 
 ### Menus
@@ -84,6 +85,24 @@ New projects go in `Documents\InterCraft Projects` unless you pick another folde
 ### Measuring
 
 Turn on Measure and click a corner, edge or face. Corners and edges snap when the cursor is close. One click describes what you picked (an edge's length, a circle's diameter and centre, a corner's position). A second click gives the distance between the two, the X, Y and Z offsets, and the angle when both are straight edges or flat faces. The numbers come from the CAD kernel, so they are exact for corners and edges. A point on a curved face comes from the mesh, which is within 0.05 mm.
+
+### Sketching
+
+The Sketch tab is a 2D canvas on the XY plane. Everything snaps to the grid (0.5, 1 or 5 mm), so what you draw has exact numbers.
+
+| Tool | How |
+|---|---|
+| Line | Click points for an outline. Click the first point again, press Enter or double click to close it. |
+| Rectangle | Click two opposite corners. |
+| Circle | Click the centre, then a point on the circle. |
+| Erase | Click inside a shape to remove it. |
+
+A shape drawn inside another becomes a hole, shown in orange. Right drag pans, scroll zooms, Backspace removes the last point or shape and Esc cancels the shape being drawn.
+
+Then use the sketch one of two ways:
+
+- **Extrude it.** New part makes a part from it, and Add to or Cut from changes the selected part. The step it adds has `height` and `z` parameters, so you can drag both in the Inspector afterwards.
+- **Send to chat.** Puts the exact coordinates in the chat box as text, so you can tell the model what to do with the profile ("revolve this", "use it as the base and add a lip").
 
 ### Section view
 
@@ -252,10 +271,11 @@ Done:
 8. Section view, part placement, rename and duplicate, fit check, and pictures for the model
 9. Reordering, renaming and editing the code of steps, and CI
 10. OpenAI-compatible chat (OpenAI, OpenRouter, Ollama, LM Studio)
+11. Sketch panel: draw a profile, extrude it or send it to the chat
 
 Next:
 
-- Sketch panel
+- Sketching on a face of a part, and arcs and fillets in sketches
 - OS-level isolation for the geometry worker
 - Memory cap and stuck-build watchdog on macOS and Linux
 - Before and after overlay

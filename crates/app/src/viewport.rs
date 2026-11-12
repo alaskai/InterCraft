@@ -113,6 +113,17 @@ fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     )
 }
 
+/// Right-handed projection without perspective, centred on the view axis, 0..1 depth.
+fn orthographic(half_width: f32, half_height: f32, near: f32, far: f32) -> Mat4 {
+    let r = 1.0 / (near - far);
+    Mat4::from_cols(
+        Vec4::new(1.0 / half_width, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 1.0 / half_height, 0.0, 0.0),
+        Vec4::new(0.0, 0.0, r, 0.0),
+        Vec4::new(0.0, 0.0, r * near, 1.0),
+    )
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
@@ -230,6 +241,8 @@ struct Scene<'a> {
     show: Show<'a>,
     /// Draw the fit check's clash volumes.
     overlays: bool,
+    /// No perspective, like a drawing: sizes and positions keep their true proportions.
+    flat: bool,
 }
 
 /// A picture of the model for an LLM to look at (the `view_model` tool).
@@ -241,6 +254,9 @@ pub struct Shot {
     /// Show just this part.
     pub only: Option<String>,
     pub section: Option<Section>,
+    /// Draw without perspective. Right for side views, where perspective makes a
+    /// plain bore look like a countersink.
+    pub flat: bool,
 }
 
 /// Side of a snapshot in pixels. A multiple of 64, so rows need no padding to read back.
@@ -706,6 +722,7 @@ impl Viewport {
             section: self.section,
             show: Show::Visible,
             overlays: true,
+            flat: false,
         };
         let view_proj = self.draw(targets, &scene);
         self.frame = Some(Frame { view_proj, inverse: view_proj.inverse(), rect });
@@ -734,6 +751,7 @@ impl Viewport {
                 section: shot.section,
                 show,
                 overlays: false,
+                flat: shot.flat,
             },
             None => Scene {
                 target: self.target,
@@ -745,6 +763,7 @@ impl Viewport {
                 section: shot.section.or(self.section),
                 show,
                 overlays: true,
+                flat: false,
             },
         };
 
@@ -789,7 +808,13 @@ impl Viewport {
         let view = look_at(eye, scene.target, Vec3::Z);
         let near = (scene.distance * 0.01).max(0.01);
         let far = scene.distance * 20.0 + 1000.0;
-        let proj = perspective(45f32.to_radians(), scene.aspect, near, far);
+        let proj = if scene.flat {
+            // The same framing the perspective camera has at the target's distance.
+            let half = scene.distance * (45f32.to_radians() * 0.5).tan();
+            orthographic(half * scene.aspect, half, near, far)
+        } else {
+            perspective(45f32.to_radians(), scene.aspect, near, far)
+        };
         let view_proj = proj * view;
 
         // Lights follow the camera so the part never goes dark while orbiting.
@@ -1067,6 +1092,20 @@ mod tests {
         assert!((t.unwrap() - 5.0).abs() < 1e-5);
         assert!(ray_triangle(Vec3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, 1.0), a, b, c).is_none(), "hit behind");
         assert!(ray_triangle(Vec3::new(5.0, 5.0, 5.0), Vec3::new(0.0, 0.0, -1.0), a, b, c).is_none(), "hit outside");
+    }
+
+    #[test]
+    fn flat_projection_keeps_sizes() {
+        let view_proj = orthographic(50.0, 50.0, 1.0, 500.0) * look_at(Vec3::new(0.0, -100.0, 0.0), Vec3::ZERO, Vec3::Z);
+        let at = |p: Vec3| {
+            let clip = view_proj * p.extend(1.0);
+            clip.truncate() / clip.w
+        };
+        // The same offset lands on the same spot whether it is near or far.
+        let (near, far) = (at(Vec3::new(25.0, -40.0, 10.0)), at(Vec3::new(25.0, 40.0, 10.0)));
+        assert!((near.x - 0.5).abs() < 1e-5 && (near.y - 0.2).abs() < 1e-5);
+        assert!((near.x - far.x).abs() < 1e-5 && (near.y - far.y).abs() < 1e-5);
+        assert!(near.z < far.z && near.z > 0.0 && far.z < 1.0, "depth still orders them");
     }
 
     #[test]

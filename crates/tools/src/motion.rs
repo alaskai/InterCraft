@@ -85,25 +85,47 @@ pub fn summarise(joint: &Joint, data: &Value) -> Value {
         ranges.push(range_json(range));
     }
 
-    let closest = steps
+    // Every gap at every step. Parts that touch (a lid resting on its box) are listed
+    // apart, so they don't hide the smallest real gap.
+    let mut closest: Option<(f64, String, String, f64)> = None;
+    let mut touching: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        let at = step["at"].as_f64().unwrap_or(0.0);
+        for gap in step["gaps"].as_array().into_iter().flatten() {
+            let (a, b) = (gap["a"].as_str().unwrap_or("?"), gap["b"].as_str().unwrap_or("?"));
+            let clearance = gap["clearance"].as_f64().unwrap_or(f64::MAX);
+            if clearance < TOUCHING {
+                let pair = format!("{a} touches {b}");
+                match touching.iter_mut().find(|(p, _)| *p == pair) {
+                    Some((_, at)) => at.push(i),
+                    None => touching.push((pair, vec![i])),
+                }
+            } else if closest.as_ref().is_none_or(|c| clearance < c.3) {
+                closest = Some((at, a.to_owned(), b.to_owned(), clearance));
+            }
+        }
+    }
+    let at_of = |i: usize| steps[i]["at"].as_f64().unwrap_or(0.0);
+    let touch_text: Vec<String> = touching
         .iter()
-        .filter(|s| s["clashes"].as_array().is_none_or(|c| c.is_empty()))
-        .filter_map(|s| Some((s["at"].as_f64()?, s["closest"].as_object()?.clone())))
-        .min_by(|a, b| {
-            let gap = |c: &serde_json::Map<String, Value>| c["clearance"].as_f64().unwrap_or(f64::MAX);
-            gap(&a.1).total_cmp(&gap(&b.1))
-        });
+        .map(|(pair, indices)| {
+            let whole = indices.len() == steps.len();
+            let span = if whole {
+                "all the way".to_owned()
+            } else if indices.len() == 1 {
+                format!("at {}", num(at_of(indices[0])))
+            } else {
+                // Shown as one span from first to last; a gap in between is unusual.
+                format!("from {} to {}", num(at_of(indices[0])), num(at_of(*indices.last().unwrap_or(&0))))
+            };
+            format!("{pair} {span}")
+        })
+        .collect();
 
-    let summary = if ranges.is_empty() {
+    let mut summary = if ranges.is_empty() {
         let mut text = format!("{} moves freely from {} to {}.", joint.name, num(joint.min), num(joint.max));
-        if let Some((at, c)) = &closest {
-            text += &format!(
-                " Closest gap {} mm, between {} and {} at {}.",
-                c["clearance"],
-                c["a"].as_str().unwrap_or("?"),
-                c["b"].as_str().unwrap_or("?"),
-                num(*at)
-            );
+        if let Some((at, a, b, clearance)) = &closest {
+            text += &format!(" Closest gap {} mm, between {a} and {b} at {}.", plain_mm(*clearance), num(*at));
         }
         text
     } else {
@@ -123,6 +145,9 @@ pub fn summarise(joint: &Joint, data: &Value) -> Value {
             .collect();
         format!("{}: {}.", joint.name, parts.join("; "))
     };
+    if !touch_text.is_empty() {
+        summary += &format!(" {}.", touch_text.join("; "));
+    }
     let mut result = json!({
         "joint": joint.summary(),
         "clear": ranges.is_empty(),
@@ -131,10 +156,22 @@ pub fn summarise(joint: &Joint, data: &Value) -> Value {
         "checked": steps.len(),
         "note": format!("Checked every {}. A clash narrower than that can slip between checks.", num(every)),
     });
-    if let Some((at, c)) = closest {
-        result["closest"] = json!({ "at": at, "a": c["a"], "b": c["b"], "clearance": c["clearance"] });
+    if let Some((at, a, b, clearance)) = closest {
+        result["closest"] = json!({ "at": at, "a": a, "b": b, "clearance": clearance });
+    }
+    if !touch_text.is_empty() {
+        result["touching"] = json!(touch_text);
     }
     result
+}
+
+/// Closer than this counts as touching, not a gap.
+const TOUCHING: f64 = 0.01;
+
+/// A gap to two decimals, without trailing zeros.
+fn plain_mm(v: f64) -> String {
+    let r = (v * 100.0).round() / 100.0;
+    format!("{r}")
 }
 
 fn range_json((from, to, pairs, worst, worst_at): (f64, f64, Vec<String>, f64, f64)) -> Value {
@@ -168,8 +205,8 @@ mod tests {
 
     #[test]
     fn clashes_are_grouped_into_ranges() {
-        let gap = |at: f64, clearance: f64| json!({ "at": at, "clashes": [], "closest": { "a": "Lid", "b": "Box", "clearance": clearance } });
-        let hit = |at: f64, v: f64| json!({ "at": at, "clashes": [{ "a": "Lid", "b": "Wall", "overlap_volume": v }], "closest": null });
+        let gap = |at: f64, clearance: f64| json!({ "at": at, "clashes": [], "gaps": [{ "a": "Lid", "b": "Box", "clearance": clearance }] });
+        let hit = |at: f64, v: f64| json!({ "at": at, "clashes": [{ "a": "Lid", "b": "Wall", "overlap_volume": v }], "gaps": [] });
         let data = json!({ "steps": [gap(0.0, 0.5), gap(30.0, 2.0), hit(60.0, 10.0), hit(90.0, 80.0), gap(120.0, 1.0)] });
         let result = summarise(&joint(), &data);
         assert_eq!(result["clear"], false);
@@ -179,5 +216,22 @@ mod tests {
 
         let free = summarise(&joint(), &json!({ "steps": [gap(0.0, 0.5), gap(120.0, 0.25)] }));
         assert_eq!(free["summary"], "Lid hinge moves freely from 0° to 120°. Closest gap 0.25 mm, between Lid and Box at 120°.");
+    }
+
+    #[test]
+    fn resting_contact_does_not_hide_a_tight_gap() {
+        // Shut, the lid sits on the box; all the way round, it runs 0.15 mm from the pin.
+        let step = |at: f64, on_box: f64| {
+            json!({ "at": at, "clashes": [], "gaps": [
+                { "a": "Lid", "b": "Box", "clearance": on_box },
+                { "a": "Lid", "b": "Pin", "clearance": 0.15 },
+            ] })
+        };
+        let result = summarise(&joint(), &json!({ "steps": [step(0.0, 0.0), step(60.0, 3.0), step(120.0, 0.4)] }));
+        assert_eq!(
+            result["summary"],
+            "Lid hinge moves freely from 0° to 120°. Closest gap 0.15 mm, between Lid and Pin at 0°. Lid touches Box at 0°."
+        );
+        assert_eq!(result["touching"], json!(["Lid touches Box at 0°"]));
     }
 }

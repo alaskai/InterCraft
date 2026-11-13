@@ -85,7 +85,7 @@ impl PrintCheck {
         if problems.is_empty() {
             ui.colored_label(egui::Color32::from_rgb(70, 170, 90), "Ready to print: no thin walls, tiny holes or unsupported overhangs.");
         }
-        egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("print results").max_height(150.0).show(ui, |ui| {
             for (i, problem) in problems.iter().enumerate() {
                 ui.horizontal_wrapped(|ui| {
                     ui.strong(format!("{}.", i + 1));

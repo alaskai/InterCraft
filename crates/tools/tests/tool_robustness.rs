@@ -459,6 +459,10 @@ fn check_motion_finds_where_a_lid_hits_the_wall() {
     let free = host.call("check_motion", &json!({ "joint": "Lid hinge", "steps": 12 })).unwrap();
     assert_eq!(free["clear"], true, "{free}");
     assert!(free["summary"].as_str().unwrap().starts_with("Lid hinge moves freely from 0° to 110°."), "{free}");
+    // The hinge line is the box's top back edge, so the lid touches it the whole way.
+    // That is a contact, reported apart, not a "0 mm" closest gap.
+    assert_eq!(free["touching"], json!(["Lid touches Box all the way"]), "{free}");
+    assert!(free.get("closest").is_none(), "{free}");
 
     // A wall 1 mm behind the open lid: fine at 90°, hit once it opens further.
     host.call("add_part", &json!({ "name": "Wall" })).unwrap();

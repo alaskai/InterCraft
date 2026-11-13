@@ -378,6 +378,8 @@ pub struct Viewport {
     meshes: BTreeMap<String, GpuMesh>,
     pub show_edges: bool,
     pub section: Option<Section>,
+    /// Leave out the clash volumes, which only fit the parts where they were checked.
+    pub hide_overlays: bool,
     frame: Option<Frame>,
 
     // Orbit camera
@@ -561,6 +563,7 @@ impl Viewport {
             meshes: BTreeMap::new(),
             show_edges: true,
             section: None,
+            hide_overlays: false,
             frame: None,
             target: Vec3::ZERO,
             yaw: -0.9,
@@ -799,7 +802,7 @@ impl Viewport {
             background: if dark { 0.11 } else { 0.86 },
             section: self.section,
             show: Show::Visible,
-            overlays: true,
+            overlays: !self.hide_overlays,
             flat: false,
         };
         let view_proj = self.draw(targets, &scene);

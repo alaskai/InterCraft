@@ -410,7 +410,7 @@ def sweep(req):
     boxes = {name: shape.bounding_box() for name, shape in still.items()}
     steps = []
     for i, value in enumerate(req["values"]):
-        clashes, closest = [], None
+        clashes, gaps = [], []
         for a, (shape, moves) in moving.items():
             placed = place(shape, moves[i])
             box = placed.bounding_box()
@@ -422,10 +422,9 @@ def sweep(req):
                     if volume > 1e-6:
                         clashes.append({"a": a, "b": b, "overlap_volume": round(volume, 3)})
                         continue
-                distance = placed.distance_to(other)
-                if closest is None or distance < closest["clearance"]:
-                    closest = {"a": a, "b": b, "clearance": round(distance, 4)}
-        steps.append({"at": value, "clashes": clashes, "closest": closest})
+                # Every pair, so a part resting on another doesn't hide a tight gap elsewhere.
+                gaps.append({"a": a, "b": b, "clearance": round(placed.distance_to(other), 4)})
+        steps.append({"at": value, "clashes": clashes, "gaps": gaps})
         send({"id": req["id"], "event": "progress"})
     send({"id": req["id"], "event": "info", "data": {"steps": steps}})
 

@@ -1079,6 +1079,19 @@ fn joints_move_in_the_motion_panel() {
     h.step();
     assert!((depth(&h) - 40.0).abs() < 0.01);
     shot(&mut h, "motion_panel");
+
+    // The copy sits inside the bracket at every angle, so the range check finds a clash.
+    click(&mut h, "Check");
+    wait_until(&mut h, "the range check", |app| {
+        matches!(app.state.motion.check("Arm pivot"), Some(motion::Check::Done(..) | motion::Check::Failed(_)))
+    });
+    let Some(motion::Check::Done(text, clear)) = h.state().state.motion.check("Arm pivot").cloned() else {
+        panic!("the check failed: {:?}", h.state().state.motion.check("Arm pivot"));
+    };
+    assert!(!clear && text.starts_with("Arm and RodBracket clash from 0° to 90°"), "{text}");
+    h.step();
+    h.get_by_label_contains("clash from 0° to 90°");
+    shot(&mut h, "motion_check");
 }
 
 #[test]

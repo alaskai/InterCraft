@@ -73,6 +73,7 @@ pub fn tool_purpose(name: &str) -> &'static str {
         "add_joint" => "Lets one part move against another: a hinge turns it, a slider slides it.",
         "edit_joint" => "Changes a joint, or moves it to a new position to check that pose.",
         "delete_joint" => "Removes a joint, so the parts no longer move.",
+        "check_motion" => "Moves a joint through its whole range and checks that nothing hits anything on the way.",
         "undo" => "Steps back one change.",
         "redo" => "Steps forward again after an undo.",
         "ask_user" => "Asks you to choose, because the decision is yours.",
@@ -136,6 +137,7 @@ pub fn caption(name: &str, input: &Value, level: Explain) -> Option<String> {
             None => format!("Changing {}", text("name").unwrap_or("a joint")),
         },
         "delete_joint" => format!("Removing {}", text("name").unwrap_or("a joint")),
+        "check_motion" => format!("Checking {} through its whole range", text("joint").unwrap_or("the joint")),
         _ => return None,
     };
     // Checks get a word on why they matter, for someone new to this.
@@ -145,6 +147,7 @@ pub fn caption(name: &str, input: &Value, level: Explain) -> Option<String> {
         (Explain::Beginner, "inspect_part") => " (exact sizes before changing anything)",
         (Explain::Beginner, "fastener_info") => " (from the standard tables, not from memory)",
         (Explain::Beginner, "edit_joint") if input["at"].is_number() => " (to check that pose)",
+        (Explain::Beginner, "check_motion") => " (a moving part must not hit anything on its way)",
         _ => "",
     };
     Some(format!("{line}{extra}"))

@@ -135,7 +135,7 @@ A joint lets one part move against another. A hinge turns it about an axis (a li
 
 Each joint keeps its current position. Everything is shown there, and measuring and the fit check see that pose too, so the model can open a lid and check it clears the box. The moving part's placement is where it sits with its joint at 0. Exports always use that rest position, wherever a joint was left. The Inspector says which joint moves the selected part and where it is.
 
-**Motion** (on the viewport toolbar once the project has a joint) lists every joint with a slider and draws each axis as a dashed line. Dragging a slider moves the parts straight away without rebuilding them, and letting go saves the new position as one undo step. **Play** sweeps a joint through its whole range and back without saving anything, which is a quick way to see a mechanism work.
+**Motion** (on the viewport toolbar once the project has a joint) lists every joint with a slider and draws each axis as a dashed line. Dragging a slider moves the parts straight away without rebuilding them, and letting go saves the new position as one undo step. **Play** sweeps a joint through its whole range and back without saving anything, which is a quick way to see a mechanism work. **Check** moves the joint through its range in steps on the real CAD shapes and says whether the parts it moves hit anything on the way: green with the closest gap when it moves freely, red with the clashing parts and the range where they clash when it doesn't. The model has the same check as `check_motion` and is told to run it after changing a joint or a moving part.
 
 ### Print check
 
@@ -224,6 +224,7 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `print_check` | Thin walls, small holes and overhangs that would need support, with positions and a rough PLA weight |
 | `check_fit` | Clashes (with volume) and clearances between parts |
 | `add_joint`, `edit_joint`, `delete_joint` | Hinges and sliders between parts, and moving them to check a pose |
+| `check_motion` | Sweeps a joint through its range and reports where its parts clash, or the closest gap if they don't |
 | `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing one part. The six side views are drawn flat, like a drawing |
 | `undo`, `redo` | Step back or forward through the project history |
 | `inspect_part` | Faces, holes and circular edges of a part with exact sizes and positions |

@@ -80,6 +80,7 @@ struct App {
     state: State,
     settings_open: bool,
     new_project: Option<menus::NewProjectDialog>,
+    /// A folder picked with File > Open that isn't a project yet, offered to make into one.
     make_project: Option<PathBuf>,
     /// Window focus last frame, to notice when the user comes back to this window.
     was_focused: bool,
@@ -125,6 +126,9 @@ struct State {
     mesh_pose: HashMap<String, Pose>,
     /// The Motion panel: joint sliders and Play.
     motion: motion::Motion,
+    /// Where the viewport toolbar was drawn last frame, so panels can keep clear of it.
+    toolbar: egui::Rect,
+    /// The app itself is saving a change, so it needs no caption.
     own_edit: bool,
     hidden: HashSet<String>,
     /// Undo history of the open project, refreshed on every reload.
@@ -195,6 +199,7 @@ impl App {
             poses: HashMap::new(),
             mesh_pose: HashMap::new(),
             motion: motion::Motion::default(),
+            toolbar: egui::Rect::NOTHING,
             own_edit: false,
             hidden: HashSet::new(),
             history: HistoryInfo::default(),
@@ -667,10 +672,11 @@ impl State {
             }
         }
 
-        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(720.0, 30.0));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+        let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2((rect.width() - 16.0).max(80.0), 30.0));
+        let used = ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
             egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
-                ui.horizontal(|ui| {
+                // Wraps onto a second row in a narrow window rather than running off the edge.
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Fit").on_hover_text("Fit to view (F, or double click)").clicked() {
                         self.viewport.fit();
                     }
@@ -709,11 +715,12 @@ impl State {
                 });
             });
         });
+        self.toolbar = used.response.rect;
 
         self.section_panel(ui, rect);
-        self.fit_panel(ui, rect);
-        self.print_panel(ui, rect);
-        self.motion_panel(ui, rect);
+        let fit = self.fit_panel(ui, rect);
+        let print = self.print_panel(ui, rect);
+        self.motion_panel(ui, rect, print, fit);
         self.caption_ui(ui, rect);
 
         if !self.measure.active {
@@ -760,7 +767,7 @@ impl State {
             }
         }
 
-        let panel = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 46.0), egui::vec2(320.0, 170.0));
+        let panel = egui::Rect::from_min_size(egui::pos2(rect.left() + 8.0, self.below_toolbar(rect)), egui::vec2(320.0, 170.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_max_width(300.0);
@@ -930,9 +937,13 @@ impl State {
     }
 
     /// The print check's findings, bottom left of the viewport, with numbered markers.
-    fn print_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+    /// Returns where the panel was drawn, so the Motion panel can keep clear of it.
+    fn print_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) -> Option<egui::Rect> {
         let can_ask = self.chat.can_ask();
-        let Some(check) = &mut self.print_check else { return };
+        // Narrower when the Motion panel shares the bottom edge.
+        let room = rect.width() - 68.0 - if self.motion.open { 296.0 } else { 0.0 };
+        let width = room.clamp(260.0, 380.0).min(rect.width() - 16.0);
+        let Some(check) = &mut self.print_check else { return None };
         let painter = ui.painter_at(rect);
         for (number, at, kind) in check.markers() {
             let Some(spot) = self.viewport.project(at) else { continue };
@@ -944,17 +955,19 @@ impl State {
             painter.circle(spot, 9.0, colour, egui::Stroke::new(1.5, egui::Color32::WHITE));
             painter.text(spot, egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::proportional(11.0), egui::Color32::WHITE);
         }
-        let panel = egui::Rect::from_min_size(rect.left_bottom() + egui::vec2(60.0, -238.0), egui::vec2(380.0, 230.0));
+        let left = if width + 68.0 <= rect.width() { 60.0 } else { 8.0 };
+        let panel = egui::Rect::from_min_size(rect.left_bottom() + egui::vec2(left, -238.0), egui::vec2(width, 230.0));
         let mut action = None;
-        ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
+        let used = ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_width(360.0);
+                ui.set_width(width - 20.0);
                 action = check.panel_ui(ui, can_ask);
             });
         });
         if let Some(print_panel::PrintAction::Ask(question)) = action {
             self.ask_chat(&question);
         }
+        Some(used.response.rect)
     }
 
     /// The project as shown right now: saved, or with a joint being dragged or played.
@@ -993,7 +1006,7 @@ impl State {
 
     /// Joint sliders and Play, bottom right of the viewport, with each joint's axis
     /// drawn in the 3D view.
-    fn motion_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+    fn motion_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect, print: Option<egui::Rect>, fit: Option<egui::Rect>) {
         if !self.motion.open {
             return;
         }
@@ -1002,7 +1015,16 @@ impl State {
         let Some(loaded) = &self.project else { return };
         let rows = loaded.project.joints.len().max(1) as f32;
         let height = (64.0 + rows * 72.0).min(rect.height() - 60.0);
-        let panel = egui::Rect::from_min_size(rect.right_bottom() + egui::vec2(-288.0, -height - 8.0), egui::vec2(280.0, height));
+        let mut panel = egui::Rect::from_min_size(rect.right_bottom() + egui::vec2(-288.0, -height - 8.0), egui::vec2(280.0, height));
+        // Too narrow to sit beside the print check: stack on top of it, as long as that
+        // keeps clear of the toolbar and the fit panel. A tiny view can't fit them all.
+        if let Some(other) = print.filter(|r| r.intersects(panel)) {
+            let stacked = panel.translate(egui::vec2(0.0, other.top() - 8.0 - panel.bottom()));
+            let ceiling = fit.filter(|f| f.x_range().intersects(stacked.x_range())).map_or(self.below_toolbar(rect), |f| f.bottom() + 8.0);
+            if stacked.top() >= ceiling {
+                panel = stacked;
+            }
+        }
         let mut action = None;
         ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -1115,13 +1137,14 @@ impl State {
 
     /// Results of the fit check, with the gap of the
     /// row under the pointer drawn in the 3D view.
-    fn fit_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let Some(fit) = &mut self.fit else { return };
+    /// Returns where the panel was drawn.
+    fn fit_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) -> Option<egui::Rect> {
         // Top right, under the section controls when those are showing.
-        let top = if self.viewport.section.is_some() { 78.0 } else { 8.0 };
-        let panel = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-328.0, top), egui::vec2(320.0, 220.0));
+        let top = self.right_column_top(rect) + if self.viewport.section.is_some() { 70.0 } else { 0.0 };
+        let Some(fit) = &mut self.fit else { return None };
+        let panel = egui::Rect::from_min_size(egui::pos2(rect.right() - 328.0, top), egui::vec2(320.0, 220.0));
         let mut hovered = None;
-        ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
+        let used = ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_width(300.0);
                 hovered = fit.panel_ui(ui);
@@ -1135,6 +1158,19 @@ impl State {
                 painter.circle_filled(sb, 3.5, egui::Color32::from_rgb(40, 190, 230));
             }
         }
+        Some(used.response.rect)
+    }
+
+    /// Just under the toolbar, wherever it ended up.
+    fn below_toolbar(&self, rect: egui::Rect) -> f32 {
+        self.toolbar.bottom().max(rect.top() + 38.0) + 8.0
+    }
+
+    /// Where the panels down the right side start: level with the toolbar when there
+    /// is room beside it, otherwise under it, so they never cover its buttons.
+    fn right_column_top(&self, rect: egui::Rect) -> f32 {
+        let room = self.toolbar.right() + 8.0 + 330.0 <= rect.right();
+        if room || self.toolbar.is_negative() { rect.top() + 8.0 } else { self.below_toolbar(rect) }
     }
 
     /// What is being done to the model right now, at the bottom of the 3D view.
@@ -1158,7 +1194,7 @@ impl State {
         let (Some(mut section), Some((lo, hi))) = (self.viewport.section, self.viewport.visible_bounds()) else {
             return;
         };
-        let panel = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-268.0, 8.0), egui::vec2(260.0, 90.0));
+        let panel = egui::Rect::from_min_size(egui::pos2(rect.right() - 268.0, self.right_column_top(rect)), egui::vec2(260.0, 90.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {

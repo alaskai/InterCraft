@@ -151,6 +151,15 @@ Each problem is numbered on the part. **Ask why** sends it to the chat, so the m
 
 File > Import STEP (or the button under the parts list) copies the file into the project's `imports` folder and adds a part that starts from it. The import is step 1 on the timeline, and the model can add features on top of it: holes, pockets, fillets. Right-click a part to lock it as a reference (so the model designs around it but can't change it) or unlock it for editing.
 
+If the file holds several bodies (an assembly from Fusion, Onshape or SolidWorks), InterCraft lists them and asks how to bring them in:
+
+| Choice | What you get |
+|---|---|
+| Separate parts in a group | One part per body, named from the file, under a folder in the parts list. Each body keeps its place in the assembly and can be moved, put on a joint, fit checked or edited. Their files go in `imports/<group>/`. Up to 500 bodies. |
+| One part | The whole file as a single part, as before. |
+
+Right-click a group to hide, isolate, rename or delete it. A big assembly can take a minute or two to read and mesh.
+
 ### Undo and history
 
 Every change is recorded, whoever made it: you in the app, the chat panel, or an agent through MCP. Edit > Undo steps back one change and Edit > History jumps to any point, so a bad edit from the model costs nothing. Edits made in a text editor are kept too. Undo reverts them as one step instead of losing them.

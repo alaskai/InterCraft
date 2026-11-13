@@ -77,6 +77,9 @@ pub struct Part {
     /// An imported STEP file the part starts from, e.g. "imports/bracket.step".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The imported assembly this part came out of, shown as a folder in the parts list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Where the part sits in the assembly, in mm. Features are written in the
     /// part's own frame and never see this.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -98,6 +101,7 @@ impl Part {
             name: name.to_owned(),
             kind: PartKind::Design,
             source,
+            group: None,
             position: [0.0; 3],
             rotation: [0.0; 3],
             features: Vec::new(),
@@ -114,6 +118,20 @@ impl Part {
 
 /// Largest STEP file accepted for import.
 pub const MAX_IMPORT_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Most bodies one STEP file can be split into. Each one becomes a part to build.
+pub const MAX_SPLIT_BODIES: usize = 500;
+
+/// Where each body of a split STEP import goes. Made by `plan_split_import`; the
+/// worker writes the files, then `add_split_import` adds the parts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitImport {
+    pub group: String,
+    /// The folder inside imports/ that the body files go in.
+    pub folder: PathBuf,
+    /// Part name and file (relative to the project) for each body, in the file's order.
+    pub parts: Vec<(String, String)>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Feature {
@@ -410,28 +428,8 @@ impl LoadedProject {
     /// Copy a STEP file into the project's imports folder and add a part that starts
     /// from it. Returns the new part's name. Call `save` afterwards.
     pub fn import_step(&mut self, file: &Path) -> Result<String> {
-        let ext = file.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-        if ext != "step" && ext != "stp" {
-            bail!("only .step and .stp files can be imported");
-        }
-        let size = std::fs::metadata(file).with_context(|| format!("reading {}", file.display()))?.len();
-        if size > MAX_IMPORT_BYTES {
-            bail!("that file is {} MB; the limit is {} MB", size >> 20, MAX_IMPORT_BYTES >> 20);
-        }
-
-        // A part name from the file name, made safe and unique.
-        let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut base: String = stem
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-            .collect::<String>()
-            .trim_matches('_')
-            .chars()
-            .take(48)
-            .collect();
-        if base.is_empty() || check_part_name(&base).is_err() {
-            base = "Imported".to_owned();
-        }
+        let ext = check_step_file(file)?;
+        let base = plain_name(&file.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(), "Imported");
         let taken = |name: &str| self.project.parts.iter().any(|p| p.name.eq_ignore_ascii_case(name));
         let mut name = base.clone();
         let mut n = 2;
@@ -446,6 +444,107 @@ impl LoadedProject {
         std::fs::copy(file, &target).with_context(|| format!("copying into {}", target.display()))?;
         self.project.parts.push(Part::new(&name, Some(relative)));
         Ok(name)
+    }
+
+    /// Plan splitting a STEP file into one part per body. `bodies` are the body names
+    /// the worker found, in order. Nothing is written yet.
+    pub fn plan_split_import(&self, file: &Path, bodies: &[String]) -> Result<SplitImport> {
+        check_step_file(file)?;
+        if bodies.is_empty() {
+            bail!("the STEP file has no solid bodies");
+        }
+        if bodies.len() > MAX_SPLIT_BODIES {
+            bail!(
+                "that file has {} bodies; up to {MAX_SPLIT_BODIES} can be split into parts. Import it as one part instead",
+                bodies.len()
+            );
+        }
+        let stem = plain_name(&file.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(), "Imported");
+        let mut folder = stem.clone();
+        let mut n = 2;
+        while self.dir.join("imports").join(&folder).exists() || self.groups().contains(&folder.as_str()) {
+            folder = format!("{stem}_{n}");
+            n += 1;
+        }
+
+        // Repeated bodies (a box of identical screws) get numbered.
+        let mut taken: HashSet<String> = self.project.parts.iter().map(|p| p.name.to_ascii_lowercase()).collect();
+        let mut parts = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            let base = plain_name(body, &format!("Body_{}", i + 1));
+            let mut name = base.clone();
+            let mut n = 2;
+            while taken.contains(&name.to_ascii_lowercase()) {
+                let suffix = format!("_{n}");
+                name = format!("{}{suffix}", base.chars().take(64 - suffix.len()).collect::<String>());
+                n += 1;
+            }
+            taken.insert(name.to_ascii_lowercase());
+            parts.push((name.clone(), format!("imports/{folder}/{name}.step")));
+        }
+        Ok(SplitImport { group: folder.clone(), folder: self.dir.join("imports").join(&folder), parts })
+    }
+
+    /// Add the parts of a split import once the worker has written every body's file.
+    /// Call `save` afterwards.
+    pub fn add_split_import(&mut self, split: &SplitImport) -> Result<()> {
+        check_group_name(&split.group)?;
+        for (name, source) in &split.parts {
+            check_part_name(name)?;
+            check_import_path(source)?;
+            if self.project.parts.iter().any(|p| p.name.eq_ignore_ascii_case(name)) {
+                bail!("a part named '{name}' already exists");
+            }
+            if !self.dir.join(source).is_file() {
+                bail!("{source} wasn't written");
+            }
+        }
+        for (name, source) in &split.parts {
+            let mut part = Part::new(name, Some(source.clone()));
+            part.group = Some(split.group.clone());
+            self.project.parts.push(part);
+        }
+        Ok(())
+    }
+
+    /// Group names in the order their first part appears.
+    pub fn groups(&self) -> Vec<&str> {
+        let mut groups: Vec<&str> = Vec::new();
+        for group in self.project.parts.iter().filter_map(|p| p.group.as_deref()) {
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+        groups
+    }
+
+    /// Rename a group. Only the label changes; the files stay where they are.
+    pub fn rename_group(&mut self, old: &str, new: &str) -> Result<()> {
+        let new = new.trim();
+        check_group_name(new)?;
+        if !self.groups().contains(&old) {
+            bail!("no group named '{old}'");
+        }
+        if new != old && self.groups().contains(&new) {
+            bail!("a group named '{new}' already exists");
+        }
+        for part in self.project.parts.iter_mut().filter(|p| p.group.as_deref() == Some(old)) {
+            part.group = Some(new.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Remove every part in a group, as `remove_part` does for each.
+    pub fn remove_group(&mut self, group: &str) -> Result<()> {
+        let names: Vec<String> =
+            self.project.parts.iter().filter(|p| p.group.as_deref() == Some(group)).map(|p| p.name.clone()).collect();
+        if names.is_empty() {
+            bail!("no group named '{group}'");
+        }
+        for name in names {
+            self.remove_part(&name)?;
+        }
+        Ok(())
     }
 
     /// Remove a part and its snippets. An imported STEP file stays in the imports
@@ -720,6 +819,9 @@ fn check_project(project: &Project) -> Result<()> {
         if let Some(source) = &part.source {
             check_import_path(source)?;
         }
+        if let Some(group) = &part.group {
+            check_group_name(group)?;
+        }
         if !part_names.insert(part.name.to_ascii_lowercase()) {
             bail!("project.json lists the part '{}' twice", part.name);
         }
@@ -764,13 +866,50 @@ fn check_snippet_path(file: &str) -> Result<()> {
     Ok(())
 }
 
-/// An imported file must sit directly in the project's imports folder.
+/// A STEP file the user picked: right extension and not too big. Returns the
+/// extension in lower case.
+fn check_step_file(file: &Path) -> Result<String> {
+    let ext = file.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if ext != "step" && ext != "stp" {
+        bail!("only .step and .stp files can be imported");
+    }
+    let size = std::fs::metadata(file).with_context(|| format!("reading {}", file.display()))?.len();
+    if size > MAX_IMPORT_BYTES {
+        bail!("that file is {} MB; the limit is {} MB", size >> 20, MAX_IMPORT_BYTES >> 20);
+    }
+    Ok(ext)
+}
+
+/// A part or folder name made from any text (a file name, a body's label in a STEP
+/// file), or `fallback` when nothing usable is left.
+fn plain_name(text: &str, fallback: &str) -> String {
+    let name: String = text
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .chars()
+        .take(48)
+        .collect();
+    if name.is_empty() || check_part_name(&name).is_err() { fallback.to_owned() } else { name }
+}
+
+/// Group names are only shown, never used as paths, so anything readable will do.
+fn check_group_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        bail!("a group name must be 1 to 64 characters");
+    }
+    Ok(())
+}
+
+/// An imported file must sit in the project's imports folder, or one folder inside it
+/// (the bodies of a split assembly).
 fn check_import_path(source: &str) -> Result<()> {
     let path = Path::new(source);
     let parts: Vec<_> = path.components().collect();
-    let in_imports = parts.len() == 2
+    let in_imports = (2..=3).contains(&parts.len())
         && matches!(parts[0], Component::Normal(first) if first == "imports")
-        && matches!(parts[1], Component::Normal(_));
+        && parts[1..].iter().all(|c| matches!(c, Component::Normal(_)));
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
     if !in_imports || !matches!(ext.as_deref(), Some("step") | Some("stp")) {
         bail!("imported file '{source}' must be a .step or .stp file in the project's imports folder");
@@ -1031,11 +1170,63 @@ mod tests {
     #[test]
     fn load_refuses_imports_outside_the_imports_folder() {
         let p = temp_project("import-paths");
-        for source in ["../x.step", "C:/x.step", "imports/../../x.step", "imports/x.txt", "x.step", "imports/a/b.step"] {
+        let bad = ["../x.step", "C:/x.step", "imports/../../x.step", "imports/x.txt", "x.step", "imports/a/b/c.step", "imports/a/../../x.step"];
+        for source in bad {
             let json = format!(r#"{{"name":"T","parts":[{{"name":"P","source":"{source}","features":[]}}]}}"#);
             std::fs::write(p.dir.join("project.json"), json).unwrap();
             assert!(LoadedProject::load(&p.dir).is_err(), "accepted {source}");
         }
+        // One folder down is where a split assembly's bodies go.
+        let json = r#"{"name":"T","parts":[{"name":"P","source":"imports/Kit/P.step","group":"Kit","features":[]}]}"#;
+        std::fs::write(p.dir.join("project.json"), json).unwrap();
+        assert!(LoadedProject::load(&p.dir).is_ok());
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn a_split_import_becomes_a_group_of_parts() {
+        let mut p = temp_project("split");
+        p.add_part("Bolt").unwrap();
+        p.save().unwrap();
+        let src = p.dir.join("Gear box (v3).step");
+        std::fs::write(&src, "ISO-10303-21;").unwrap();
+        let bodies: Vec<String> = ["Housing", "Bolt", "Bolt", "M3 screw (1)", "", "Bolt"].map(String::from).to_vec();
+        let split = p.plan_split_import(&src, &bodies).unwrap();
+        assert_eq!(split.group, "Gear_box__v3");
+        let names: Vec<&str> = split.parts.iter().map(|(n, _)| n.as_str()).collect();
+        // "Bolt" is already a part, so every copy is numbered; a blank label gets a stand-in.
+        assert_eq!(names, ["Housing", "Bolt_2", "Bolt_3", "M3_screw__1", "Body_5", "Bolt_4"]);
+        assert_eq!(split.parts[0].1, "imports/Gear_box__v3/Housing.step");
+
+        // The worker hasn't written the files yet, so nothing is added.
+        assert!(p.add_split_import(&split).is_err());
+        assert_eq!(p.project.parts.len(), 1);
+        std::fs::create_dir_all(&split.folder).unwrap();
+        for (_, source) in &split.parts {
+            std::fs::write(p.dir.join(source), "ISO-10303-21;").unwrap();
+        }
+        p.add_split_import(&split).unwrap();
+        p.save().unwrap();
+        assert_eq!(p.history().undo_label(), Some("Import 'Gear_box__v3' (6 parts)"));
+        assert_eq!(p.groups(), ["Gear_box__v3"]);
+
+        // Importing the same file again makes a second group in its own folder.
+        let again = p.plan_split_import(&src, &bodies[..1]).unwrap();
+        assert_eq!((again.group.as_str(), again.parts[0].0.as_str()), ("Gear_box__v3_2", "Housing_2"));
+        assert!(p.plan_split_import(&src, &vec!["X".to_owned(); MAX_SPLIT_BODIES + 1]).is_err());
+
+        p.rename_group("Gear_box__v3", "Gear box").unwrap();
+        p.save().unwrap();
+        assert_eq!(p.history().undo_label(), Some("Rename group 'Gear_box__v3' to 'Gear box'"));
+        let loaded = LoadedProject::load(&p.dir).unwrap();
+        assert_eq!(loaded.project.parts[1].group.as_deref(), Some("Gear box"));
+
+        p.remove_group("Gear box").unwrap();
+        p.save().unwrap();
+        assert_eq!(p.history().undo_label(), Some("Delete 'Gear box' (6 parts)"));
+        assert_eq!(p.project.parts.len(), 1);
+        p.undo().unwrap();
+        assert_eq!(p.project.parts.len(), 7);
         std::fs::remove_dir_all(&p.dir).unwrap();
     }
 

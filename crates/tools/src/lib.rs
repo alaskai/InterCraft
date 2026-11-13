@@ -44,6 +44,7 @@ Working method:
 Imported parts and measuring:
 - A part can start from an imported STEP file (its first step is "import"). In the first feature after it, `part` is that imported shape, so cuts, holes and fillets work on it like any other.
 - Before editing an imported part, call inspect_part to find its faces, holes and their exact positions instead of guessing.
+- An imported assembly can be split into one part per body, all with the same `group`. get_project lists untouched bodies briefly (where they sit); each is a normal part to place, joint, check or edit.
 - Use measure to check clearances, hole spacing and wall thickness after a change.
 
 Assemblies:
@@ -662,7 +663,11 @@ impl ToolHost {
             "get_project" => {
                 let mut parts = Vec::new();
                 for part in &project.project.parts {
-                    parts.push(self.build_report(&project, part, true)?);
+                    let report = self.build_report(&project, part, true)?;
+                    // A split assembly can be hundreds of untouched bodies; where each
+                    // one sits is what matters until it's edited.
+                    let untouched = part.group.is_some() && part.features.is_empty();
+                    parts.push(if untouched { brief_report(report) } else { report });
                 }
                 Ok(json!({
                     "name": project.project.name,
@@ -1161,12 +1166,33 @@ impl ToolHost {
         if let Some(source) = &part.source {
             report["imported_from"] = source.clone().into();
         }
+        if let Some(group) = &part.group {
+            report["group"] = group.clone().into();
+        }
         if !all_ok {
             report["note"] =
                 "The change is saved but the part does not build cleanly. Fix it with edit_feature or delete_feature.".into();
         }
         Ok(report)
     }
+}
+
+/// A build report cut down to the part's name, group, state and where it sits.
+fn brief_report(full: Value) -> Value {
+    let mut brief = json!({});
+    for key in ["part", "group", "kind", "ok", "imported_from", "position_mm", "rotation_deg", "moved_by"] {
+        if let Some(v) = full.get(key) {
+            brief[key] = v.clone();
+        }
+    }
+    if let Some(step) = full["features"].as_array().and_then(|f| f.last()) {
+        for key in ["size_mm", "bbox_min", "bbox_max", "error"] {
+            if let Some(v) = step.get(key) {
+                brief[key] = v.clone();
+            }
+        }
+    }
+    brief
 }
 
 /// Everything the worker needs to build a part: the imported file first, if any,

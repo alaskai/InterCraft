@@ -2,7 +2,7 @@
 // kept as a numbered snapshot in .intercraft/history, so a change made by the user,
 // the chat panel or an MCP client can be stepped back and forth.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -282,6 +282,10 @@ impl LoadedProject {
 }
 
 /// A short description of what changed between two versions of a project.
+fn parts_count(n: usize) -> String {
+    if n == 1 { "1 part".to_owned() } else { format!("{n} parts") }
+}
+
 fn describe(before: &Content, after: &Content) -> String {
     let (old, new) = (&before.project, &after.project);
     // Same parts in the same places with one name changed is a rename.
@@ -300,7 +304,49 @@ fn describe(before: &Content, after: &Content) -> String {
     if old.name != new.name {
         changes.push(format!("Rename project to '{}'", new.name));
     }
+    // A whole group arriving, leaving or being renamed is one change, not one per part.
+    let mut whole: HashSet<&str> = HashSet::new();
+    let group_of = |parts: &[crate::Part], group: &str| -> Vec<String> {
+        parts.iter().filter(|p| p.group.as_deref() == Some(group)).map(|p| p.name.clone()).collect()
+    };
+    let group_names = |parts: &[crate::Part]| -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for g in parts.iter().filter_map(|p| p.group.clone()) {
+            if !names.contains(&g) {
+                names.push(g);
+            }
+        }
+        names
+    };
+    let (old_groups, new_groups) = (group_names(&old.parts), group_names(&new.parts));
+    for group in &new_groups {
+        let members = group_of(&new.parts, group);
+        let was_there = |name: &String| old.parts.iter().any(|p| p.name == *name);
+        if members.iter().all(|m| !was_there(m)) {
+            changes.push(format!("Import '{group}' ({})", parts_count(members.len())));
+        } else if !old_groups.contains(group) && members.iter().all(was_there) {
+            match old.parts.iter().find(|p| p.name == members[0]).and_then(|p| p.group.as_deref()) {
+                Some(before) if group_of(&old.parts, before) == members => {
+                    changes.push(format!("Rename group '{before}' to '{group}'"))
+                }
+                _ => continue,
+            }
+        } else {
+            continue;
+        }
+        whole.extend(new.parts.iter().filter(|p| p.group.as_deref() == Some(group.as_str())).map(|p| p.name.as_str()));
+    }
+    for group in &old_groups {
+        let members = group_of(&old.parts, group);
+        if members.iter().all(|m| !new.parts.iter().any(|p| p.name == *m)) {
+            changes.push(format!("Delete '{group}' ({})", parts_count(members.len())));
+            whole.extend(old.parts.iter().filter(|p| p.group.as_deref() == Some(group.as_str())).map(|p| p.name.as_str()));
+        }
+    }
     for part in &new.parts {
+        if whole.contains(part.name.as_str()) {
+            continue;
+        }
         let Some(was) = old.parts.iter().find(|p| p.name == part.name) else {
             changes.push(match part.source {
                 Some(_) => format!("Import '{}'", part.name),
@@ -349,6 +395,9 @@ fn describe(before: &Content, after: &Content) -> String {
         }
     }
     for was in &old.parts {
+        if whole.contains(was.name.as_str()) {
+            continue;
+        }
         if !new.parts.iter().any(|p| p.name == was.name) {
             changes.push(format!("Delete part '{}'", was.name));
         }

@@ -6,6 +6,7 @@ mod caption;
 mod chat;
 mod fit;
 mod glossary;
+mod import;
 mod measure;
 mod menus;
 mod motion;
@@ -155,6 +156,10 @@ struct State {
     fit: Option<fit::FitCheck>,
     /// The print check panel for the selected part, while it is open.
     print_check: Option<print_panel::PrintCheck>,
+    /// A STEP file being read, or waiting to be split or kept whole.
+    import: Option<import::Import>,
+    /// The selection the parts list last showed, so a new one opens its group.
+    listed_selection: Option<String>,
     sketch: sketch::Sketch,
 
     exports_pending: usize,
@@ -215,6 +220,8 @@ impl App {
             measure: measure::MeasureTool::default(),
             fit: None,
             print_check: None,
+            import: None,
+            listed_selection: None,
             sketch: sketch::Sketch::default(),
             exports_pending: 0,
             exported: Vec::new(),
@@ -316,6 +323,7 @@ impl eframe::App for App {
         self.first_run_window(&ctx);
         self.new_project_window(&ctx);
         self.make_project_window(&ctx);
+        self.state.import_window(&ctx);
         DockArea::new(&mut self.dock)
             .show_close_buttons(false)
             .show_leaf_close_all_buttons(false)
@@ -354,6 +362,7 @@ impl State {
         self.code_draft = None;
         self.brief_draft = None;
         self.rename = None;
+        self.import = None;
         self.hidden.clear();
         self.selected_part = None;
         self.selected_step = None;
@@ -380,7 +389,97 @@ impl State {
         else {
             return;
         };
-        self.import_step(&file);
+        self.start_import(&file);
+    }
+
+    /// Read a STEP file to see what's in it. One body is imported straight away; for
+    /// several, the import window asks whether to split them into a group.
+    fn start_import(&mut self, file: &std::path::Path) {
+        // A file that's missing or too big gets its plain error from the normal import.
+        let too_big = std::fs::metadata(file).map_or(true, |m| m.len() > intercraft_core::MAX_IMPORT_BYTES);
+        if too_big {
+            return self.import_step(file);
+        }
+        let sent = self.worker.as_mut().map(|w| w.request_step_contents(file));
+        match sent {
+            Some(Ok(id)) => self.import = Some(import::Import { file: file.to_owned(), stage: import::Stage::Reading(id) }),
+            // Without a worker there's nothing to read it with, so keep it whole.
+            _ => self.import_step(file),
+        }
+    }
+
+    fn import_window(&mut self, ctx: &egui::Context) {
+        let Some(choice) = self.import.as_ref().and_then(|i| i.window(ctx)) else { return };
+        let Some(current) = self.import.take() else { return };
+        match (choice, current.stage) {
+            (import::Choice::Whole, _) => self.import_step(&current.file),
+            (import::Choice::Split, import::Stage::Asking(bodies)) => {
+                let file = current.file;
+                let result = (|| {
+                    let loaded = self.project.as_ref().ok_or_else(|| anyhow::anyhow!("no project is open"))?;
+                    let split = loaded.plan_split_import(&file, &bodies)?;
+                    std::fs::create_dir_all(&split.folder)?;
+                    let files: Vec<PathBuf> = split.parts.iter().map(|(_, source)| self.project_dir.join(source)).collect();
+                    let worker = self.worker.as_mut().ok_or_else(|| anyhow::anyhow!("the geometry worker isn't running"))?;
+                    let id = worker.request_split_step(&file, &files)?;
+                    Ok::<_, anyhow::Error>(import::Stage::Splitting(id, split, 0))
+                })();
+                let stage = result.unwrap_or_else(|e| import::Stage::Failed(format!("{e:#}")));
+                self.import = Some(import::Import { file, stage });
+            }
+            _ => {}
+        }
+    }
+
+    /// The worker answered a request for the import in progress.
+    fn import_answer(&mut self, data: Result<serde_json::Value, String>) {
+        let Some(current) = self.import.take() else { return };
+        let data = match data {
+            Ok(data) => data,
+            Err(error) => {
+                let first = error.lines().last().unwrap_or_default().to_owned();
+                self.import = Some(import::Import { file: current.file, stage: import::Stage::Failed(first) });
+                return;
+            }
+        };
+        match current.stage {
+            import::Stage::Reading(_) => {
+                let bodies: Vec<String> = data["bodies"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|b| b["name"].as_str().unwrap_or_default().to_owned())
+                    .collect();
+                if bodies.len() > 1 {
+                    self.import = Some(import::Import { file: current.file, stage: import::Stage::Asking(bodies) });
+                } else if bodies.is_empty() {
+                    let error = "the file has no solid bodies, only surfaces or sketches".to_owned();
+                    self.import = Some(import::Import { file: current.file, stage: import::Stage::Failed(error) });
+                } else {
+                    self.import_step(&current.file);
+                }
+            }
+            import::Stage::Splitting(_, split, _) => {
+                let result = self.edit_project(|p| p.add_split_import(&split).and_then(|()| p.save()));
+                match result {
+                    Ok(()) => {
+                        self.worker_status = format!(
+                            "Imported {} parts from {} into the group '{}'. Ctrl+Z undoes it.",
+                            split.parts.len(),
+                            current.file.display(),
+                            split.group
+                        );
+                        self.selected_part = split.parts.first().map(|(name, _)| name.clone());
+                        self.selected_step = None;
+                    }
+                    Err(e) => {
+                        let stage = import::Stage::Failed(format!("{e:#}"));
+                        self.import = Some(import::Import { file: current.file, stage });
+                    }
+                }
+            }
+            stage => self.import = Some(import::Import { file: current.file, stage }),
+        }
     }
 
     fn import_step(&mut self, file: &std::path::Path) {
@@ -561,6 +660,7 @@ impl State {
         let Some((target, mut name, mut error)) = self.rename.take() else { return };
         let (title, hint, current) = match &target {
             RenameTarget::Part(part) => ("Rename part", "Letters, digits, _ and -", part.clone()),
+            RenameTarget::Group(group) => ("Rename group", "A name for the whole assembly", group.clone()),
             RenameTarget::Step { label, .. } => ("Rename step", "A short name for the step", label.clone()),
         };
         let mut open = true;
@@ -585,6 +685,7 @@ impl State {
                     } else {
                         let result = match &target {
                             RenameTarget::Part(part) => self.rename_part(part, name.trim()),
+                            RenameTarget::Group(group) => self.rename_group(group, name.trim()),
                             RenameTarget::Step { part, feature, .. } => self.rename_step(part, feature, name.trim()),
                         };
                         match result {
@@ -1330,19 +1431,20 @@ impl State {
 
     fn drain_worker_events(&mut self) {
         // A step that never finishes (usually an endless loop) would freeze the view forever.
-        if self.worker.as_ref().is_some_and(|w| w.stuck()) {
+        if let Some(worker) = self.worker.as_ref().filter(|w| w.stuck()) {
+            let message = intercraft_geo::stuck_message(worker.current_timeout(), worker.importing());
             let parts: HashSet<String> = std::mem::take(&mut self.building);
             for ((part, _), entry) in self.results.iter_mut() {
                 if entry.stale && parts.contains(part) {
                     entry.stale = false;
                     entry.result.ok = false;
-                    entry.result.error = Some(format!(
-                        "Stopped after {} s without finishing. An endless loop in a snippet is the usual cause.",
-                        intercraft_geo::build_timeout().as_secs()
-                    ));
+                    entry.result.error = Some(message.clone());
                 }
             }
             self.poses.clear();
+            if let Some(import) = self.import.as_mut().filter(|i| i.busy()) {
+                import.stage = import::Stage::Failed(message.clone());
+            }
             if let Some(worker) = self.worker.as_mut() {
                 self.worker_status = match worker.restart() {
                     Ok(()) => "A build step took too long and was stopped. The geometry worker restarted.".to_owned(),
@@ -1370,6 +1472,17 @@ impl State {
                     self.results.retain(|(p, _), e| p != &part || !e.stale);
                 }
                 GeoEvent::Measured { id, data } => self.measure.result(id, Ok(data)),
+                GeoEvent::Info { id, data } if self.import.as_ref().is_some_and(|i| i.waiting_for(id)) => {
+                    self.import_answer(Ok(data));
+                }
+                GeoEvent::Error { id: Some(id), error } if self.import.as_ref().is_some_and(|i| i.waiting_for(id)) => {
+                    self.import_answer(Err(error));
+                }
+                GeoEvent::Progress { id } if self.import.is_some() => {
+                    if let Some(import) = self.import.as_mut() {
+                        import.progress(id);
+                    }
+                }
                 GeoEvent::Info { id, data } => {
                     if let Some(check) = self.print_check.as_mut().filter(|c| c.waiting_for(id)) {
                         check.result(Ok(data));
@@ -1549,7 +1662,130 @@ impl State {
         }
 
         let mut action = None;
-        for (i, part) in loaded.project.parts.iter().enumerate() {
+        // A new selection (say, a click in the 3D view) opens its group so it can be seen.
+        let reveal = (self.listed_selection != self.selected_part).then(|| self.selected_part.clone()).flatten();
+        let parts = &loaded.project.parts;
+        let mut drawn_groups: HashSet<&str> = HashSet::new();
+        for (i, part) in parts.iter().enumerate() {
+            let Some(group) = part.group.as_deref() else {
+                self.part_row(ui, i, part, reveal.as_deref(), &mut action);
+                continue;
+            };
+            // A group is drawn where its first part sits, with all its parts inside.
+            if !drawn_groups.insert(group) {
+                continue;
+            }
+            let members: Vec<(usize, &Part)> =
+                parts.iter().enumerate().filter(|(_, p)| p.group.as_deref() == Some(group)).collect();
+            let all_hidden = members.iter().all(|(_, p)| self.hidden.contains(&p.name));
+            let holds_reveal = reveal.as_deref().is_some_and(|r| members.iter().any(|(_, p)| p.name == r));
+            let mut header = egui::CollapsingHeader::new(egui::RichText::new(format!("{group}  ({})", members.len())).strong())
+                .id_salt(("part group", group))
+                .default_open(false);
+            if holds_reveal {
+                header = header.open(Some(true));
+            }
+            let shown = header.show(ui, |ui| {
+                for (i, member) in &members {
+                    self.part_row(ui, *i, member, reveal.as_deref(), &mut action);
+                }
+            });
+            shown.header_response.on_hover_text("An imported assembly. Right-click for the whole group.").context_menu(|ui| {
+                let names: Vec<String> = members.iter().map(|(_, p)| p.name.clone()).collect();
+                if ui.button(if all_hidden { "Show group" } else { "Hide group" }).clicked() {
+                    action = Some(PartAction::GroupVisible(names.clone(), all_hidden));
+                    ui.close();
+                }
+                if ui.button("Show only this group").clicked() {
+                    action = Some(PartAction::GroupIsolate(names.clone()));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Rename group...").clicked() {
+                    action = Some(PartAction::GroupRename(group.to_owned()));
+                    ui.close();
+                }
+                if ui.button(format!("Delete group ({} parts)", names.len())).clicked() {
+                    action = Some(PartAction::GroupDelete(group.to_owned()));
+                    ui.close();
+                }
+            });
+        }
+        self.listed_selection = self.selected_part.clone();
+        ui.add_space(6.0);
+        if ui.button("Import STEP...").on_hover_text("Add a part from a STEP file").clicked() {
+            action = Some(PartAction::Import);
+        }
+        // Delete removes the selected part while the pointer is over this list.
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        if ui.ui_contains_pointer() && !typing && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+            if let Some(name) = self.selected_part.clone() {
+                action = Some(PartAction::Delete(name));
+            }
+        }
+
+        match action {
+            Some(PartAction::Select(name)) => {
+                if self.selected_part.as_ref() != Some(&name) {
+                    self.selected_part = Some(name.clone());
+                    self.selected_step = None;
+                }
+                // Picked in the list, so it's already in view.
+                self.listed_selection = Some(name);
+            }
+            Some(PartAction::Visible(name, visible)) => self.set_visible(&name, visible),
+            Some(PartAction::Isolate(name)) => self.isolate(&[name]),
+            Some(PartAction::GroupVisible(names, visible)) => {
+                for name in names {
+                    self.set_visible(&name, visible);
+                }
+            }
+            Some(PartAction::GroupIsolate(names)) => self.isolate(&names),
+            Some(PartAction::GroupRename(group)) => self.rename = Some((RenameTarget::Group(group.clone()), group, None)),
+            Some(PartAction::GroupDelete(group)) => self.delete_group(&group),
+            Some(PartAction::ShowAll) => self.show_all(),
+            Some(PartAction::Kind(name, kind)) => self.set_part_kind(&name, kind),
+            Some(PartAction::Delete(name)) => self.delete_part(&name),
+            Some(PartAction::Rename(name)) => self.rename = Some((RenameTarget::Part(name.clone()), name, None)),
+            Some(PartAction::Duplicate(name)) => self.duplicate_part(&name),
+            Some(PartAction::Explain(name)) => self.ask_chat(&explain_part(&name)),
+            Some(PartAction::Import) => self.import_step_dialog(),
+            None => {}
+        }
+        self.rename_window(ui.ctx());
+    }
+
+    /// Show only these parts.
+    fn isolate(&mut self, keep: &[String]) {
+        let names: Vec<String> = self.project.iter().flat_map(|p| &p.project.parts).map(|p| p.name.clone()).collect();
+        for other in names {
+            let visible = keep.contains(&other);
+            self.set_visible(&other, visible);
+        }
+    }
+
+    fn delete_group(&mut self, group: &str) {
+        let names: Vec<String> = self.project.iter().flat_map(|p| &p.project.parts).filter(|p| p.group.as_deref() == Some(group)).map(|p| p.name.clone()).collect();
+        match self.edit_project(|p| p.remove_group(group).and_then(|()| p.save())) {
+            Ok(()) => {
+                for name in &names {
+                    self.hidden.remove(name);
+                }
+                self.worker_status = format!("Deleted the group '{group}' ({} parts). Ctrl+Z brings it back.", names.len());
+            }
+            Err(e) => self.worker_status = format!("Couldn't delete '{group}': {e:#}"),
+        }
+    }
+
+    fn rename_group(&mut self, old: &str, new: &str) -> anyhow::Result<()> {
+        self.edit_project(|p| p.rename_group(old, new).and_then(|()| p.save()))?;
+        self.worker_status = format!("Renamed the group '{old}' to '{new}'");
+        Ok(())
+    }
+
+    /// One row of the parts list: eye, colour, name, status, and its right-click menu.
+    fn part_row(&self, ui: &mut egui::Ui, i: usize, part: &Part, reveal: Option<&str>, action: &mut Option<PartAction>) {
+        {
             let selected = self.selected_part.as_ref() == Some(&part.name);
             let hidden = self.hidden.contains(&part.name);
             let fill = if selected {
@@ -1569,7 +1805,7 @@ impl State {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
                                 if eye_button(ui, !hidden, &part.name).clicked() {
-                                    action = Some(PartAction::Visible(part.name.clone(), hidden));
+                                    *action = Some(PartAction::Visible(part.name.clone(), hidden));
                                 }
                                 // Same colour as in the viewport, so parts are easy to match up.
                                 let [r, g, b] = part_color(part.kind, i).map(|c| (c * 255.0) as u8);
@@ -1600,34 +1836,37 @@ impl State {
                 })
                 .response;
             if row.clicked() {
-                action = Some(PartAction::Select(part.name.clone()));
+                *action = Some(PartAction::Select(part.name.clone()));
+            }
+            if reveal == Some(part.name.as_str()) {
+                row.scroll_to_me(None);
             }
             row.context_menu(|ui| {
                 let name = part.name.clone();
                 if ui.button(if hidden { "Show" } else { "Hide" }).clicked() {
-                    action = Some(PartAction::Visible(name.clone(), hidden));
+                    *action = Some(PartAction::Visible(name.clone(), hidden));
                     ui.close();
                 }
                 if ui.button("Show only this").clicked() {
-                    action = Some(PartAction::Isolate(name.clone()));
+                    *action = Some(PartAction::Isolate(name.clone()));
                     ui.close();
                 }
                 if ui.add_enabled(!self.hidden.is_empty(), egui::Button::new("Show all")).clicked() {
-                    action = Some(PartAction::ShowAll);
+                    *action = Some(PartAction::ShowAll);
                     ui.close();
                 }
                 ui.separator();
                 if ui.button("Rename...").clicked() {
-                    action = Some(PartAction::Rename(name.clone()));
+                    *action = Some(PartAction::Rename(name.clone()));
                     ui.close();
                 }
                 let ready = self.chat.can_ask();
                 if ui.add_enabled(ready, egui::Button::new("Explain this part")).on_disabled_hover_text("Set up a chat provider in Settings first, or wait for the current reply").clicked() {
-                    action = Some(PartAction::Explain(name.clone()));
+                    *action = Some(PartAction::Explain(name.clone()));
                     ui.close();
                 }
                 if ui.button("Duplicate").clicked() {
-                    action = Some(PartAction::Duplicate(name.clone()));
+                    *action = Some(PartAction::Duplicate(name.clone()));
                     ui.close();
                 }
                 let (label, kind) = match part.kind {
@@ -1635,53 +1874,16 @@ impl State {
                     PartKind::Reference => ("Unlock for editing", PartKind::Design),
                 };
                 if ui.button(label).clicked() {
-                    action = Some(PartAction::Kind(name.clone(), kind));
+                    *action = Some(PartAction::Kind(name.clone(), kind));
                     ui.close();
                 }
                 ui.separator();
                 if ui.add(egui::Button::new("Delete part").shortcut_text("Del")).clicked() {
-                    action = Some(PartAction::Delete(name));
+                    *action = Some(PartAction::Delete(name));
                     ui.close();
                 }
             });
         }
-        ui.add_space(6.0);
-        if ui.button("Import STEP...").on_hover_text("Add a part from a STEP file").clicked() {
-            action = Some(PartAction::Import);
-        }
-        // Delete removes the selected part while the pointer is over this list.
-        let typing = ui.ctx().egui_wants_keyboard_input();
-        if ui.ui_contains_pointer() && !typing && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-            if let Some(name) = self.selected_part.clone() {
-                action = Some(PartAction::Delete(name));
-            }
-        }
-
-        match action {
-            Some(PartAction::Select(name)) => {
-                if self.selected_part.as_ref() != Some(&name) {
-                    self.selected_part = Some(name);
-                    self.selected_step = None;
-                }
-            }
-            Some(PartAction::Visible(name, visible)) => self.set_visible(&name, visible),
-            Some(PartAction::Isolate(name)) => {
-                let names: Vec<String> = self.project.iter().flat_map(|p| &p.project.parts).map(|p| p.name.clone()).collect();
-                for other in names {
-                    let visible = other == name;
-                    self.set_visible(&other, visible);
-                }
-            }
-            Some(PartAction::ShowAll) => self.show_all(),
-            Some(PartAction::Kind(name, kind)) => self.set_part_kind(&name, kind),
-            Some(PartAction::Delete(name)) => self.delete_part(&name),
-            Some(PartAction::Rename(name)) => self.rename = Some((RenameTarget::Part(name.clone()), name, None)),
-            Some(PartAction::Duplicate(name)) => self.duplicate_part(&name),
-            Some(PartAction::Explain(name)) => self.ask_chat(&explain_part(&name)),
-            Some(PartAction::Import) => self.import_step_dialog(),
-            None => {}
-        }
-        self.rename_window(ui.ctx());
     }
 
     fn inspector_ui(&mut self, ui: &mut egui::Ui) {
@@ -1964,6 +2166,7 @@ impl State {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RenameTarget {
     Part(String),
+    Group(String),
     Step { part: String, feature: String, label: String },
 }
 
@@ -2076,6 +2279,10 @@ enum PartAction {
     Select(String),
     Visible(String, bool),
     Isolate(String),
+    GroupVisible(Vec<String>, bool),
+    GroupIsolate(Vec<String>),
+    GroupRename(String),
+    GroupDelete(String),
     ShowAll,
     Kind(String, PartKind),
     Delete(String),

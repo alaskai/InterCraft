@@ -60,13 +60,14 @@ def feature_hash(prev, feature):
     return h.hexdigest()
 
 
-def write_mesh(shape, path):
+def write_mesh(shape, path, tick=lambda: None):
     # Mesh files are named by a hash of everything that shaped them, so an existing
     # file is already right. The viewer and an MCP server each run a worker and can
     # build the same step at the same moment.
     if os.path.exists(path):
         return
     verts, tris = shape.tessellate(LINEAR_TOL, ANGULAR_TOL)
+    tick()
     v = np.array([(q.X, q.Y, q.Z) for q in verts], dtype=np.float32).reshape(-1, 3)
     t = np.array(tris, dtype=np.uint32).reshape(-1, 3)
 
@@ -80,7 +81,11 @@ def write_mesh(shape, path):
         length = np.linalg.norm(n, axis=1, keepdims=True)
         n = n / np.where(length > 0, length, 1)
 
-    edges = [edge_points(e) for e in shape.edges()]
+    edges = []
+    for e in shape.edges():
+        edges.append(edge_points(e))
+        if len(edges) % 2000 == 0:
+            tick()
     corners = [tuple(vx) for vx in shape.vertices()]
 
     tmp = f"{path}.{os.getpid()}.tmp"
@@ -141,6 +146,73 @@ def import_step(path):
     return shape
 
 
+# The last STEP file read for splitting: (path, size, mtime) and its bodies.
+_step_bodies = (None, [])
+
+
+def step_bodies(path, tick=lambda: None):
+    """Every body in a STEP file as (name, shape), each placed where it sits in the
+    whole assembly. Bodies inside sub-assemblies are found too."""
+    global _step_bodies
+    if not path.lower().endswith(STEP_EXTENSIONS):
+        raise ValueError("only .step and .stp files can be imported")
+    stat = os.stat(path)
+    key = (path, stat.st_size, stat.st_mtime)
+    if _step_bodies[0] == key:
+        return _step_bodies[1]
+    shape = build123d.import_step(path)
+    tick()
+    bodies = []
+
+    def walk(node, above):
+        here = above * node.location
+        if node.children:
+            for child in node.children:
+                walk(child, here)
+            return
+        if not node.solids():
+            return  # a sketch or a surface, nothing to build on
+        # A fresh copy with no parent; exporting a node still in the tree fails.
+        alone = type(node)(node.wrapped.Moved(above.wrapped))
+        bodies.append((node.label or "", alone))
+
+    if shape is not None:
+        if not shape.children and len(shape.solids()) > 1:
+            # Several bodies with no assembly structure: one per solid.
+            for i, solid in enumerate(shape.solids()):
+                bodies.append((f"{shape.label or 'Body'}_{i + 1}", solid))
+        else:
+            walk(shape, build123d.Location())
+    _step_bodies = (key, bodies)
+    return bodies
+
+
+def step_contents(req):
+    def tick():
+        send({"id": req["id"], "event": "progress"})
+
+    bodies = step_bodies(req["step"], tick)
+    names = [{"name": name, "solids": len(shape.solids())} for name, shape in bodies]
+    send({"id": req["id"], "event": "info", "data": {"bodies": names}})
+
+
+def split_step(req):
+    """Write each body of a STEP file to its own file, in the order step_contents gave."""
+    bodies = step_bodies(req["step"])
+    files = req["files"]
+    if len(files) != len(bodies):
+        raise ValueError(f"{len(files)} file names for {len(bodies)} bodies")
+    for (name, shape), path in zip(bodies, files):
+        if not str(path).lower().endswith(STEP_EXTENSIONS):
+            raise ValueError("bodies are written as .step files")
+        shape.label = name
+        tmp = f"{path}.{os.getpid()}.tmp.step"
+        build123d.export_step(shape, tmp)
+        os.replace(tmp, path)
+        send({"id": req["id"], "event": "progress"})
+    send({"id": req["id"], "event": "info", "data": {"written": len(files)}})
+
+
 def shown_key(key, placement):
     """Cache key of a step as it is shown: its chain hash, plus where the part sits."""
     if not placement or not any(placement):
@@ -180,6 +252,11 @@ def rebuild(req, emit=True):
     shape = None
     volume = None
 
+    def tick():
+        # A big import takes several slow stages; each one shows the app it's alive.
+        if emit:
+            send({"id": rid, "event": "progress"})
+
     for index, feature in enumerate(req["features"]):
         start = time.perf_counter()
         key = feature_hash(prev_hash, feature)
@@ -203,10 +280,12 @@ def rebuild(req, emit=True):
                 else:
                     shape = run_feature(shape, feature)
                     _local[key] = shape
+                    tick()
                 shown = place(shape, placement)
                 report = make_report(shown, volume)
+                tick()
                 mesh_path = os.path.join(cache_dir, placed + ".icm")
-                write_mesh(shown, mesh_path)
+                write_mesh(shown, mesh_path, tick)
                 _cache[placed] = (shown, report, mesh_path)
             volume = report["volume"]
             event.update(ok=True, cached=cached, mesh=mesh_path, report=report)
@@ -455,6 +534,10 @@ def main():
                 min_wall = float(req.get("min_wall") or 1.2)
                 up = req.get("up") or [0, 0, 1]
                 send({"id": req["id"], "event": "info", "data": print_check.check(shape, min_wall, up)})
+            elif req.get("cmd") == "step_contents":
+                step_contents(req)
+            elif req.get("cmd") == "split_step":
+                split_step(req)
             elif req.get("cmd") == "fastener_info":
                 send({"id": req["id"], "event": "info", "data": parts_library.fastener_info(str(req["size"]))})
             else:

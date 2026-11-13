@@ -34,6 +34,9 @@ struct Globals {
     flags: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
+// Moves one part from where its mesh was built to where it is shown now, while a
+// joint is dragged or played. Identity the rest of the time.
+@group(1) @binding(0) var<uniform> motion: mat4x4<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -49,10 +52,11 @@ fn cut_away(world: vec3<f32>) -> bool {
 @vertex
 fn vs_main(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>) -> VsOut {
     var out: VsOut;
-    out.pos = globals.view_proj * vec4<f32>(pos, 1.0);
-    out.normal = normal;
+    let world = (motion * vec4<f32>(pos, 1.0)).xyz;
+    out.pos = globals.view_proj * vec4<f32>(world, 1.0);
+    out.normal = (motion * vec4<f32>(normal, 0.0)).xyz;
     out.color = color;
-    out.world = pos;
+    out.world = world;
     return out;
 }
 
@@ -175,8 +179,45 @@ struct GpuMesh {
     bounds: (Vec3, Vec3),
     color: [f32; 3],
     visible: bool,
-    /// CPU copy for picking and highlighting.
+    /// CPU copy for picking and highlighting, where the mesh was built.
     cpu: Arc<Mesh>,
+    /// From where the mesh was built to where the part is shown now.
+    motion: Mat4,
+    motion_buffer: wgpu::Buffer,
+    motion_bind: wgpu::BindGroup,
+}
+
+impl GpuMesh {
+    /// The mesh's box where the part is shown now.
+    fn shown_bounds(&self) -> (Vec3, Vec3) {
+        if self.motion == Mat4::IDENTITY {
+            return self.bounds;
+        }
+        let (lo, hi) = self.bounds;
+        let corners = (0..8).map(|i| {
+            let pick = |bit: usize, axis: usize| if i & bit == 0 { lo[axis] } else { hi[axis] };
+            self.motion.transform_point3(Vec3::new(pick(1, 0), pick(2, 1), pick(4, 2)))
+        });
+        corners.fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(p), b.max(p)))
+    }
+
+    fn at(&self, p: [f32; 3]) -> Vec3 {
+        self.motion.transform_point3(Vec3::from(p))
+    }
+}
+
+fn motion_binding(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, motion: Mat4) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("intercraft motion"),
+        contents: bytemuck::cast_slice(&motion.to_cols_array()),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("intercraft motion"),
+        layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+    });
+    (buffer, bind)
 }
 
 struct Targets {
@@ -329,6 +370,9 @@ pub struct Viewport {
     overlays: Vec<(wgpu::Buffer, wgpu::Buffer, u32)>,
     globals: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    motion_layout: wgpu::BindGroupLayout,
+    /// No motion, for what isn't a part: clash volumes and section caps.
+    still: wgpu::BindGroup,
     targets: Option<Targets>,
     texture_id: Option<egui::TextureId>,
     meshes: BTreeMap<String, GpuMesh>,
@@ -364,9 +408,22 @@ impl Viewport {
                 count: None,
             }],
         });
+        let motion_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("intercraft motion"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("intercraft pipeline layout"),
-            bind_group_layouts: &[Some(&globals_layout)],
+            bind_group_layouts: &[Some(&globals_layout), Some(&motion_layout)],
             immediate_size: 0,
         });
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
@@ -485,8 +542,11 @@ impl Viewport {
             layout: &globals_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() }],
         });
+        let (_, still) = motion_binding(device, &motion_layout, Mat4::IDENTITY);
 
         Self {
+            motion_layout,
+            still,
             rs,
             pipeline,
             line_pipeline,
@@ -537,6 +597,7 @@ impl Viewport {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
+        let (motion_buffer, motion_bind) = motion_binding(device, &self.motion_layout, Mat4::IDENTITY);
         self.meshes.insert(
             name.to_owned(),
             GpuMesh {
@@ -557,6 +618,9 @@ impl Viewport {
                 color,
                 visible,
                 cpu: Arc::new(mesh),
+                motion: Mat4::IDENTITY,
+                motion_buffer,
+                motion_bind,
             },
         );
         if first {
@@ -591,6 +655,15 @@ impl Viewport {
         self.meshes.retain(|name, _| keep(name));
     }
 
+    /// Show a part moved from where its mesh was built, without rebuilding it.
+    pub fn set_motion(&mut self, name: &str, motion: Mat4) {
+        let Some(mesh) = self.meshes.get_mut(name) else { return };
+        if mesh.motion != motion {
+            mesh.motion = motion;
+            self.rs.queue.write_buffer(&mesh.motion_buffer, 0, bytemuck::cast_slice(&motion.to_cols_array()));
+        }
+    }
+
     pub fn set_visible(&mut self, name: &str, visible: bool) {
         if let Some(mesh) = self.meshes.get_mut(name) {
             mesh.visible = visible;
@@ -607,7 +680,7 @@ impl Viewport {
     }
 
     fn bounds_of(&self, show: Show) -> Option<(Vec3, Vec3)> {
-        self.shown(show).map(|m| m.bounds).reduce(|(lo, hi), (a, b)| (lo.min(a), hi.max(b)))
+        self.shown(show).map(GpuMesh::shown_bounds).reduce(|(lo, hi), (a, b)| (lo.min(a), hi.max(b)))
     }
 
     /// Box around everything that is visible, as (min, max).
@@ -873,6 +946,7 @@ impl Viewport {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_pipeline(&self.pipeline);
             for mesh in self.shown(scene.show) {
+                pass.set_bind_group(1, &mesh.motion_bind, &[]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -881,10 +955,12 @@ impl Viewport {
                 pass.set_stencil_reference(0);
                 for (i, mesh) in self.shown(scene.show).enumerate() {
                     pass.set_pipeline(&self.mark_pipeline);
+                    pass.set_bind_group(1, &mesh.motion_bind, &[]);
                     pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                     pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                     pass.set_pipeline(&self.cap_pipeline);
+                    pass.set_bind_group(1, &self.still, &[]);
                     pass.set_vertex_buffer(0, caps.slice(..));
                     let first = i as u32 * 6;
                     pass.draw(first..first + 6, 0..1);
@@ -894,6 +970,7 @@ impl Viewport {
                 pass.set_pipeline(&self.line_pipeline);
                 for mesh in self.shown(scene.show) {
                     if let Some(edges) = &mesh.edges {
+                        pass.set_bind_group(1, &mesh.motion_bind, &[]);
                         pass.set_vertex_buffer(0, edges.slice(..));
                         pass.draw(0..mesh.edge_vertex_count, 0..1);
                     }
@@ -901,6 +978,7 @@ impl Viewport {
             }
             if scene.overlays {
                 pass.set_pipeline(&self.overlay_pipeline);
+                pass.set_bind_group(1, &self.still, &[]);
                 for (vertices, indices, count) in &self.overlays {
                     pass.set_vertex_buffer(0, vertices.slice(..));
                     pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -981,9 +1059,12 @@ impl Viewport {
         let mut surface: Option<(f32, &str)> = None;
         for (name, mesh) in visible() {
             let p = &mesh.cpu.positions;
+            // Into the mesh's own frame. The motion is rigid, so distances along the ray agree.
+            let back = mesh.motion.inverse();
+            let (local_origin, local_dir) = (back.transform_point3(origin), back.transform_vector3(dir));
             for tri in mesh.cpu.indices.chunks_exact(3) {
                 let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| Vec3::from(p[i as usize]));
-                if let Some(t) = ray_triangle(origin, dir, a, b, c) {
+                if let Some(t) = ray_triangle(local_origin, local_dir, a, b, c) {
                     if surface.is_none_or(|(best, _)| t < best) && !cut(origin + dir * t) {
                         surface = Some((t, name));
                     }
@@ -1000,11 +1081,11 @@ impl Viewport {
         let mut best: Option<(f32, Hit)> = None;
         for (name, mesh) in visible() {
             for (i, &corner) in mesh.cpu.corners.iter().enumerate() {
-                let p = Vec3::from(corner);
+                let p = mesh.at(corner);
                 let Some(s) = to_screen(p) else { continue };
                 let d = s.distance(cursor_v);
                 if d < CORNER_SNAP && in_view(p) && !cut(p) && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
-                    best = Some((d, Hit { part: name.clone(), target: Target::Corner(i), pos: corner }));
+                    best = Some((d, Hit { part: name.clone(), target: Target::Corner(i), pos: p.to_array() }));
                 }
             }
         }
@@ -1015,7 +1096,7 @@ impl Viewport {
         for (name, mesh) in visible() {
             for (i, line) in mesh.cpu.edges.iter().enumerate() {
                 for pair in line.windows(2) {
-                    let (p0, p1) = (Vec3::from(pair[0]), Vec3::from(pair[1]));
+                    let (p0, p1) = (mesh.at(pair[0]), mesh.at(pair[1]));
                     let (Some(s0), Some(s1)) = (to_screen(p0), to_screen(p1)) else { continue };
                     let seg = s1 - s0;
                     let t = if seg.length_squared() > 0.0 {
@@ -1039,8 +1120,9 @@ impl Viewport {
     }
 
     /// The polyline of one edge, for highlighting.
-    pub fn edge_points(&self, part: &str, edge: usize) -> Option<&[[f32; 3]]> {
-        self.meshes.get(part)?.cpu.edges.get(edge).map(Vec::as_slice)
+    pub fn edge_points(&self, part: &str, edge: usize) -> Option<Vec<[f32; 3]>> {
+        let mesh = self.meshes.get(part)?;
+        Some(mesh.cpu.edges.get(edge)?.iter().map(|&p| mesh.at(p).to_array()).collect())
     }
 
     /// Draw a highlighted pick on top of the 3D view.

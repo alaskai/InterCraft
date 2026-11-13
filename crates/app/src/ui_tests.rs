@@ -1007,6 +1007,81 @@ fn a_part_on_a_joint_is_shown_where_the_joint_puts_it() {
 }
 
 #[test]
+fn joints_move_in_the_motion_panel() {
+    let _one = one_at_a_time();
+    let project = example_project("motion");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let mut loaded = intercraft_core::LoadedProject::load(&project).unwrap();
+    loaded.duplicate_part("RodBracket", Some("Arm")).unwrap();
+    loaded
+        .add_joint(intercraft_core::Joint {
+            name: "Arm pivot".into(),
+            kind: intercraft_core::JointKind::Hinge,
+            base: "RodBracket".into(),
+            part: "Arm".into(),
+            origin: [0.0, 0.0, 0.0],
+            axis: [0.0, 0.0, 1.0],
+            min: 0.0,
+            max: 90.0,
+            at: 0.0,
+            why: String::new(),
+        })
+        .unwrap();
+    loaded.save().unwrap();
+    wait_until(&mut h, "the copy", |app| built(app) && app.state.shown.contains_key("Arm"));
+    // Both parts sit on top of each other: 40 x 30 from above.
+    let depth = |h: &Harness<'static, App>| {
+        let (lo, hi) = h.state().state.viewport.visible_bounds().unwrap();
+        hi[1] - lo[1]
+    };
+    let saved = || intercraft_core::LoadedProject::load(&project).unwrap().project.joints[0].at;
+    assert!((depth(&h) - 30.0).abs() < 0.01);
+
+    click(&mut h, "Motion");
+    h.get_by_label_contains("Drag to move");
+
+    // Play swings the arm round without saving anything.
+    click(&mut h, "Play");
+    for _ in 0..30 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    assert!(depth(&h) > 31.0, "the arm has turned: {}", depth(&h));
+    shot(&mut h, "motion_playing");
+    click(&mut h, "Stop");
+    assert!((depth(&h) - 30.0).abs() < 0.01, "back where it is saved");
+    assert_eq!(saved(), 0.0);
+
+    // Dragging the slider previews; letting go saves.
+    let rail = h.get_by_role(egui::accesskit::Role::Slider).rect();
+    let press = |h: &mut Harness<'static, App>, pos: egui::Pos2, pressed: bool| {
+        h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+        h.step();
+    };
+    let start = rail.left_center() + egui::vec2(4.0, 0.0);
+    h.event(egui::Event::PointerMoved(start));
+    h.step();
+    press(&mut h, start, true);
+    let end = rail.right_center() + egui::vec2(30.0, 0.0);
+    h.event(egui::Event::PointerMoved(end));
+    h.step();
+    h.step();
+    assert!((depth(&h) - 40.0).abs() < 0.01, "turned a quarter while held: {}", depth(&h));
+    assert_eq!(saved(), 0.0, "nothing saved while dragging");
+    press(&mut h, end, false);
+    h.step();
+    assert_eq!(saved(), 90.0);
+    assert_eq!(h.state().state.history.undo_label(), Some("Move 'Arm pivot' to 90°"));
+    // Still shown turned while the copy rebuilds, and after.
+    assert!((depth(&h) - 40.0).abs() < 0.01);
+    wait_until(&mut h, "the rebuild", |app| built(app) && app.state.building.is_empty());
+    h.step();
+    assert!((depth(&h) - 40.0).abs() < 0.01);
+    shot(&mut h, "motion_panel");
+}
+
+#[test]
 fn several_questions_in_one_reply_are_answered_together() {
     let _one = one_at_a_time();
     let project = example_project("questions");

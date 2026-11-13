@@ -274,6 +274,7 @@ impl eframe::App for App {
         // Both of these need the meshes of the latest build, so they come after the sync.
         self.state.run_fit();
         self.state.run_print_check();
+        self.state.run_motion_check();
         self.state.serve_views();
         // The project name can also change on disk, so check it after each reload.
         if std::mem::take(&mut self.title_dirty) || self.state.project_renamed() {
@@ -981,7 +982,7 @@ impl State {
         self.draw_joint_axes(ui, rect, &project);
         let Some(loaded) = &self.project else { return };
         let rows = loaded.project.joints.len().max(1) as f32;
-        let height = (64.0 + rows * 52.0).min(rect.height() - 60.0);
+        let height = (64.0 + rows * 72.0).min(rect.height() - 60.0);
         let panel = egui::Rect::from_min_size(rect.right_bottom() + egui::vec2(-288.0, -height - 8.0), egui::vec2(280.0, height));
         let mut action = None;
         ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
@@ -1000,6 +1001,40 @@ impl State {
                 Err(e) => self.worker_status = format!("Couldn't move {name}: {e:#}"),
             }
         }
+    }
+
+    /// Send a joint's range check once every part has finished building, using the
+    /// meshes on screen and the pose each was built at.
+    fn run_motion_check(&mut self) {
+        let Some(name) = self.motion.wanted_check() else { return };
+        if !self.building.is_empty() || self.param_drag.is_some() {
+            return;
+        }
+        let Some(loaded) = &self.project else { return };
+        let Some(joint) = loaded.project.joint(&name).cloned() else { return };
+        let built: Vec<(String, String, Pose)> = loaded
+            .project
+            .parts
+            .iter()
+            .filter_map(|p| {
+                let key = Mesh::key_of(self.shown.get(&p.name)?)?;
+                Some((p.name.clone(), key, *self.mesh_pose.get(&p.name)?))
+            })
+            .collect();
+        let moving = loaded.project.moved_by(&joint.name);
+        if built.len() < 2 || !moving.iter().all(|m| built.iter().any(|(n, _, _)| n == m)) {
+            let error = "every part needs to build first".to_owned();
+            self.motion.set_check(&name, motion::Check::Failed(error));
+            return;
+        }
+        let values = intercraft_tools::motion::sweep_values(&joint, intercraft_tools::motion::DEFAULT_STEPS);
+        let parts = intercraft_tools::motion::sweep_parts(&loaded.project, &joint.name, &values, &built);
+        let check = match self.worker.as_mut().map(|w| w.request_sweep(&parts, &values)) {
+            Some(Ok(id)) => motion::Check::Sent(id),
+            Some(Err(e)) => motion::Check::Failed(format!("{e:#}")),
+            None => motion::Check::Failed("the geometry worker isn't running".to_owned()),
+        };
+        self.motion.set_check(&name, check);
     }
 
     /// Each joint's axis as a dashed line through its pivot, labelled with its name.
@@ -1193,6 +1228,7 @@ impl State {
                 if let Some(check) = &mut self.print_check {
                     check.invalidate();
                 }
+                self.motion.invalidate();
                 self.rebuild_all();
             }
             // Keep showing the last good project. A half-saved file shouldn't blank the view.
@@ -1278,6 +1314,20 @@ impl State {
                 GeoEvent::Info { id, data } => {
                     if let Some(check) = self.print_check.as_mut().filter(|c| c.waiting_for(id)) {
                         check.result(Ok(data));
+                    } else if let Some(name) = self.motion.checking(id) {
+                        let joint = self.project.as_ref().and_then(|p| p.project.joint(&name).cloned());
+                        if let Some(joint) = joint {
+                            let found = intercraft_tools::motion::summarise(&joint, &data);
+                            let text = found["summary"].as_str().unwrap_or_default();
+                            // The panel row already names the joint.
+                            let text = text.strip_prefix(&format!("{name}: ")).unwrap_or(text).to_owned();
+                            self.motion.set_check(&name, motion::Check::Done(text, found["clear"] == true));
+                        }
+                    }
+                }
+                GeoEvent::Error { id: Some(id), error } if self.motion.checking(id).is_some() => {
+                    if let Some(name) = self.motion.checking(id) {
+                        self.motion.set_check(&name, motion::Check::Failed(error));
                     }
                 }
                 GeoEvent::Error { id: Some(id), error } if self.print_check.as_ref().is_some_and(|c| c.waiting_for(id)) => {
@@ -1285,7 +1335,7 @@ impl State {
                         check.result(Err(error));
                     }
                 }
-                GeoEvent::Inspected { .. } => {}
+                GeoEvent::Inspected { .. } | GeoEvent::Progress { .. } => {}
                 GeoEvent::Fitted { id, data } => {
                     if let Some(fit) = self.fit.as_mut().filter(|f| f.waiting_for(id)) {
                         let meshes: Vec<Mesh> = fit::overlap_meshes(&data).iter().filter_map(|p| Mesh::load(p).ok()).collect();

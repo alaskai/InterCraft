@@ -17,6 +17,19 @@ pub struct Motion {
     /// A joint being dragged, and the value under the pointer.
     drag: Option<(String, f64)>,
     playing: Option<(String, Instant)>,
+    /// Range checks, by joint name.
+    checks: std::collections::HashMap<String, Check>,
+}
+
+/// A check of a joint's whole range for clashes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Check {
+    /// Asked for, waiting for the parts to finish building.
+    Wanted,
+    Sent(u64),
+    /// The summary, and whether it moves freely.
+    Done(String, bool),
+    Failed(String),
 }
 
 /// What the panel asks the app to do.
@@ -45,6 +58,34 @@ impl Motion {
         self.playing = None;
     }
 
+    /// A joint whose range check is waiting to be sent.
+    pub fn wanted_check(&self) -> Option<String> {
+        self.checks.iter().find(|(_, c)| **c == Check::Wanted).map(|(name, _)| name.clone())
+    }
+
+    pub fn set_check(&mut self, joint: &str, check: Check) {
+        self.checks.insert(joint.to_owned(), check);
+    }
+
+    #[cfg(test)]
+    pub fn check(&self, joint: &str) -> Option<&Check> {
+        self.checks.get(joint)
+    }
+
+    /// The joint whose check has this worker id.
+    pub fn checking(&self, id: u64) -> Option<String> {
+        self.checks.iter().find(|(_, c)| **c == Check::Sent(id)).map(|(name, _)| name.clone())
+    }
+
+    /// The project changed, so the answers no longer hold. A check still running
+    /// is asked for again, so it ends up about the new shapes.
+    pub fn invalidate(&mut self) {
+        self.checks.retain(|_, c| matches!(c, Check::Wanted | Check::Sent(_)));
+        for check in self.checks.values_mut() {
+            *check = Check::Wanted;
+        }
+    }
+
     /// The panel: one row per joint with a slider and a Play button.
     pub fn panel_ui(&mut self, ui: &mut egui::Ui, project: &Project) -> Option<MotionAction> {
         // A joint that has gone (undo, or the model removed it) can't be shown any more.
@@ -54,6 +95,7 @@ impl Motion {
         if self.drag.as_ref().is_some_and(|(name, _)| project.joint(name).is_none()) {
             self.drag = None;
         }
+        self.checks.retain(|name, _| project.joint(name).is_some());
         let mut action = None;
         ui.strong("Motion");
         if project.joints.is_empty() {
@@ -74,6 +116,11 @@ impl Motion {
                 let button = ui.small_button(if playing { "Stop" } else { "Play" });
                 if button.on_hover_text("Sweep through the whole range without saving").clicked() {
                     self.playing = (!playing).then(|| (joint.name.clone(), Instant::now()));
+                }
+                let running = matches!(self.checks.get(&joint.name), Some(Check::Wanted | Check::Sent(_)));
+                let check = ui.add_enabled(!running, egui::Button::new("Check").small());
+                if check.on_hover_text("Check the whole range for parts hitting each other").clicked() {
+                    self.checks.insert(joint.name.clone(), Check::Wanted);
                 }
             });
 
@@ -104,6 +151,22 @@ impl Motion {
                         action = Some(MotionAction::Set(name, value));
                     }
                 }
+            }
+            match self.checks.get(&joint.name) {
+                Some(Check::Wanted | Check::Sent(_)) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Checking the whole range...");
+                    });
+                }
+                Some(Check::Done(text, clear)) => {
+                    let colour = if *clear { egui::Color32::from_rgb(90, 190, 110) } else { egui::Color32::from_rgb(235, 90, 80) };
+                    ui.label(egui::RichText::new(text).color(colour).small());
+                }
+                Some(Check::Failed(error)) => {
+                    ui.weak(format!("Couldn't check: {error}"));
+                }
+                None => {}
             }
         }
         ui.add_space(2.0);

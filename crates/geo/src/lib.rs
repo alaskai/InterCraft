@@ -82,6 +82,8 @@ pub enum GeoEvent {
     Fitted { id: u64, data: serde_json::Value },
     /// An answer that isn't about a shape, such as fastener sizes.
     Info { id: u64, data: serde_json::Value },
+    /// A long job is still going (one step of a motion check done).
+    Progress { id: u64 },
     Error {
         #[serde(default)]
         id: Option<u64>,
@@ -341,6 +343,21 @@ impl PythonWorker {
 
     pub fn print_check_blocking(&mut self, mesh_key: &str, min_wall: f64, up: [f64; 3]) -> Result<serde_json::Value> {
         let id = self.request_print_check(mesh_key, min_wall, up)?;
+        self.wait_for(id)
+    }
+
+    /// Move parts through a joint's range and check for clashes at each value, without
+    /// waiting. `parts` lists each part's mesh key, and for the parts that move, one
+    /// extra move per value as [x, y, z, rx, ry, rz]. The answer arrives as
+    /// `GeoEvent::Info` with this id.
+    pub fn request_sweep(&mut self, parts: &serde_json::Value, values: &[f64]) -> Result<u64> {
+        let id = self.next_id;
+        self.send(serde_json::json!({ "cmd": "sweep", "parts": parts, "values": values }))?;
+        Ok(id)
+    }
+
+    pub fn sweep_blocking(&mut self, parts: &serde_json::Value, values: &[f64]) -> Result<serde_json::Value> {
+        let id = self.request_sweep(parts, values)?;
         self.wait_for(id)
     }
 

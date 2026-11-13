@@ -2,6 +2,8 @@
 // Shared by the MCP server and the built-in chat panel, so both behave the same.
 // serde_json 1, anyhow 1, dirs 7
 
+pub mod motion;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +58,7 @@ Joints and motion:
 - `at` is where a joint is now. Build reports, measure, check_fit and view_model all show the parts at `at`. To check that a lid clears the box when open, edit_joint it to the open angle, run check_fit, then set it back.
 - Joints can chain: a part moved by one joint can be the base of another, and moves everything hanging from it.
 - Moving parts need clearance: about 0.3 mm or more around a printed hinge pin, and a gap where a part swings past another. Say which in the joint's why.
+- After adding or changing a joint, or a part that moves, run check_motion. It sweeps the whole range and says where anything clashes. Fix a clash (more clearance, a smaller range, a chamfer on the swinging edge) and check again before calling a mechanism done.
 
 Standard parts and fits:
 - Never size a screw hole, nut trap, insert hole or bearing seat from memory. Call fastener_info for the size (e.g. "M4") and use its numbers.
@@ -574,6 +577,18 @@ pub fn definitions() -> Value {
             },
         },
         {
+            "name": "check_motion",
+            "description": "Move a joint through its whole range and check at each step whether the parts it moves hit anything. Reports the ranges that clash (which parts, and the worst overlap) or, if it moves freely, the closest gap and where. Run it after adding or changing a joint, and after changing a part that moves.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "joint": { "type": "string", "description": "The joint to check." },
+                    "steps": { "type": "integer", "minimum": 2, "maximum": motion::MAX_STEPS, "description": "How many positions to check across the range. Default 19." },
+                },
+                "required": ["joint"],
+            },
+        },
+        {
             "name": "delete_joint",
             "description": "Remove a joint. The parts stay where its value 0 puts them.",
             "inputSchema": {
@@ -945,6 +960,29 @@ impl ToolHost {
                 project.edit_joint(name, edit)?;
                 project.save()?;
                 self.joint_report(&project, name)
+            }
+            "check_motion" => {
+                let name = text(args, "joint")?;
+                let joint = project.project.joint(name).with_context(|| format!("no joint called '{name}'"))?.clone();
+                let steps = match args.get("steps") {
+                    None | Some(Value::Null) => motion::DEFAULT_STEPS,
+                    Some(v) => v.as_u64().filter(|n| (2..=motion::MAX_STEPS as u64).contains(n)).with_context(|| {
+                        format!("'steps' must be a whole number from 2 to {}", motion::MAX_STEPS)
+                    })? as usize,
+                };
+                let moving = project.project.moved_by(&joint.name);
+                if moving.len() == project.project.parts.len() {
+                    bail!("every part moves with '{}', so there is nothing for it to hit", joint.name);
+                }
+                let mut built = Vec::new();
+                for part in &project.project.parts {
+                    let key = self.built_key(&project, part, None, true)?;
+                    built.push((part.name.clone(), key, project.project.shown_pose(part)));
+                }
+                let values = motion::sweep_values(&joint, steps);
+                let parts = motion::sweep_parts(&project.project, &joint.name, &values, &built);
+                let data = self.with_worker(|w| w.sweep_blocking(&parts, &values))?;
+                Ok(motion::summarise(&joint, &data))
             }
             "delete_joint" => {
                 let name = text(args, "name")?;

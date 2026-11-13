@@ -438,6 +438,46 @@ fn a_hinged_lid_opens_and_the_tools_see_it_open() {
 }
 
 #[test]
+fn check_motion_finds_where_a_lid_hits_the_wall() {
+    if !worker_available() {
+        return;
+    }
+    let _one = one_at_a_time();
+    let (mut host, dir) = project("sweep");
+    host.call("add_part", &json!({ "name": "Box" })).unwrap();
+    add(&mut host, "Box", "Body", "part = Box(40, 20, 10)").unwrap();
+    host.call("add_part", &json!({ "name": "Lid" })).unwrap();
+    add(&mut host, "Lid", "Plate", "part = Box(40, 20, 2)").unwrap();
+    host.call("place_part", &json!({ "part": "Lid", "position": [0, 0, 6] })).unwrap();
+    let hinge = json!({
+        "name": "Lid hinge", "kind": "hinge", "base": "Box", "part": "Lid",
+        "origin": [0, 10, 5], "axis": [-1, 0, 0], "min": 0, "max": 110,
+    });
+    host.call("add_joint", &hinge).unwrap();
+
+    // Nothing else around: it swings freely, resting on the box when shut.
+    let free = host.call("check_motion", &json!({ "joint": "Lid hinge", "steps": 12 })).unwrap();
+    assert_eq!(free["clear"], true, "{free}");
+    assert!(free["summary"].as_str().unwrap().starts_with("Lid hinge moves freely from 0° to 110°."), "{free}");
+
+    // A wall 1 mm behind the open lid: fine at 90°, hit once it opens further.
+    host.call("add_part", &json!({ "name": "Wall" })).unwrap();
+    add(&mut host, "Wall", "Slab", "part = Box(40, 2, 30)").unwrap();
+    host.call("place_part", &json!({ "part": "Wall", "position": [0, 14, 20] })).unwrap();
+    let hit = host.call("check_motion", &json!({ "joint": "Lid hinge", "steps": 12 })).unwrap();
+    assert_eq!(hit["clear"], false, "{hit}");
+    let range = &hit["clash_ranges"][0];
+    assert_eq!((range["from"].as_f64(), range["to"].as_f64()), (Some(100.0), Some(110.0)), "{hit}");
+    assert_eq!(range["parts"], json!(["Lid and Wall"]));
+    assert!(hit["note"].as_str().unwrap().contains("every 10°"));
+    // The check moves nothing for real.
+    assert_eq!(host.call("get_project", &json!({})).unwrap()["joints"][0]["at"], 0.0);
+    assert!(host.call("check_motion", &json!({ "joint": "Nope" })).is_err());
+    assert!(host.call("check_motion", &json!({ "joint": "Lid hinge", "steps": 1000 })).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_why_travels_through_the_tools() {
     if !worker_available() {
         return;

@@ -388,6 +388,48 @@ def fit(req):
     send({"id": req["id"], "event": "fitted", "data": {"pairs": pairs}})
 
 
+def boxes_meet(a, b):
+    """Whether two bounding boxes share any space, one inside the other included."""
+    return all(
+        getattr(a.min, axis) <= getattr(b.max, axis) and getattr(b.min, axis) <= getattr(a.max, axis)
+        for axis in "XYZ"
+    )
+
+
+def sweep(req):
+    """Move parts through a joint's range and check the moving ones against the rest at
+    each step. Each moving part brings one extra move per step, from where its shape
+    was built to where the joint puts it."""
+    moving, still = {}, {}
+    for p in req["parts"]:
+        shape = cached_shape(p["mesh"])
+        if p.get("moves"):
+            moving[p["name"]] = (shape, p["moves"])
+        else:
+            still[p["name"]] = shape
+    boxes = {name: shape.bounding_box() for name, shape in still.items()}
+    steps = []
+    for i, value in enumerate(req["values"]):
+        clashes, closest = [], None
+        for a, (shape, moves) in moving.items():
+            placed = place(shape, moves[i])
+            box = placed.bounding_box()
+            for b, other in still.items():
+                # Boxes apart means no overlap, so the boolean can be skipped.
+                if boxes_meet(box, boxes[b]):
+                    common = placed.intersect(other)
+                    volume = sum(s.volume for item in (common or []) for s in item.solids())
+                    if volume > 1e-6:
+                        clashes.append({"a": a, "b": b, "overlap_volume": round(volume, 3)})
+                        continue
+                distance = placed.distance_to(other)
+                if closest is None or distance < closest["clearance"]:
+                    closest = {"a": a, "b": b, "clearance": round(distance, 4)}
+        steps.append({"at": value, "clashes": clashes, "closest": closest})
+        send({"id": req["id"], "event": "progress"})
+    send({"id": req["id"], "event": "info", "data": {"steps": steps}})
+
+
 def main():
     send({"event": "ready", "build123d": build123d.__version__})
     for line in sys.stdin:
@@ -407,6 +449,8 @@ def main():
                 inspect(req)
             elif req.get("cmd") == "fit":
                 fit(req)
+            elif req.get("cmd") == "sweep":
+                sweep(req)
             elif req.get("cmd") == "print_check":
                 shape = cached_shape(req["mesh"])
                 min_wall = float(req.get("min_wall") or 1.2)

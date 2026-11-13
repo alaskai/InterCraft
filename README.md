@@ -129,6 +129,12 @@ Each part has a placement: a position in mm and a rotation in degrees about X, Y
 
 Fit check compares every pair of visible parts on the real CAD shapes. A pair either clashes, with the overlapping volume listed and drawn in red through the parts, or is clear, with the smallest gap listed. Hover a row to see where the gap is. The check runs again by itself after each change while its panel is open.
 
+### Joints
+
+A joint lets one part move against another. A hinge turns it about an axis (a lid, a door, a lever) and a slider moves it along one (a drawer, a carriage). The model adds them with `add_joint`: the part it is fixed to, the part that moves, the axis and the range. Joints can chain, so a latch on a hinged lid moves with the lid.
+
+Each joint keeps its current position. Everything is shown there, and measuring and the fit check see that pose too, so the model can open a lid and check it clears the box. The moving part's placement is where it sits with its joint at 0. Exports always use that rest position, wherever a joint was left. The Inspector says which joint moves the selected part and where it is.
+
 ### Print check
 
 Print check looks at the selected part the way a 3D printer will, with +Z up:
@@ -215,6 +221,7 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `add_standard_part` | Adds a real screw, nut, washer, heat-set insert or ball bearing as its own part |
 | `print_check` | Thin walls, small holes and overhangs that would need support, with positions and a rough PLA weight |
 | `check_fit` | Clashes (with volume) and clearances between parts |
+| `add_joint`, `edit_joint`, `delete_joint` | Hinges and sliders between parts, and moving them to check a pose |
 | `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing one part. The six side views are drawn flat, like a drawing |
 | `undo`, `redo` | Step back or forward through the project history |
 | `inspect_part` | Faces, holes and circular edges of a part with exact sizes and positions |
@@ -231,7 +238,7 @@ A project is a folder with a `project.json` and one Python snippet per feature.
 
 ```
 examples/bracket/
-  project.json            parts, feature order, labels, prompts, parameters
+  project.json            parts, feature order, labels, prompts, parameters, joints
   brief.md                the design brief, in Markdown
   .intercraft/history/    undo snapshots (not needed to share the project)
   .intercraft/view/       picture requests from the model, removed once answered

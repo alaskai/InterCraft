@@ -390,6 +390,54 @@ fn check_fit_finds_clashes_and_gaps() {
 }
 
 #[test]
+fn a_hinged_lid_opens_and_the_tools_see_it_open() {
+    if !worker_available() {
+        return;
+    }
+    let _one = one_at_a_time();
+    let (mut host, dir) = project("hinge");
+    host.call("add_part", &json!({ "name": "Box" })).unwrap();
+    add(&mut host, "Box", "Body", "part = Box(40, 20, 10)").unwrap();
+    host.call("add_part", &json!({ "name": "Lid" })).unwrap();
+    add(&mut host, "Lid", "Plate", "part = Box(40, 20, 2)").unwrap();
+    host.call("place_part", &json!({ "part": "Lid", "position": [0, 0, 6] })).unwrap();
+
+    // Along the top back edge, turning so positive angles lift the front of the lid.
+    let hinge = json!({
+        "name": "Lid hinge", "kind": "hinge", "base": "Box", "part": "Lid",
+        "origin": [0, 10, 5], "axis": [-1, 0, 0], "min": 0, "max": 110,
+        "why": "Opens the lid upwards about its back edge.",
+    });
+    let added = host.call("add_joint", &hinge).unwrap();
+    assert_eq!(added["summary"], "Lid hinge: hinge, 0 to 110°, now 0°");
+    assert_eq!(added["moved_parts"][0]["bbox_min"], json!([-20.0, -10.0, 5.0]));
+    assert!(host.call("add_joint", &hinge).is_err(), "the name is taken");
+
+    let open = host.call("edit_joint", &json!({ "name": "Lid hinge", "at": 90 })).unwrap();
+    let lid = &open["moved_parts"][0];
+    assert_eq!((lid["bbox_min"].clone(), lid["bbox_max"].clone()), (json!([-20.0, 10.0, 5.0]), json!([20.0, 12.0, 25.0])), "{open}");
+    assert!(host.call("edit_joint", &json!({ "name": "Lid hinge", "at": 200 })).is_err(), "outside the range");
+
+    // Everything else sees the open pose, and says so.
+    let fit = host.call("check_fit", &json!({})).unwrap();
+    assert_eq!(fit["joints"][0], "Lid hinge: hinge, 0 to 110°, now 90°");
+    let project = host.call("get_project", &json!({})).unwrap();
+    assert_eq!(project["joints"][0]["at"], 90.0);
+    let lid_report = project["parts"].as_array().unwrap().iter().find(|p| p["part"] == "Lid").unwrap().clone();
+    assert_eq!(lid_report["moved_by"][0], "Lid hinge: hinge, 0 to 110°, now 90°");
+    assert_eq!(lid_report["features"][0]["bbox_max"], json!([20.0, 12.0, 25.0]));
+
+    // Exports stay at rest, wherever the hinge was left.
+    let exported = host.call("export_part", &json!({ "part": "Lid", "format": "step" })).unwrap();
+    assert!(exported["exported"][0].as_str().is_some());
+
+    assert_eq!(host.call("undo", &json!({})).unwrap()["undone"], "Move 'Lid hinge' to 90°");
+    let removed = host.call("delete_joint", &json!({ "name": "lid hinge" })).unwrap();
+    assert_eq!(removed["back_at_rest"], json!(["Lid"]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_why_travels_through_the_tools() {
     if !worker_available() {
         return;

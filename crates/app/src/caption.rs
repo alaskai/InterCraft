@@ -70,6 +70,9 @@ pub fn tool_purpose(name: &str) -> &'static str {
         "view_model" => "Takes a picture of the model to check that it looks right.",
         "export_part" => "Writes the part to a file: STEP to keep editing it, STL to 3D print it.",
         "update_brief" => "Updates the project's design brief: what it is for, decisions made and open questions.",
+        "add_joint" => "Lets one part move against another: a hinge turns it, a slider slides it.",
+        "edit_joint" => "Changes a joint, or moves it to a new position to check that pose.",
+        "delete_joint" => "Removes a joint, so the parts no longer move.",
         "undo" => "Steps back one change.",
         "redo" => "Steps forward again after an undo.",
         "ask_user" => "Asks you to choose, because the decision is yours.",
@@ -120,6 +123,19 @@ pub fn caption(name: &str, input: &Value, level: Explain) -> Option<String> {
         "update_brief" => format!("Updating the brief: {}", text("section").unwrap_or("notes")),
         "undo" => "Undoing the last change".to_owned(),
         "redo" => "Redoing the change".to_owned(),
+        "add_joint" => {
+            let kind = text("kind").unwrap_or("joint");
+            let base = format!("Adding a {kind} so {} can move", part.unwrap_or("the part"));
+            match (level, text("why")) {
+                (Explain::Expert, _) | (_, None) => base,
+                (_, Some(why)) => format!("{base}: {why}"),
+            }
+        }
+        "edit_joint" => match input["at"].as_f64() {
+            Some(at) => format!("Moving {} to {}", text("name").unwrap_or("the joint"), crate::measure::mm(at)),
+            None => format!("Changing {}", text("name").unwrap_or("a joint")),
+        },
+        "delete_joint" => format!("Removing {}", text("name").unwrap_or("a joint")),
         _ => return None,
     };
     // Checks get a word on why they matter, for someone new to this.
@@ -128,6 +144,7 @@ pub fn caption(name: &str, input: &Value, level: Explain) -> Option<String> {
         (Explain::Beginner, "check_fit") => " (parts that should fit together must not overlap)",
         (Explain::Beginner, "inspect_part") => " (exact sizes before changing anything)",
         (Explain::Beginner, "fastener_info") => " (from the standard tables, not from memory)",
+        (Explain::Beginner, "edit_joint") if input["at"].is_number() => " (to check that pose)",
         _ => "",
     };
     Some(format!("{line}{extra}"))

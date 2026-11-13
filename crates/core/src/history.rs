@@ -353,6 +353,22 @@ fn describe(before: &Content, after: &Content) -> String {
             changes.push(format!("Delete part '{}'", was.name));
         }
     }
+    for joint in &new.joints {
+        match old.joints.iter().find(|j| j.name == joint.name) {
+            None => changes.push(format!("Add joint '{}'", joint.name)),
+            Some(was) if was == joint => {}
+            // Only its position changed: say where it went.
+            Some(was) if crate::Joint { at: was.at, ..joint.clone() } == *was => {
+                changes.push(format!("Move '{}' to {}{}", joint.name, crate::joints::tidy(joint.at), joint.kind.unit()))
+            }
+            Some(_) => changes.push(format!("Edit joint '{}'", joint.name)),
+        }
+    }
+    for was in &old.joints {
+        if !new.joints.iter().any(|j| j.name == was.name) {
+            changes.push(format!("Delete joint '{}'", was.name));
+        }
+    }
     match changes.len() {
         0 => "Change project".to_owned(),
         1 => changes.remove(0),

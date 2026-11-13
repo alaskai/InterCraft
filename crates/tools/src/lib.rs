@@ -25,7 +25,7 @@ Writing a feature:
 
 Design brief:
 - Every project has a brief (brief.md): what it is, how it will be made, key dimensions, decisions and open items. get_project includes it. Read it before designing.
-- If the brief is empty or still the blank template, start by asking the user about it with ask_user (2 to 4 short questions at a time: what it is for, what it attaches to or holds, rough size, how it will be made). Record the answers with update_brief.
+- If the brief is empty or still the blank template, start by asking the user about it. Call ask_user 2 to 4 times in the same reply, one short question per call (what it is for, what it attaches to or holds, rough size, how it will be made), then end the reply. The user answers them all at once. Record the answers with update_brief.
 - Keep it current as you work: add each decision with its reason, record measured versus assumed dimensions, and keep a short list of open items. Update one section at a time.
 
 Working method:
@@ -180,7 +180,8 @@ pub fn chat_panel_definitions() -> Value {
             "name": "ask_user",
             "description": "Ask the user to choose when the decision is genuinely theirs: design intent, a trade-off, \
 or a dimension you can't measure or sensibly assume. The options appear as buttons in InterCraft's chat. \
-After calling this, end your reply without further tool calls; the answer arrives as the user's next message. \
+One question per call. To ask several things, call it once for each question in the same reply (up to 4), \
+then end your reply without other tool calls; all the answers arrive together as the user's next message. \
 Don't use it for things you can work out from the project or the build reports.",
             "inputSchema": {
                 "type": "object",
@@ -579,7 +580,7 @@ impl ToolHost {
             validate_question(args)?;
             return Ok(json!({
                 "shown": true,
-                "next": "The question is on the user's screen. End your reply now without more tool calls. Their answer arrives as their next message.",
+                "next": "The question is on the user's screen. Ask any other questions now with more ask_user calls, then end your reply without other tool calls. The answers arrive together as their next message.",
             }));
         }
         // One tool call at a time per project, across processes, so two agents

@@ -119,6 +119,10 @@ const MEMORY_LIMIT: usize = 4 << 30;
 /// Loading OpenCascade takes a few seconds, more on a cold disk. Not a build step.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Reading and meshing a big imported assembly can take minutes, and that isn't a
+/// stuck snippet. The worker still reports between stages, so this is per stage.
+pub const IMPORT_TIMEOUT: Duration = Duration::from_secs(600);
+
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
 pub struct PythonWorker {
@@ -134,6 +138,8 @@ pub struct PythonWorker {
     last_progress: Instant,
     /// The worker has finished loading and said so.
     ready: bool,
+    /// Something in flight reads an imported file, so allow IMPORT_TIMEOUT.
+    slow: bool,
     #[cfg(windows)]
     _job: Option<job::Job>,
 }
@@ -164,8 +170,20 @@ impl PythonWorker {
         false
     }
 
-    fn current_timeout(&self) -> Duration {
-        if self.ready { build_timeout() } else { STARTUP_TIMEOUT }
+    /// How long the worker may go quiet before it counts as stuck, right now.
+    pub fn current_timeout(&self) -> Duration {
+        if !self.ready {
+            STARTUP_TIMEOUT
+        } else if self.slow {
+            IMPORT_TIMEOUT.max(build_timeout())
+        } else {
+            build_timeout()
+        }
+    }
+
+    /// Whether a request in flight reads an imported file.
+    pub fn importing(&self) -> bool {
+        self.slow
     }
 
     fn start(wake: Wake) -> Result<Self> {
@@ -224,6 +242,7 @@ impl PythonWorker {
             in_flight: 0,
             last_progress: Instant::now(),
             ready: false,
+            slow: false,
             #[cfg(windows)]
             _job: job,
         })
@@ -246,8 +265,21 @@ impl PythonWorker {
                 | GeoEvent::Error { .. }
         ) {
             self.in_flight = self.in_flight.saturating_sub(1);
+            if self.in_flight == 0 {
+                self.slow = false;
+            }
         }
     }
+}
+
+/// What to tell the user when the worker went quiet for `timeout`.
+pub fn stuck_message(timeout: Duration, importing: bool) -> String {
+    let cause = if importing {
+        "The imported file may be too big or too detailed to load"
+    } else {
+        "An endless loop in a snippet is the usual cause"
+    };
+    format!("A build step ran for over {} s and was stopped. {cause}.", timeout.as_secs())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,21 +297,23 @@ impl PythonWorker {
             self.last_progress = Instant::now();
         }
         self.in_flight += 1;
+        let imports = msg["features"].as_array().is_some_and(|f| f.iter().any(|f| f.get("import").is_some()));
+        if imports || msg.get("step").is_some() {
+            self.slow = true;
+        }
         writeln!(self.stdin, "{msg}").context("writing to worker")?;
         self.stdin.flush().context("flushing worker stdin")
     }
 
     fn recv_blocking(&mut self) -> Result<GeoEvent> {
-        match self.events.recv_timeout(self.current_timeout()) {
+        let timeout = self.current_timeout();
+        match self.events.recv_timeout(timeout) {
             Ok(GeoEvent::Exited) => bail!("the geometry worker stopped (it may have run out of memory)"),
             Ok(event) => {
                 self.track(&event);
                 Ok(event)
             }
-            Err(_) => bail!(
-                "a build step ran for over {} s and was stopped. An endless loop in a snippet is the usual cause",
-                build_timeout().as_secs()
-            ),
+            Err(_) => bail!("{}", stuck_message(timeout, self.slow)),
         }
     }
 

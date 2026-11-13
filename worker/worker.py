@@ -60,13 +60,14 @@ def feature_hash(prev, feature):
     return h.hexdigest()
 
 
-def write_mesh(shape, path):
+def write_mesh(shape, path, tick=lambda: None):
     # Mesh files are named by a hash of everything that shaped them, so an existing
     # file is already right. The viewer and an MCP server each run a worker and can
     # build the same step at the same moment.
     if os.path.exists(path):
         return
     verts, tris = shape.tessellate(LINEAR_TOL, ANGULAR_TOL)
+    tick()
     v = np.array([(q.X, q.Y, q.Z) for q in verts], dtype=np.float32).reshape(-1, 3)
     t = np.array(tris, dtype=np.uint32).reshape(-1, 3)
 
@@ -80,7 +81,11 @@ def write_mesh(shape, path):
         length = np.linalg.norm(n, axis=1, keepdims=True)
         n = n / np.where(length > 0, length, 1)
 
-    edges = [edge_points(e) for e in shape.edges()]
+    edges = []
+    for e in shape.edges():
+        edges.append(edge_points(e))
+        if len(edges) % 2000 == 0:
+            tick()
     corners = [tuple(vx) for vx in shape.vertices()]
 
     tmp = f"{path}.{os.getpid()}.tmp"
@@ -206,7 +211,7 @@ def rebuild(req, emit=True):
                 shown = place(shape, placement)
                 report = make_report(shown, volume)
                 mesh_path = os.path.join(cache_dir, placed + ".icm")
-                write_mesh(shown, mesh_path)
+                write_mesh(shown, mesh_path, tick)
                 _cache[placed] = (shown, report, mesh_path)
             volume = report["volume"]
             event.update(ok=True, cached=cached, mesh=mesh_path, report=report)
@@ -247,6 +252,11 @@ def export(req):
 
 def cached_shape(mesh_key):
     entry = _cache.get(mesh_key)
+    def tick():
+        # A big import takes several slow stages; each one shows the app it's alive.
+        if emit:
+            send({"id": rid, "event": "progress"})
+
     if entry is None:
         raise ValueError("that shape is no longer cached; rebuild the part and try again")
     return entry[0]
@@ -270,8 +280,10 @@ def entity(selection):
     if not 0 <= index < len(found):
         raise ValueError(f"{kind} {index} doesn't exist; the shape has {len(found)}")
     return found[index]
+                    tick()
 
 
+                tick()
 def describe(item):
     """Facts about one edge, face or vertex, for a single-click measurement."""
     if isinstance(item, build123d.Vertex):

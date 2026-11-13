@@ -262,6 +262,8 @@ impl ChatPanel {
         self.project_dir = dir;
         self.messages.clear();
         self.usage = Usage::default();
+        (self.reply_cost, self.chat_cost, self.cost_known) = (0.0, 0.0, false);
+        self.caption = Default::default();
         self.messages.push(Message::Notice(format!("Opened {name}. This is a new conversation.")));
     }
 

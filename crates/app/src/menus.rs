@@ -475,11 +475,55 @@ impl App {
         else {
             return;
         };
-        if !dir.join("project.json").exists() {
-            self.state.worker_status = format!("{} isn't an InterCraft project (it has no project.json).", dir.display());
+        self.open_folder(dir);
+    }
+
+    /// Open a folder picked by the user. A folder inside a project (a part's snippets,
+    /// say) opens that project; a folder that isn't one is offered to become one.
+    pub(crate) fn open_folder(&mut self, dir: PathBuf) {
+        if dir.join("project.json").exists() {
+            self.open(dir);
             return;
         }
-        self.open(dir);
+        if let Some(project) = dir.ancestors().skip(1).take(3).find(|d| d.join("project.json").exists()) {
+            self.open(project.to_path_buf());
+            return;
+        }
+        self.make_project = Some(dir);
+    }
+
+    pub(crate) fn make_project_window(&mut self, ctx: &egui::Context) {
+        let Some(dir) = self.make_project.clone() else { return };
+        let mut open = true;
+        let mut make = false;
+        egui::Window::new("Not a project yet")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.label(format!("{} has no project.json, so it isn't an InterCraft project yet.", dir.display()));
+                ui.weak("Making it one adds project.json and brief.md. Anything else in the folder is left alone.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    make = ui.button("Make it a project").clicked();
+                    if ui.button("Cancel").clicked() {
+                        self.make_project = None;
+                    }
+                });
+            });
+        if !open {
+            self.make_project = None;
+        }
+        if make {
+            self.make_project = None;
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
+            match intercraft_core::LoadedProject::create(&dir, &name) {
+                Ok(_) => self.open(dir),
+                Err(e) => self.state.worker_status = format!("Couldn't make a project there: {e:#}"),
+            }
+        }
     }
 }
 

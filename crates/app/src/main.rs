@@ -80,6 +80,7 @@ struct App {
     state: State,
     settings_open: bool,
     new_project: Option<menus::NewProjectDialog>,
+    make_project: Option<PathBuf>,
     /// Window focus last frame, to notice when the user comes back to this window.
     was_focused: bool,
     /// The window title needs the new project's name.
@@ -220,7 +221,7 @@ impl App {
         let _ = settings::Settings::remember_project(&state.project_dir);
         state.reload_project();
         let first_run = !saved.onboarded;
-        Ok(Self { dock, state, settings_open: false, new_project: None, was_focused: true, title_dirty: true, first_run })
+        Ok(Self { dock, state, settings_open: false, new_project: None, make_project: None, was_focused: true, title_dirty: true, first_run })
     }
 
     /// Switch to another project folder.
@@ -307,6 +308,7 @@ impl eframe::App for App {
         self.settings_window(&ctx);
         self.first_run_window(&ctx);
         self.new_project_window(&ctx);
+        self.make_project_window(&ctx);
         DockArea::new(&mut self.dock)
             .show_close_buttons(false)
             .show_leaf_close_all_buttons(false)
@@ -332,7 +334,19 @@ impl State {
         self.shown.clear();
         self.poses.clear();
         self.mesh_pose.clear();
-        self.motion.stop();
+        // Nothing from the old project may stay on screen: its checks, overlays,
+        // section, picks, caption or half-made edits.
+        self.motion = motion::Motion::default();
+        self.fit = None;
+        self.print_check = None;
+        self.viewport.set_overlays(&[]);
+        self.viewport.section = None;
+        self.measure.clear();
+        self.outside_caption = Default::default();
+        self.param_drag = None;
+        self.code_draft = None;
+        self.brief_draft = None;
+        self.rename = None;
         self.hidden.clear();
         self.selected_part = None;
         self.selected_step = None;

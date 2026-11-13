@@ -1177,3 +1177,120 @@ fn print_check_marks_problems_on_the_part() {
     click(&mut h, "Print check");
     assert!(h.state().state.print_check.is_none());
 }
+
+/// The example bracket plus a turned copy of it on a hinge, open in the viewer.
+fn hinged_copy(name: &str, size: egui::Vec2) -> (Harness<'static, App>, PathBuf) {
+    let project = example_project(name);
+    sandbox_dirs();
+    let dir = project.clone();
+    let mut h = Harness::builder().with_size(size).wgpu().build_eframe(move |cc| App::new(cc, dir).expect("app starts"));
+    wait_until(&mut h, "the first build", built);
+    let mut loaded = intercraft_core::LoadedProject::load(&project).unwrap();
+    loaded.duplicate_part("RodBracket", Some("Arm")).unwrap();
+    loaded.set_placement("Arm", [0.0, 40.0, 0.0], [0.0; 3]).unwrap();
+    let joint = intercraft_core::Joint {
+        name: "Arm pivot".into(),
+        kind: intercraft_core::JointKind::Hinge,
+        base: "RodBracket".into(),
+        part: "Arm".into(),
+        origin: [0.0, 20.0, 0.0],
+        axis: [0.0, 0.0, 1.0],
+        min: 0.0,
+        max: 90.0,
+        at: 0.0,
+        why: String::new(),
+    };
+    loaded.add_joint(joint).unwrap();
+    loaded.save().unwrap();
+    wait_until(&mut h, "the copy", |app| built(app) && app.state.shown.contains_key("Arm"));
+    (h, project)
+}
+
+fn settle(h: &mut Harness<'static, App>) {
+    for _ in 0..30 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn panels_keep_clear_of_the_toolbar_and_each_other() {
+    let _one = one_at_a_time();
+    for (size, name) in [(egui::vec2(1000.0, 640.0), "small"), (egui::vec2(1250.0, 760.0), "medium")] {
+        let (mut h, _) = hinged_copy(&format!("panels-{name}"), size);
+        for button in ["Motion", "Print check", "Fit check"] {
+            click(&mut h, button);
+        }
+        settle(&mut h);
+        shot(&mut h, &format!("panels_{name}_window"));
+
+        // However small the view, no panel covers the toolbar, which is how panels are closed.
+        let toolbar = h.state().state.toolbar;
+        let fit_title = h.query_all_by_label("Fit check").map(|n| n.rect()).find(|r| !toolbar.contains_rect(*r)).unwrap();
+        let print = h.get_by_label_contains("Print check: ").rect().union(h.get_by_label_contains("g of PLA").rect());
+        let motion = h.get_by_label_contains("Drag to move").rect().union(h.get_by_label("Arm pivot").rect());
+        for (panel, what) in [(fit_title, "fit"), (print, "print"), (motion, "motion")] {
+            assert!(!panel.intersects(toolbar), "{name}: the {what} panel covers the toolbar: {panel:?} {toolbar:?}");
+        }
+        // With room for them, the panels keep clear of each other too.
+        if name == "medium" {
+            assert!(!print.intersects(motion), "{print:?} {motion:?}");
+            assert!(!fit_title.intersects(motion) && !fit_title.intersects(print));
+        }
+    }
+}
+
+#[test]
+fn moving_a_joint_hides_old_checks_and_needs_no_caption() {
+    let _one = one_at_a_time();
+    let (mut h, _) = hinged_copy("own-edit", egui::vec2(1400.0, 860.0));
+    click(&mut h, "Motion");
+    click(&mut h, "Fit check");
+    settle(&mut h);
+    assert!(!h.state().state.viewport.hide_overlays);
+    click(&mut h, "Play");
+    settle(&mut h);
+    assert!(h.state().state.viewport.hide_overlays, "clash volumes are hidden while the joint plays");
+    click(&mut h, "Stop");
+    assert!(!h.state().state.viewport.hide_overlays);
+
+    // A change made in the app says so in the status bar, not in a caption as well.
+    h.state_mut().state.outside_caption = Default::default();
+    let edit = intercraft_core::JointEdit { at: Some(60.0), ..Default::default() };
+    h.state_mut().state.edit_project(|p| p.edit_joint("Arm pivot", edit).and_then(|()| p.save())).unwrap();
+    h.step();
+    assert!(h.state().state.outside_caption.shown().is_none(), "{:?}", h.state().state.outside_caption.shown());
+}
+
+#[test]
+fn switching_project_leaves_nothing_of_the_old_one() {
+    let _one = one_at_a_time();
+    let (mut h, project) = hinged_copy("switch", egui::vec2(1400.0, 860.0));
+    for name in ["Motion", "Print check", "Fit check", "Section"] {
+        click(&mut h, name);
+    }
+    settle(&mut h);
+
+    // A part's own folder opens the project it belongs to.
+    h.state_mut().open_folder(project.join("RodBracket"));
+    h.step();
+    assert_eq!(h.state().state.project_dir, project.join("RodBracket").parent().unwrap());
+
+    // A plain folder is offered to become a project, and switching clears the old one away.
+    let empty = sandbox_dirs().join(format!("plain-folder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&empty);
+    std::fs::create_dir_all(&empty).unwrap();
+    h.state_mut().open_folder(empty.clone());
+    h.step();
+    h.step();
+    shot(&mut h, "make_project_offer");
+    click(&mut h, "Make it a project");
+    settle(&mut h);
+    let app = &h.state().state;
+    assert_eq!(app.project_dir, empty);
+    assert!(app.project.as_ref().unwrap().project.parts.is_empty());
+    assert!(app.fit.is_none() && app.print_check.is_none() && app.viewport.section.is_none());
+    assert!(!app.motion.open && app.outside_caption.shown().is_none());
+    assert!(app.viewport.visible_bounds().is_none(), "no old meshes");
+    shot(&mut h, "switched_project");
+}

@@ -158,7 +158,15 @@ If the file holds several bodies (an assembly from Fusion, Onshape or SolidWorks
 | Separate parts in a group | One part per body, named from the file, under a folder in the parts list. Each body keeps its place in the assembly and can be moved, put on a joint, fit checked or edited. Their files go in `imports/<group>/`. Up to 500 bodies. |
 | One part | The whole file as a single part, as before. |
 
-Right-click a group to hide, isolate, rename or delete it. A big assembly can take a minute or two to read and mesh.
+A group is one colour, and the eye on its header hides or shows the whole import. Right-click a group to:
+
+- **Stand upright (Y up to Z up):** many CAD programs export with Y up, so a model can arrive lying on its back.
+- **Turn 90° about Z**, or **Rest on the floor** (lowest point at Z = 0).
+- Show only that group, rename it or delete it.
+
+The group turns as one piece, joints included, and each action is one undo step. The model can do the same with `move_group`.
+
+A big assembly can take a few minutes to read. Each body is kept as a quick binary copy next to its mesh, so the project opens in seconds after that. If the geometry worker runs out of memory, InterCraft restarts it and carries on with the other parts. A part that stops it twice is left out with a message, so the rest of the model still shows.
 
 ### Undo and history
 
@@ -227,6 +235,7 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `update_brief` | Replaces one section of the design brief |
 | `delete_part` | Removes a design part (reference parts can only be removed by you) |
 | `place_part` | Moves or turns a design part in the assembly |
+| `move_group` | Moves or turns a whole imported group as one piece |
 | `duplicate_part`, `rename_part` | Copies or renames a part |
 | `fastener_info` | Real sizes for a metric screw from the ISO tables: clearance holes, tap drill, head, nut and heat-set insert hole |
 | `add_standard_part` | Adds a real screw, nut, washer, heat-set insert or ball bearing as its own part |

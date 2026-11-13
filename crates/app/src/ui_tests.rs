@@ -310,6 +310,56 @@ fn import_step_adds_an_editable_part() {
     shot(&mut h, "imported");
 }
 
+fn asking(app: &App) -> bool {
+    matches!(app.state.import.as_ref().map(|i| &i.stage), Some(import::Stage::Asking(_)))
+}
+
+#[test]
+fn an_assembly_can_be_split_into_a_group_or_kept_whole() {
+    let _one = one_at_a_time();
+    let project = example_project("split");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    // A base plate and a hinge sub-assembly with two leaves and a pin.
+    let kit = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/tests/fixtures/kit.step");
+
+    h.state_mut().state.start_import(&kit);
+    wait_until(&mut h, "the file to be read", asking);
+    assert!(h.get_all_by_label_contains("holds 4 bodies").count() >= 1);
+    assert!(h.get_all_by_label_contains("Base, Leaf ×2, Pin").count() >= 1);
+    shot(&mut h, "import-choice");
+    click(&mut h, "Separate parts in a group");
+    wait_until(&mut h, "the bodies to be built", |app| {
+        app.state.import.is_none() && built(app) && app.state.shown.contains_key("Leaf_2")
+    });
+    assert_eq!(part_names(&h), ["RodBracket", "Base", "Leaf", "Leaf_2", "Pin"]);
+    assert_eq!(h.state().state.history.undo_label(), Some("Import 'kit' (4 parts)"));
+
+    // The group is listed, and opens to show the part picked in the 3D view.
+    assert!(h.get_all_by_label_contains("kit  (4)").count() >= 1);
+    h.state_mut().state.selected_part = Some("Pin".into());
+    h.step();
+    h.step();
+    assert!(h.get_all_by_label("Pin").count() >= 1, "the group didn't open to show Pin");
+    shot(&mut h, "import-group");
+
+    h.state_mut().state.rename_group("kit", "Hinge kit").unwrap();
+    h.step();
+    assert!(h.get_all_by_label_contains("Hinge kit  (4)").count() >= 1);
+    h.state_mut().state.delete_group("Hinge kit");
+    h.step();
+    assert_eq!(part_names(&h), ["RodBracket"]);
+
+    // Kept whole, it's one part as before.
+    h.state_mut().state.start_import(&kit);
+    wait_until(&mut h, "the file to be read again", asking);
+    click(&mut h, "One part");
+    wait_until(&mut h, "the whole file to build", |app| built(app) && app.state.shown.contains_key("kit"));
+    let app = h.state();
+    let part = app.state.project.as_ref().unwrap().part("kit").unwrap();
+    assert_eq!((part.source.as_deref(), part.group.as_deref()), (Some("imports/kit.step"), None));
+}
+
 fn part_names(h: &Harness<'static, App>) -> Vec<String> {
     let project = h.state().state.project.as_ref().expect("a project is loaded");
     project.project.parts.iter().map(|p| p.name.clone()).collect()

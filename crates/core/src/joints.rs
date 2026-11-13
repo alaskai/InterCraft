@@ -147,6 +147,18 @@ impl Pose {
     pub fn apply(&self, p: [f64; 3]) -> [f64; 3] {
         add(mul_vec(&self.rot, p), self.pos)
     }
+
+    /// The move that undoes this one.
+    pub fn inverse(&self) -> Pose {
+        let rot = [0, 1, 2].map(|i| [0, 1, 2].map(|j| self.rot[j][i]));
+        let back = mul_vec(&rot, self.pos);
+        Pose { rot, pos: back.map(|v| -v) }
+    }
+
+    /// Turns a direction without moving it.
+    pub fn turn(&self, v: [f64; 3]) -> [f64; 3] {
+        mul_vec(&self.rot, v)
+    }
 }
 
 impl Project {
@@ -183,6 +195,11 @@ impl Project {
         let pose = Pose::from_placement(part.position, part.rotation).then(&self.motion_of(&part.name));
         let placement = pose.to_placement();
         placement.iter().any(|v| *v != 0.0).then_some(placement)
+    }
+
+    /// The whole move from a part's own frame to where it is shown.
+    pub fn shown_pose(&self, part: &Part) -> Pose {
+        Pose::from_placement(part.position, part.rotation).then(&self.motion_of(&part.name))
     }
 
     /// The joints between a part and the part it ultimately hangs from, nearest first.
@@ -388,6 +405,11 @@ mod tests {
         // The same order as build123d: X, then Y, then Z of the turned frame.
         let pose = Pose::from_placement([0.0; 3], [90.0, 0.0, 90.0]);
         assert!(close(pose.apply([1.0, 0.0, 0.0]), [0.0, 0.0, 1.0]));
+        // Undoing a move lands back where it started.
+        let pose = Pose::from_placement([4.0, -2.0, 7.0], [10.0, 20.0, 30.0]);
+        let p = [1.0, 2.0, 3.0];
+        assert!(close(pose.inverse().apply(pose.apply(p)), p));
+        assert!(close(pose.then(&pose.inverse()).apply(p), p));
     }
 
     #[test]

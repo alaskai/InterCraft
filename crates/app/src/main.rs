@@ -8,6 +8,7 @@ mod fit;
 mod glossary;
 mod measure;
 mod menus;
+mod motion;
 mod print_panel;
 mod params;
 mod settings;
@@ -16,13 +17,13 @@ mod sketch;
 mod ui_tests;
 mod viewport;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState, TabViewer};
-use intercraft_core::{HistoryInfo, LoadedProject, Part, PartKind};
+use intercraft_core::{HistoryInfo, LoadedProject, Part, PartKind, Pose};
 use intercraft_geo::{ExportFormat, FeatureResult, GeoEvent, GeometryBackend, Mesh, PythonWorker, Report};
 use viewport::Viewport;
 
@@ -92,6 +93,8 @@ struct App {
 struct Entry {
     result: FeatureResult,
     stale: bool,
+    /// Where the build that made it placed the part.
+    pose: Option<Pose>,
 }
 
 struct State {
@@ -113,6 +116,14 @@ struct State {
     selected_step: Option<String>,
     /// Mesh file currently on screen for each part.
     shown: HashMap<String, PathBuf>,
+    /// Where each build sent to the worker places its part, oldest first. The worker
+    /// answers in order, so the front is the build whose results are arriving.
+    poses: HashMap<String, VecDeque<Pose>>,
+    /// Where the mesh on screen was built, so the viewer can move it to where the
+    /// part should be now (a joint being dragged, or a change still rebuilding).
+    mesh_pose: HashMap<String, Pose>,
+    /// The Motion panel: joint sliders and Play.
+    motion: motion::Motion,
     hidden: HashSet<String>,
     /// Undo history of the open project, refreshed on every reload.
     history: HistoryInfo,
@@ -179,6 +190,9 @@ impl App {
             selected_part: None,
             selected_step: None,
             shown: HashMap::new(),
+            poses: HashMap::new(),
+            mesh_pose: HashMap::new(),
+            motion: motion::Motion::default(),
             hidden: HashSet::new(),
             history: HistoryInfo::default(),
             param_drag: None,
@@ -256,6 +270,7 @@ impl eframe::App for App {
         self.state.send_preview();
         self.state.fix_selection();
         self.state.sync_meshes();
+        self.state.update_motion(ctx);
         // Both of these need the meshes of the latest build, so they come after the sync.
         self.state.run_fit();
         self.state.run_print_check();
@@ -314,6 +329,9 @@ impl State {
         self.results.clear();
         self.building.clear();
         self.shown.clear();
+        self.poses.clear();
+        self.mesh_pose.clear();
+        self.motion.stop();
         self.hidden.clear();
         self.selected_part = None;
         self.selected_step = None;
@@ -571,6 +589,7 @@ impl State {
             return;
         }
         if worker.rebuild(intercraft_tools::request_for(&loaded.dir, &loaded.project, &part)).is_ok() {
+            self.poses.entry(part.name.clone()).or_default().push_back(loaded.project.shown_pose(&part));
             for ((name, _), entry) in self.results.iter_mut() {
                 if *name == part.name {
                     entry.stale = true;
@@ -652,6 +671,15 @@ impl State {
                     if ui.selectable_label(cutting, "Section").on_hover_text("Cut the model open (S)").clicked() {
                         self.viewport.toggle_section();
                     }
+                    let has_joints = self.project.as_ref().is_some_and(|p| !p.project.joints.is_empty());
+                    if (has_joints || self.motion.open)
+                        && ui.selectable_label(self.motion.open, "Motion").on_hover_text("Move the hinges and sliders").clicked()
+                    {
+                        self.motion.open = !self.motion.open;
+                        if !self.motion.open {
+                            self.motion.stop();
+                        }
+                    }
                     if !self.hidden.is_empty() {
                         let text = format!("Show all ({} hidden)", self.hidden.len());
                         if ui.button(text).clicked() {
@@ -665,6 +693,7 @@ impl State {
         self.section_panel(ui, rect);
         self.fit_panel(ui, rect);
         self.print_panel(ui, rect);
+        self.motion_panel(ui, rect);
         self.caption_ui(ui, rect);
 
         if !self.measure.active {
@@ -908,6 +937,95 @@ impl State {
         }
     }
 
+    /// The project as shown right now: saved, or with a joint being dragged or played.
+    fn shown_project(&self) -> Option<std::borrow::Cow<'_, intercraft_core::Project>> {
+        let loaded = self.project.as_ref()?;
+        let Some((name, value)) = self.motion.preview(&loaded.project) else {
+            return Some(std::borrow::Cow::Borrowed(&loaded.project));
+        };
+        let mut project = loaded.project.clone();
+        if let Some(joint) = project.joints.iter_mut().find(|j| j.name == name) {
+            joint.at = value;
+        }
+        Some(std::borrow::Cow::Owned(project))
+    }
+
+    /// Move each mesh from where it was built to where its part is shown now. Only
+    /// differs while a joint is dragged or played, or while a change is rebuilding.
+    fn update_motion(&mut self, ctx: &egui::Context) {
+        let Some(project) = self.shown_project() else { return };
+        let moves: Vec<(String, glam::Mat4)> = project
+            .parts
+            .iter()
+            .filter_map(|part| {
+                let built = self.mesh_pose.get(&part.name)?;
+                Some((part.name.clone(), mat4(&built.inverse().then(&project.shown_pose(part)))))
+            })
+            .collect();
+        drop(project);
+        for (name, motion) in moves {
+            self.viewport.set_motion(&name, motion);
+        }
+        if self.motion.animating() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Joint sliders and Play, bottom right of the viewport, with each joint's axis
+    /// drawn in the 3D view.
+    fn motion_panel(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        if !self.motion.open {
+            return;
+        }
+        let Some(project) = self.shown_project().map(|p| p.into_owned()) else { return };
+        self.draw_joint_axes(ui, rect, &project);
+        let Some(loaded) = &self.project else { return };
+        let rows = loaded.project.joints.len().max(1) as f32;
+        let height = (64.0 + rows * 52.0).min(rect.height() - 60.0);
+        let panel = egui::Rect::from_min_size(rect.right_bottom() + egui::vec2(-288.0, -height - 8.0), egui::vec2(280.0, height));
+        let mut action = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(260.0);
+                egui::ScrollArea::vertical().max_height(height - 20.0).show(ui, |ui| {
+                    action = self.motion.panel_ui(ui, &loaded.project);
+                });
+            });
+        });
+        if let Some(motion::MotionAction::Set(name, value)) = action {
+            let unit = loaded.project.joint(&name).map_or("", |j| j.kind.unit());
+            let edit = intercraft_core::JointEdit { at: Some(value), ..Default::default() };
+            match self.edit_project(|p| p.edit_joint(&name, edit).and_then(|()| p.save())) {
+                Ok(()) => self.worker_status = format!("Moved {name} to {}{unit}. Ctrl+Z undoes it.", measure::mm(value)),
+                Err(e) => self.worker_status = format!("Couldn't move {name}: {e:#}"),
+            }
+        }
+    }
+
+    /// Each joint's axis as a dashed line through its pivot, labelled with its name.
+    fn draw_joint_axes(&self, ui: &egui::Ui, rect: egui::Rect, project: &intercraft_core::Project) {
+        let painter = ui.painter_at(rect);
+        let reach = self
+            .viewport
+            .visible_bounds()
+            .map_or(20.0, |(lo, hi)| (glam::Vec3::from(hi) - glam::Vec3::from(lo)).length() as f64 * 0.35);
+        let colour = egui::Color32::from_rgb(250, 190, 60);
+        for joint in &project.joints {
+            // The axis rides along with whatever moves the base.
+            let carry = project.motion_of(&joint.base);
+            let origin = carry.apply(joint.origin);
+            let length = joint.axis.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-9);
+            let dir = carry.turn(joint.axis.map(|v| v / length));
+            let at = |s: f64| [0, 1, 2].map(|i| (origin[i] + dir[i] * s) as f32);
+            let (Some(a), Some(b), Some(o)) = (self.viewport.project(at(-reach)), self.viewport.project(at(reach)), self.viewport.project(at(0.0))) else {
+                continue;
+            };
+            painter.add(egui::Shape::dashed_line(&[a, b], egui::Stroke::new(2.0, colour), 7.0, 5.0));
+            painter.circle(o, 4.0, colour, egui::Stroke::new(1.0, egui::Color32::BLACK));
+            painter.text(o + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, &joint.name, egui::FontId::proportional(12.0), colour);
+        }
+    }
+
     pub(crate) fn toggle_fit(&mut self) {
         self.fit = match self.fit {
             None => Some(fit::FitCheck::default()),
@@ -1091,6 +1209,7 @@ impl State {
         for part in &loaded.project.parts {
             match worker.rebuild(intercraft_tools::request_for(&loaded.dir, &loaded.project, part)) {
                 Ok(()) => {
+                    self.poses.entry(part.name.clone()).or_default().push_back(loaded.project.shown_pose(part));
                     self.building.insert(part.name.clone());
                 }
                 Err(e) => self.worker_status = format!("Worker error: {e:#}"),
@@ -1128,6 +1247,7 @@ impl State {
                     ));
                 }
             }
+            self.poses.clear();
             if let Some(worker) = self.worker.as_mut() {
                 self.worker_status = match worker.restart() {
                     Ok(()) => "A build step took too long and was stopped. The geometry worker restarted.".to_owned(),
@@ -1143,9 +1263,13 @@ impl State {
                 }
                 GeoEvent::Feature(result) => {
                     let key = (result.part.clone(), result.feature_id.clone());
-                    self.results.insert(key, Entry { result, stale: false });
+                    let pose = self.poses.get(&result.part).and_then(|q| q.front()).copied();
+                    self.results.insert(key, Entry { result, stale: false, pose });
                 }
                 GeoEvent::Done { part } => {
+                    if let Some(queue) = self.poses.get_mut(&part) {
+                        queue.pop_front();
+                    }
                     self.building.remove(&part);
                     // Anything still stale was removed from the project or sits after a failure.
                     self.results.retain(|(p, _), e| p != &part || !e.stale);
@@ -1208,11 +1332,13 @@ impl State {
 
         for (i, part) in loaded.project.parts.iter().enumerate() {
             let mut wanted = None;
+            let mut wanted_pose = None;
             for step in steps(part) {
                 let key = (part.name.clone(), step.id.to_owned());
                 match self.results.get(&key) {
-                    Some(Entry { result, stale: false }) if result.ok => {
+                    Some(Entry { result, stale: false, pose }) if result.ok => {
                         wanted = result.mesh.clone();
+                        wanted_pose = *pose;
                     }
                     _ => break,
                 }
@@ -1233,6 +1359,10 @@ impl State {
                         self.viewport.set_visible(&part.name, false);
                     }
                     self.shown.insert(part.name.clone(), path);
+                    match wanted_pose {
+                        Some(pose) => self.mesh_pose.insert(part.name.clone(), pose),
+                        None => self.mesh_pose.remove(&part.name),
+                    };
                 }
                 Err(e) => self.worker_status = format!("Mesh load failed: {e:#}"),
             }
@@ -1241,6 +1371,7 @@ impl State {
         let names: HashSet<&str> = loaded.project.parts.iter().map(|p| p.name.as_str()).collect();
         self.viewport.retain_meshes(|name| names.contains(name));
         self.shown.retain(|name, _| names.contains(name.as_str()));
+        self.mesh_pose.retain(|name, _| names.contains(name.as_str()));
         self.hidden.retain(|name| names.contains(name.as_str()));
     }
 
@@ -1961,6 +2092,20 @@ fn trim_mm(value: f64) -> String {
 
 fn plural(n: usize, word: &str) -> String {
     if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
+}
+
+/// A pose as a GPU matrix. Rounding noise counts as no move, so a part that isn't
+/// moving is drawn exactly as built.
+fn mat4(pose: &Pose) -> glam::Mat4 {
+    let r = &pose.rot;
+    let still = (0..3).all(|i| (0..3).all(|j| (r[i][j] - if i == j { 1.0 } else { 0.0 }).abs() < 1e-9))
+        && pose.pos.iter().all(|v| v.abs() < 1e-9);
+    if still {
+        return glam::Mat4::IDENTITY;
+    }
+    let col = |j: usize| glam::Vec4::new(r[0][j] as f32, r[1][j] as f32, r[2][j] as f32, 0.0);
+    let [x, y, z] = pose.pos.map(|v| v as f32);
+    glam::Mat4::from_cols(col(0), col(1), col(2), glam::Vec4::new(x, y, z, 1.0))
 }
 
 fn part_color(kind: PartKind, index: usize) -> [f32; 3] {

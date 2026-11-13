@@ -135,6 +135,8 @@ A joint lets one part move against another. A hinge turns it about an axis (a li
 
 Each joint keeps its current position. Everything is shown there, and measuring and the fit check see that pose too, so the model can open a lid and check it clears the box. The moving part's placement is where it sits with its joint at 0. Exports always use that rest position, wherever a joint was left. The Inspector says which joint moves the selected part and where it is.
 
+**Motion** (on the viewport toolbar once the project has a joint) lists every joint with a slider and draws each axis as a dashed line. Dragging a slider moves the parts straight away without rebuilding them, and letting go saves the new position as one undo step. **Play** sweeps a joint through its whole range and back without saving anything, which is a quick way to see a mechanism work.
+
 ### Print check
 
 Print check looks at the selected part the way a 3D printer will, with +Z up:

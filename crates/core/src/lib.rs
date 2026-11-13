@@ -534,6 +534,31 @@ impl LoadedProject {
         Ok(())
     }
 
+    /// Move a whole group as one rigid piece: every part is turned (degrees about X,
+    /// Y, Z through the assembly origin) and then shifted, on top of where it is now.
+    /// Joints that move a part of the group go with it.
+    pub fn move_group(&mut self, group: &str, position: [f64; 3], rotation: [f64; 3]) -> Result<()> {
+        if position.iter().chain(&rotation).any(|v| !v.is_finite() || v.abs() > 1e6) {
+            bail!("positions and rotations must be ordinary numbers");
+        }
+        let by = Pose::from_placement(position, rotation);
+        let mut moved = HashSet::new();
+        for part in self.project.parts.iter_mut().filter(|p| p.group.as_deref() == Some(group)) {
+            let [x, y, z, rx, ry, rz] = Pose::from_placement(part.position, part.rotation).then(&by).to_placement();
+            part.position = [x, y, z];
+            part.rotation = [rx, ry, rz];
+            moved.insert(part.name.clone());
+        }
+        if moved.is_empty() {
+            bail!("no group named '{group}'");
+        }
+        for joint in self.project.joints.iter_mut().filter(|j| moved.contains(&j.part)) {
+            joint.origin = by.apply(joint.origin);
+            joint.axis = by.turn(joint.axis);
+        }
+        Ok(())
+    }
+
     /// Remove every part in a group, as `remove_part` does for each.
     pub fn remove_group(&mut self, group: &str) -> Result<()> {
         let names: Vec<String> =
@@ -1214,6 +1239,18 @@ mod tests {
         let again = p.plan_split_import(&src, &bodies[..1]).unwrap();
         assert_eq!((again.group.as_str(), again.parts[0].0.as_str()), ("Gear_box__v3_2", "Housing_2"));
         assert!(p.plan_split_import(&src, &vec!["X".to_owned(); MAX_SPLIT_BODIES + 1]).is_err());
+
+        // Standing a Y-up model upright turns every part together about the origin.
+        p.set_placement("Housing", [0.0, 10.0, 0.0], [0.0; 3]).unwrap();
+        p.save().unwrap();
+        p.move_group("Gear_box__v3", [0.0, 0.0, 5.0], [90.0, 0.0, 0.0]).unwrap();
+        p.save().unwrap();
+        assert_eq!(p.history().undo_label(), Some("Move 'Gear_box__v3' (6 parts)"));
+        let housing = p.part("Housing").unwrap();
+        assert_eq!((housing.position, housing.rotation), ([0.0, 0.0, 15.0], [90.0, 0.0, 0.0]));
+        assert_eq!(p.part("Bolt_2").unwrap().position, [0.0, 0.0, 5.0]);
+        assert_eq!(p.part("Bolt").unwrap().position, [0.0; 3], "parts outside the group stay put");
+        assert!(p.move_group("Nothing", [1.0; 3], [0.0; 3]).is_err());
 
         p.rename_group("Gear_box__v3", "Gear box").unwrap();
         p.save().unwrap();

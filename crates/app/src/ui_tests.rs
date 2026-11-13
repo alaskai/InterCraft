@@ -310,6 +310,51 @@ fn import_step_adds_an_editable_part() {
     shot(&mut h, "imported");
 }
 
+#[test]
+fn the_viewer_holds_hundreds_of_parts() {
+    let _one = one_at_a_time();
+    let project = example_project("many");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    // A split assembly can be hundreds of parts. One triangle each is enough: this
+    // checks how many parts the viewer holds, not how big they are.
+    for i in 0..300 {
+        let x = i as f32;
+        let mesh = Mesh {
+            positions: vec![[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0], [x, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            indices: vec![0, 1, 2],
+            edges: vec![vec![[x, 0.0, 0.0], [x + 1.0, 0.0, 0.0]]],
+            corners: Vec::new(),
+        };
+        assert!(h.state_mut().state.viewport.set_mesh(&format!("Many{i}"), mesh, [0.5; 3]));
+        h.step();
+    }
+}
+
+#[test]
+fn a_worker_that_stops_is_restarted_and_the_rest_still_builds() {
+    let _one = one_at_a_time();
+    let project = example_project("restart");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let kit = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/tests/fixtures/kit.step");
+    h.state_mut().state.start_import(&kit);
+    wait_until(&mut h, "the file to be read", asking);
+    click(&mut h, "Separate parts in a group");
+    wait_until(&mut h, "the bodies to be built", |app| app.state.import.is_none() && built(app) && app.state.shown.len() == 5);
+
+    // Out of memory halfway through a rebuild: the worker process just ends.
+    let s = &mut h.state_mut().state;
+    s.shown.clear();
+    s.rebuild_all();
+    s.worker.as_mut().unwrap().kill();
+    wait_until(&mut h, "everything to build again", |app| built(app) && app.state.shown.len() == 5);
+    let s = &h.state().state;
+    assert!(s.worker.is_some(), "the worker should have been restarted");
+    assert!(s.worker_status.contains("restarted") || s.worker_status.contains("ready"), "{}", s.worker_status);
+}
+
 fn asking(app: &App) -> bool {
     matches!(app.state.import.as_ref().map(|i| &i.stage), Some(import::Stage::Asking(_)))
 }

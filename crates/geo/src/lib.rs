@@ -157,6 +157,11 @@ impl PythonWorker {
         Ok(())
     }
 
+    /// End the worker process now, as running out of memory would. For tests.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
+
     /// True when a build has gone longer than `build_timeout()` without any progress.
     pub fn stuck(&self) -> bool {
         self.in_flight > 0 && self.last_progress.elapsed() > self.current_timeout()

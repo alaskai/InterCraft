@@ -110,6 +110,11 @@ struct State {
     worker: Option<PythonWorker>,
     worker_status: String,
     building: HashSet<String>,
+    /// Parts sent to the worker, in order. It answers in order, so the front is the
+    /// part it is on, and the one to blame if it stops.
+    sent: VecDeque<String>,
+    /// Parts that were being built when the worker stopped, and how many times.
+    crashed: HashMap<String, u32>,
 
     /// (part, feature id) -> result
     results: HashMap<(String, String), Entry>,
@@ -197,6 +202,8 @@ impl App {
             worker,
             worker_status,
             building: HashSet::new(),
+            sent: VecDeque::new(),
+            crashed: HashMap::new(),
             results: HashMap::new(),
             selected_part: None,
             selected_step: None,
@@ -721,6 +728,7 @@ impl State {
                     entry.stale = true;
                 }
             }
+            self.sent.push_back(part.name.clone());
             self.building.insert(part.name);
             drag.sent = Some(drag.value);
         }
@@ -1403,9 +1411,14 @@ impl State {
             entry.stale = true;
         }
         for part in &loaded.project.parts {
+            // Stopped the worker twice: leave it, so the rest of the model still builds.
+            if self.crashed.get(&part.name).is_some_and(|n| *n >= 2) {
+                continue;
+            }
             match worker.rebuild(intercraft_tools::request_for(&loaded.dir, &loaded.project, part)) {
                 Ok(()) => {
                     self.poses.entry(part.name.clone()).or_default().push_back(loaded.project.shown_pose(part));
+                    self.sent.push_back(part.name.clone());
                     self.building.insert(part.name.clone());
                 }
                 Err(e) => self.worker_status = format!("Worker error: {e:#}"),
@@ -1429,18 +1442,70 @@ impl State {
         }
     }
 
+    /// The worker process ended, usually out of memory on a big part. Start a new one
+    /// and build what was left, skipping a part that has stopped it twice, so one
+    /// heavy part can't keep the rest of the model from showing.
+    fn worker_stopped(&mut self) {
+        let culprit = self.sent.front().cloned();
+        self.sent.clear();
+        self.building.clear();
+        self.poses.clear();
+        if let Some(import) = self.import.as_mut().filter(|i| i.busy()) {
+            import.stage = import::Stage::Failed("the geometry worker stopped, most likely out of memory".to_owned());
+        }
+        let strikes = culprit.as_ref().map_or(0, |name| {
+            let n = self.crashed.entry(name.clone()).or_insert(0);
+            *n += 1;
+            *n
+        });
+        if let (Some(name), true) = (&culprit, strikes >= 2) {
+            for ((part, _), entry) in self.results.iter_mut() {
+                if part == name && entry.stale {
+                    entry.stale = false;
+                    entry.result.ok = false;
+                    entry.result.error = Some(
+                        "The geometry worker ran out of memory building this part, twice, so it was left out. Close other programs, or simplify or delete the part.".to_owned(),
+                    );
+                }
+            }
+        }
+        let restarted = self.worker.as_mut().map(|w| w.restart());
+        self.worker_status = match (restarted, &culprit) {
+            (Some(Ok(())), Some(name)) if strikes >= 2 => {
+                format!("The geometry worker stopped twice on '{name}' (most likely out of memory), so that part was skipped. The rest is building.")
+            }
+            (Some(Ok(())), Some(name)) => format!("The geometry worker stopped while building '{name}' and restarted. Building the rest."),
+            (Some(Ok(())), None) => "The geometry worker stopped and restarted.".to_owned(),
+            (Some(Err(e)), _) => {
+                self.worker = None;
+                format!("The geometry worker stopped and couldn't restart: {e:#}")
+            }
+            (None, _) => "Geometry worker stopped".to_owned(),
+        };
+        if self.worker.is_some() {
+            self.rebuild_all();
+        }
+    }
+
     fn drain_worker_events(&mut self) {
         // A step that never finishes (usually an endless loop) would freeze the view forever.
         if let Some(worker) = self.worker.as_ref().filter(|w| w.stuck()) {
             let message = intercraft_geo::stuck_message(worker.current_timeout(), worker.importing());
-            let parts: HashSet<String> = std::mem::take(&mut self.building);
+            // Only the part the worker was on is to blame; the rest were waiting behind it.
+            let culprit = self.sent.front().cloned();
             for ((part, _), entry) in self.results.iter_mut() {
-                if entry.stale && parts.contains(part) {
+                if entry.stale && culprit.as_ref() == Some(part) {
                     entry.stale = false;
                     entry.result.ok = false;
                     entry.result.error = Some(message.clone());
                 }
             }
+            if let Some(name) = &culprit {
+                // It would only time out again, so leave it until it's changed.
+                self.crashed.insert(name.clone(), 2);
+            }
+            self.sent.clear();
+            self.building.clear();
             self.poses.clear();
             if let Some(import) = self.import.as_mut().filter(|i| i.busy()) {
                 import.stage = import::Stage::Failed(message.clone());
@@ -1451,6 +1516,7 @@ impl State {
                     Err(e) => format!("Worker restart failed: {e:#}"),
                 };
             }
+            self.rebuild_all();
         }
         loop {
             let Some(event) = self.worker.as_mut().and_then(|w| w.try_recv()) else { break };
@@ -1467,6 +1533,10 @@ impl State {
                     if let Some(queue) = self.poses.get_mut(&part) {
                         queue.pop_front();
                     }
+                    if let Some(at) = self.sent.iter().position(|p| *p == part) {
+                        self.sent.remove(at);
+                    }
+                    self.crashed.remove(&part);
                     self.building.remove(&part);
                     // Anything still stale was removed from the project or sits after a failure.
                     self.results.retain(|(p, _), e| p != &part || !e.stale);
@@ -1540,9 +1610,8 @@ impl State {
                     }
                 }
                 GeoEvent::Exited => {
-                    self.worker_status = "Geometry worker stopped".to_owned();
-                    self.building.clear();
-                    self.worker = None;
+                    self.worker_stopped();
+                    break;
                 }
             }
         }
@@ -1576,7 +1645,14 @@ impl State {
             }
             match Mesh::load(&path) {
                 Ok(mesh) => {
-                    self.viewport.set_mesh(&part.name, mesh, part_color(part.kind, i));
+                    let slot = color_slot(&loaded.project.parts, i);
+                    if !self.viewport.set_mesh(&part.name, mesh, part_color(part.kind, slot)) {
+                        // Marked as shown anyway, so it isn't tried again every frame.
+                        self.worker_status = format!(
+                            "Not enough graphics memory to show '{}'. Hide or delete some parts, or close other programs, then reopen the project.",
+                            part.name
+                        );
+                    }
                     if self.hidden.contains(&part.name) {
                         self.viewport.set_visible(&part.name, false);
                     }
@@ -1679,25 +1755,54 @@ impl State {
                 parts.iter().enumerate().filter(|(_, p)| p.group.as_deref() == Some(group)).collect();
             let all_hidden = members.iter().all(|(_, p)| self.hidden.contains(&p.name));
             let holds_reveal = reveal.as_deref().is_some_and(|r| members.iter().any(|(_, p)| p.name == r));
-            let mut header = egui::CollapsingHeader::new(egui::RichText::new(format!("{group}  ({})", members.len())).strong())
-                .id_salt(("part group", group))
-                .default_open(false);
+            let names: Vec<String> = members.iter().map(|(_, p)| p.name.clone()).collect();
+            let id = ui.make_persistent_id(("part group", group));
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
             if holds_reveal {
-                header = header.open(Some(true));
+                state.set_open(true);
             }
-            let shown = header.show(ui, |ui| {
+            let header = state.show_header(ui, |ui| {
+                // The eye hides or shows every part of the import at once.
+                if eye_button(ui, !all_hidden, group).clicked() {
+                    action = Some(PartAction::GroupVisible(names.clone(), all_hidden));
+                }
+                let (first, part) = members[0];
+                let [r, g, b] = part_color(part.kind, first).map(|c| (c * 255.0) as u8);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                let swatch = egui::Color32::from_rgb(r, g, b);
+                ui.painter().rect_filled(rect, 2.0, if all_hidden { swatch.gamma_multiply(0.35) } else { swatch });
+                let title = egui::RichText::new(format!("{group}  ({})", members.len())).strong();
+                let title = if all_hidden { title.color(ui.visuals().weak_text_color()) } else { title };
+                ui.add(egui::Label::new(title).sense(egui::Sense::click()))
+            });
+            let (_, header, _) = header.body(|ui| {
                 for (i, member) in &members {
                     self.part_row(ui, *i, member, reveal.as_deref(), &mut action);
                 }
             });
-            shown.header_response.on_hover_text("An imported assembly. Right-click for the whole group.").context_menu(|ui| {
-                let names: Vec<String> = members.iter().map(|(_, p)| p.name.clone()).collect();
+            header.inner.on_hover_text("An imported assembly. Right-click for the whole group.").context_menu(|ui| {
                 if ui.button(if all_hidden { "Show group" } else { "Hide group" }).clicked() {
                     action = Some(PartAction::GroupVisible(names.clone(), all_hidden));
                     ui.close();
                 }
                 if ui.button("Show only this group").clicked() {
                     action = Some(PartAction::GroupIsolate(names.clone()));
+                    ui.close();
+                }
+                ui.separator();
+                // Many CAD programs export with Y up; here Z is up.
+                if ui.button("Stand upright (Y up to Z up)").on_hover_text("Turns the whole group 90° about X").clicked() {
+                    action = Some(PartAction::GroupMove(group.to_owned(), [0.0; 3], [90.0, 0.0, 0.0]));
+                    ui.close();
+                }
+                if ui.button("Turn 90° about Z").clicked() {
+                    action = Some(PartAction::GroupMove(group.to_owned(), [0.0; 3], [0.0, 0.0, 90.0]));
+                    ui.close();
+                }
+                let lowest = members.iter().filter_map(|(_, p)| self.latest_report(p)).map(|r| r.bbox_min[2]).reduce(f64::min);
+                let floor = ui.add_enabled(lowest.is_some_and(|z| z.abs() > 1e-6), egui::Button::new("Rest on the floor"));
+                if floor.on_hover_text("Moves the group up or down so its lowest point sits at Z = 0").clicked() {
+                    action = Some(PartAction::GroupMove(group.to_owned(), [0.0, 0.0, -lowest.unwrap_or(0.0)], [0.0; 3]));
                     ui.close();
                 }
                 ui.separator();
@@ -1743,6 +1848,7 @@ impl State {
             Some(PartAction::GroupIsolate(names)) => self.isolate(&names),
             Some(PartAction::GroupRename(group)) => self.rename = Some((RenameTarget::Group(group.clone()), group, None)),
             Some(PartAction::GroupDelete(group)) => self.delete_group(&group),
+            Some(PartAction::GroupMove(group, position, rotation)) => self.move_group(&group, position, rotation),
             Some(PartAction::ShowAll) => self.show_all(),
             Some(PartAction::Kind(name, kind)) => self.set_part_kind(&name, kind),
             Some(PartAction::Delete(name)) => self.delete_part(&name),
@@ -1777,6 +1883,13 @@ impl State {
         }
     }
 
+    fn move_group(&mut self, group: &str, position: [f64; 3], rotation: [f64; 3]) {
+        match self.edit_project(|p| p.move_group(group, position, rotation).and_then(|()| p.save())) {
+            Ok(()) => self.worker_status = format!("Moved the group '{group}'. Ctrl+Z undoes it."),
+            Err(e) => self.worker_status = format!("Couldn't move '{group}': {e:#}"),
+        }
+    }
+
     fn rename_group(&mut self, old: &str, new: &str) -> anyhow::Result<()> {
         self.edit_project(|p| p.rename_group(old, new).and_then(|()| p.save()))?;
         self.worker_status = format!("Renamed the group '{old}' to '{new}'");
@@ -1808,7 +1921,8 @@ impl State {
                                     *action = Some(PartAction::Visible(part.name.clone(), hidden));
                                 }
                                 // Same colour as in the viewport, so parts are easy to match up.
-                                let [r, g, b] = part_color(part.kind, i).map(|c| (c * 255.0) as u8);
+                                let slot = self.project.as_ref().map_or(i, |p| color_slot(&p.project.parts, i));
+                                let [r, g, b] = part_color(part.kind, slot).map(|c| (c * 255.0) as u8);
                                 let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                                 let swatch = egui::Color32::from_rgb(r, g, b);
                                 let swatch = if hidden { swatch.gamma_multiply(0.35) } else { swatch };
@@ -2283,6 +2397,7 @@ enum PartAction {
     GroupIsolate(Vec<String>),
     GroupRename(String),
     GroupDelete(String),
+    GroupMove(String, [f64; 3], [f64; 3]),
     ShowAll,
     Kind(String, PartKind),
     Delete(String),
@@ -2422,6 +2537,15 @@ fn mat4(pose: &Pose) -> glam::Mat4 {
     let col = |j: usize| glam::Vec4::new(r[0][j] as f32, r[1][j] as f32, r[2][j] as f32, 0.0);
     let [x, y, z] = pose.pos.map(|v| v as f32);
     glam::Mat4::from_cols(col(0), col(1), col(2), glam::Vec4::new(x, y, z, 1.0))
+}
+
+/// The colour slot of a part: its place in the list, or for a part in a group, the
+/// place of the group's first part, so an imported assembly is one colour.
+fn color_slot(parts: &[Part], index: usize) -> usize {
+    match parts[index].group.as_deref() {
+        Some(group) => parts.iter().position(|p| p.group.as_deref() == Some(group)).unwrap_or(index),
+        None => index,
+    }
 }
 
 fn part_color(kind: PartKind, index: usize) -> [f32; 3] {

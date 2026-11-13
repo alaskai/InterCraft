@@ -407,6 +407,19 @@ pub fn definitions() -> Value {
             },
         },
         {
+            "name": "move_group",
+            "description": "Move a whole imported group as one rigid piece. Every part is turned by rotation [rx, ry, rz] (degrees about X, Y and Z through the assembly origin) and then shifted by position [x, y, z] mm, on top of where it is now. A model that came in Y-up stands upright with rotation [90, 0, 0].",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "group": { "type": "string", "description": "The group name, as get_project shows it." },
+                    "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "rotation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                },
+                "required": ["group"],
+            },
+        },
+        {
             "name": "duplicate_part",
             "description": "Copy a part with all its features. The copy is a design part, so copying a reference part gives you something you can change.",
             "inputSchema": {
@@ -767,6 +780,15 @@ impl ToolHost {
                 project.set_placement(name, position, rotation)?;
                 project.save()?;
                 self.build_report(&project, project.part(name)?, false)
+            }
+            "move_group" => {
+                let group = text(args, "group")?;
+                let position = optional_triple(args, "position")?.unwrap_or([0.0; 3]);
+                let rotation = optional_triple(args, "rotation")?.unwrap_or([0.0; 3]);
+                project.move_group(group, position, rotation)?;
+                project.save()?;
+                let moved = project.project.parts.iter().filter(|p| p.group.as_deref() == Some(group)).count();
+                Ok(json!({ "moved_group": group, "parts": moved, "note": "Call get_project to see where each part sits now." }))
             }
             "delete_part" => {
                 let name = text(args, "part")?;

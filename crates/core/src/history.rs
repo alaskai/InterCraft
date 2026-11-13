@@ -331,6 +331,14 @@ fn describe(before: &Content, after: &Content) -> String {
                 }
                 _ => continue,
             }
+        } else if members.len() > 1
+            && members.iter().all(|m| {
+                let now = new.parts.iter().find(|p| p.name == *m);
+                let was = old.parts.iter().find(|p| p.name == *m);
+                matches!((now, was), (Some(n), Some(w)) if n.position != w.position || n.rotation != w.rotation)
+            })
+        {
+            changes.push(format!("Move '{group}' ({})", parts_count(members.len())));
         } else {
             continue;
         }

@@ -55,9 +55,25 @@ def feature_hash(prev, feature):
     h.update(f"{LINEAR_TOL}/{ANGULAR_TOL}/{MESH_FORMAT}".encode())
     if feature.get("import"):
         # An imported file's content is part of what shaped the result.
-        with open(feature["import"], "rb") as f:
-            h.update(hashlib.sha1(f.read()).digest())
+        h.update(file_hash(feature["import"]).encode())
+        h.update(IMPORT_FORMAT.encode())
     return h.hexdigest()
+
+
+# Bump when imported shapes are read differently, so their meshes are rebuilt.
+IMPORT_FORMAT = "brep1"
+
+# (path, size, mtime) -> sha1 of the file, so a big import is hashed once.
+_file_hashes = {}
+
+
+def file_hash(path):
+    stat = os.stat(path)
+    key = (path, stat.st_size, stat.st_mtime)
+    if key not in _file_hashes:
+        with open(path, "rb") as f:
+            _file_hashes[key] = hashlib.sha1(f.read()).hexdigest()
+    return _file_hashes[key]
 
 
 def write_mesh(shape, path, tick=lambda: None):
@@ -135,15 +151,32 @@ def make_report(shape, volume_before):
     }
 
 
-def import_step(path):
+def import_step(path, cache_dir=None):
     """The base shape of a part made from an imported STEP file. The app has already
-    checked the path is inside the project's imports folder."""
+    checked the path is inside the project's imports folder.
+
+    Reading STEP is slow (minutes for a threaded rod), so the shape is kept next to
+    the meshes as BREP, which loads in under a second. The shape always comes from
+    the BREP copy, even the first time, so its edges are numbered the same way in
+    every session."""
     if not path.lower().endswith(STEP_EXTENSIONS):
         raise ValueError("only .step and .stp files can be imported")
-    shape = build123d.import_step(path)
-    if shape is None or not shape.solids():
-        raise ValueError("the STEP file has no solid bodies")
-    return shape
+    if cache_dir is None:
+        shape = build123d.import_step(path)
+        if shape is None or not shape.solids():
+            raise ValueError("the STEP file has no solid bodies")
+        return shape
+    copy = os.path.join(cache_dir, f"{file_hash(path)}.{IMPORT_FORMAT}.brep")
+    if not os.path.exists(copy):
+        shape = build123d.import_step(path)
+        if shape is None or not shape.solids():
+            raise ValueError("the STEP file has no solid bodies")
+        tmp = f"{copy}.{os.getpid()}.tmp"
+        build123d.export_brep(shape, tmp)
+        os.replace(tmp, copy)
+    solids = build123d.import_brep(copy).solids()
+    # The solids themselves: a compound read back from BREP can't be meshed whole.
+    return solids[0] if len(solids) == 1 else build123d.Compound(solids)
 
 
 # The last STEP file read for splitting: (path, size, mtime) and its bodies.
@@ -209,6 +242,14 @@ def split_step(req):
         tmp = f"{path}.{os.getpid()}.tmp.step"
         build123d.export_step(shape, tmp)
         os.replace(tmp, path)
+        # The shape is in memory now; reading the STEP back later can take minutes
+        # and gigabytes for a threaded rod, so keep the quick copy straight away.
+        cache_dir = req.get("cache_dir")
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            copy = os.path.join(cache_dir, f"{file_hash(path)}.{IMPORT_FORMAT}.brep")
+            build123d.export_brep(shape, f"{copy}.{os.getpid()}.tmp")
+            os.replace(f"{copy}.{os.getpid()}.tmp", copy)
         send({"id": req["id"], "event": "progress"})
     send({"id": req["id"], "event": "info", "data": {"written": len(files)}})
 
@@ -228,9 +269,9 @@ def place(shape, placement):
     return shape.moved(build123d.Location((x, y, z), (rx, ry, rz)))
 
 
-def run_feature(prev_shape, feature):
+def run_feature(prev_shape, feature, cache_dir=None):
     if feature.get("import"):
-        return import_step(feature["import"])
+        return import_step(feature["import"], cache_dir)
     shape = sandbox.run(feature["code"], prev_shape, feature.get("params", {}), _base_ns, feature.get("id", "feature"))
     if shape is None:
         raise ValueError("snippet finished without assigning `part`")
@@ -278,7 +319,7 @@ def rebuild(req, emit=True):
                 if key in _local:
                     shape = _local[key]
                 else:
-                    shape = run_feature(shape, feature)
+                    shape = run_feature(shape, feature, cache_dir)
                     _local[key] = shape
                     tick()
                 shown = place(shape, placement)

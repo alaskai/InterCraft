@@ -2,8 +2,10 @@
 // serde 1, serde_json 1, anyhow 1
 
 mod history;
+mod joints;
 
 pub use history::{HistoryEntry, HistoryInfo};
+pub use joints::{Joint, JointEdit, JointKind, Pose, MAX_JOINTS};
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -48,6 +50,9 @@ pub struct Project {
     #[serde(default = "default_units")]
     pub units: String,
     pub parts: Vec<Part>,
+    /// How parts move against each other: hinges and sliders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joints: Vec<Joint>,
 }
 
 fn default_units() -> String {
@@ -199,7 +204,7 @@ impl LoadedProject {
 
     /// Start an empty project in `dir`, with a blank brief, and write it to disk.
     pub fn create(dir: &Path, name: &str) -> Result<Self> {
-        let project = Project { name: name.to_owned(), units: default_units(), parts: Vec::new() };
+        let project = Project { name: name.to_owned(), units: default_units(), parts: Vec::new(), joints: Vec::new() };
         let loaded = Self::from_project(dir, project, BRIEF_TEMPLATE.to_owned());
         loaded.write_files()?;
         Ok(loaded)
@@ -340,6 +345,13 @@ impl LoadedProject {
             }
         }
         self.removed.extend(left_behind);
+        for joint in &mut self.project.joints {
+            for name in [&mut joint.base, &mut joint.part] {
+                if name.as_str() == old {
+                    *name = new.to_owned();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -449,7 +461,54 @@ impl LoadedProject {
         for feature in part.features {
             self.removed.push(self.dir.join(feature.file));
         }
+        // A joint can't outlive either of its parts. Undo brings them back together.
+        self.project.joints.retain(|j| j.base != name && j.part != name);
         Ok(())
+    }
+
+    /// Add a hinge or slider between two parts. Call `save` afterwards.
+    pub fn add_joint(&mut self, joint: Joint) -> Result<()> {
+        if self.project.joint(&joint.name).is_some() {
+            bail!("a joint called '{}' already exists; change it with edit_joint", joint.name);
+        }
+        let mut joint = joint;
+        joint.name = joint.name.trim().to_owned();
+        joint.why = joint.why.trim().to_owned();
+        self.project.joints.push(joint);
+        self.check_joints_or_undo(|p| {
+            p.joints.pop();
+        })
+    }
+
+    /// Change a joint, for example to move it to a new position (`at`).
+    pub fn edit_joint(&mut self, name: &str, edit: JointEdit) -> Result<()> {
+        let index = self.joint_index(name)?;
+        let before = self.project.joints[index].clone();
+        edit.apply(&mut self.project.joints[index]);
+        self.check_joints_or_undo(|p| p.joints[index] = before)
+    }
+
+    pub fn delete_joint(&mut self, name: &str) -> Result<()> {
+        let index = self.joint_index(name)?;
+        self.project.joints.remove(index);
+        Ok(())
+    }
+
+    fn joint_index(&self, name: &str) -> Result<usize> {
+        self.project
+            .joints
+            .iter()
+            .position(|j| j.name.eq_ignore_ascii_case(name))
+            .with_context(|| format!("no joint called '{name}'"))
+    }
+
+    /// Checks the joints after a change, and puts things back if they don't hold up.
+    fn check_joints_or_undo(&mut self, undo: impl FnOnce(&mut Project)) -> Result<()> {
+        let result = joints::check_joints(&self.project);
+        if result.is_err() {
+            undo(&mut self.project);
+        }
+        result
     }
 
     /// Lock a part (reference) or unlock it (design).
@@ -672,7 +731,7 @@ fn check_project(project: &Project) -> Result<()> {
             check_snippet_path(&feature.file)?;
         }
     }
-    Ok(())
+    joints::check_joints(project)
 }
 
 /// Part names become folder names, so keep them plain.
@@ -814,6 +873,68 @@ mod tests {
             after: after.map(str::to_owned),
             ..Default::default()
         }
+    }
+
+    fn hinge(name: &str, base: &str, part: &str) -> Joint {
+        Joint {
+            name: name.into(),
+            kind: JointKind::Hinge,
+            base: base.into(),
+            part: part.into(),
+            origin: [0.0, 0.0, 10.0],
+            axis: [1.0, 0.0, 0.0],
+            min: 0.0,
+            max: 110.0,
+            at: 0.0,
+            why: "Lets the lid swing open.".into(),
+        }
+    }
+
+    #[test]
+    fn joints_follow_their_parts() {
+        let mut p = temp_project("joints");
+        for name in ["Box", "Lid", "Latch"] {
+            p.add_part(name).unwrap();
+        }
+        p.save().unwrap();
+        p.add_joint(hinge("Lid hinge", "Box", "Lid")).unwrap();
+        p.save().unwrap();
+        assert_eq!(p.history().undo_label(), Some("Add joint 'Lid hinge'"));
+
+        // Broken joints are refused and leave the project as it was.
+        assert!(p.add_joint(hinge("lid HINGE", "Box", "Latch")).is_err(), "names are unique");
+        assert!(p.add_joint(hinge("Second", "Box", "Lid")).is_err(), "one joint per moving part");
+        assert!(p.add_joint(hinge("Loop", "Lid", "Box")).is_err(), "no loops");
+        assert!(p.add_joint(hinge("Self", "Box", "Box")).is_err());
+        assert!(p.add_joint(Joint { axis: [0.0; 3], ..hinge("Flat", "Box", "Latch") }).is_err());
+        assert!(p.add_joint(Joint { at: 200.0, ..hinge("Far", "Box", "Latch") }).is_err());
+        assert!(p.add_joint(hinge("Ghost", "Box", "Nothing")).is_err());
+        assert_eq!(p.project.joints.len(), 1);
+        let edit = JointEdit { at: Some(500.0), ..Default::default() };
+        assert!(p.edit_joint("Lid hinge", edit).is_err());
+        assert_eq!(p.project.joints[0].at, 0.0, "a refused edit changes nothing");
+
+        // A chain: the latch rides on the lid.
+        p.add_joint(Joint { origin: [0.0, 5.0, 10.0], ..hinge("Latch pivot", "Lid", "Latch") }).unwrap();
+        p.save().unwrap();
+        assert_eq!(p.project.moved_by("Lid hinge"), ["Lid", "Latch"]);
+        let latch = p.part("Latch").unwrap().clone();
+        assert_eq!(p.project.shown_placement(&latch), None, "nothing moves at zero");
+        p.edit_joint("lid hinge", JointEdit { at: Some(90.0), ..Default::default() }).unwrap();
+        p.save().unwrap();
+        assert_eq!(p.history().undo_label(), Some("Move 'Lid hinge' to 90°"));
+        // Turned 90° about X through (0, 0, 10): the latch's origin lands at (0, 10, 10).
+        let shown = p.project.shown_placement(&latch).unwrap();
+        assert_eq!(shown, [0.0, 10.0, 10.0, 90.0, 0.0, 0.0]);
+
+        // Renames carry through, and removing a part drops its joints.
+        p.rename_part("Lid", "Cover").unwrap();
+        assert_eq!((p.project.joints[0].part.as_str(), p.project.joints[1].base.as_str()), ("Cover", "Cover"));
+        p.save().unwrap();
+        assert_eq!(LoadedProject::load(&p.dir).unwrap().project.joints.len(), 2);
+        p.remove_part("Cover").unwrap();
+        assert!(p.project.joints.is_empty());
+        std::fs::remove_dir_all(&p.dir).unwrap();
     }
 
     #[test]

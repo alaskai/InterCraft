@@ -81,7 +81,7 @@ impl FitCheck {
         }
 
         let mut hovered = None;
-        egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("fit results").max_height(130.0).show(ui, |ui| {
             // Clashes first, then the tightest gaps.
             let mut sorted: Vec<&Value> = pairs.iter().collect();
             sorted.sort_by(|a, b| {

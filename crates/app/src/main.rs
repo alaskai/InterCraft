@@ -1007,7 +1007,7 @@ impl State {
         ui.scope_builder(egui::UiBuilder::new().max_rect(panel), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_width(260.0);
-                egui::ScrollArea::vertical().max_height(height - 20.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("motion joints").max_height(height - 20.0).show(ui, |ui| {
                     action = self.motion.panel_ui(ui, &loaded.project);
                 });
             });

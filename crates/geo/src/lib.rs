@@ -395,6 +395,32 @@ impl PythonWorker {
         self.wait_for(id)
     }
 
+    /// List the bodies in a STEP file, without waiting. The answer arrives as
+    /// `GeoEvent::Info` with `{"bodies": [{"name", "solids"}]}`, in file order.
+    pub fn request_step_contents(&mut self, step: &Path) -> Result<u64> {
+        let id = self.next_id;
+        self.send(serde_json::json!({ "cmd": "step_contents", "step": step }))?;
+        Ok(id)
+    }
+
+    pub fn step_contents_blocking(&mut self, step: &Path) -> Result<serde_json::Value> {
+        let id = self.request_step_contents(step)?;
+        self.wait_for(id)
+    }
+
+    /// Write each body of a STEP file to its own file, one path per body in the order
+    /// `request_step_contents` listed them. Answers with `GeoEvent::Info`.
+    pub fn request_split_step(&mut self, step: &Path, files: &[PathBuf]) -> Result<u64> {
+        let id = self.next_id;
+        self.send(serde_json::json!({ "cmd": "split_step", "step": step, "files": files }))?;
+        Ok(id)
+    }
+
+    pub fn split_step_blocking(&mut self, step: &Path, files: &[PathBuf]) -> Result<serde_json::Value> {
+        let id = self.request_split_step(step, files)?;
+        self.wait_for(id)
+    }
+
     /// Real sizes for a metric screw size ("M4"): clearance holes, tap drill, head,
     /// nut and heat-set insert, from the ISO tables in bd_warehouse.
     pub fn fastener_info_blocking(&mut self, size: &str) -> Result<serde_json::Value> {

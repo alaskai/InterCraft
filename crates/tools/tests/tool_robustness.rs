@@ -276,6 +276,52 @@ fn imported_part_can_be_inspected_measured_and_edited() {
 }
 
 #[test]
+fn an_assembly_splits_into_parts_where_they_sat() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    // kit.step: a base plate, and a hinge sub-assembly (two leaves and a pin) moved
+    // 100 mm along Y. Made by fixtures/make_kit.py.
+    let kit = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kit.step");
+    let mut worker = intercraft_geo::PythonWorker::spawn(|| {}).unwrap();
+    let contents = worker.step_contents_blocking(&kit).unwrap();
+    let bodies: Vec<String> =
+        contents["bodies"].as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(bodies, ["Base", "Leaf", "Leaf", "Pin"]);
+
+    let (mut host, dir) = project("split");
+    let mut loaded = intercraft_core::LoadedProject::create(&dir, "Split").unwrap();
+    let split = loaded.plan_split_import(&kit, &bodies).unwrap();
+    std::fs::create_dir_all(&split.folder).unwrap();
+    let files: Vec<PathBuf> = split.parts.iter().map(|(_, source)| dir.join(source)).collect();
+    assert_eq!(worker.split_step_blocking(&kit, &files).unwrap()["written"], 4);
+    loaded.add_split_import(&split).unwrap();
+    loaded.save().unwrap();
+    drop(worker);
+
+    let project = host.call("get_project", &json!({})).unwrap();
+    let parts = project["parts"].as_array().unwrap();
+    let names: Vec<&str> = parts.iter().map(|p| p["part"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Base", "Leaf", "Leaf_2", "Pin"]);
+    assert!(parts.iter().all(|p| p["group"] == "kit" && p["ok"] == true), "{project}");
+    // Untouched bodies are listed briefly, without code or every step.
+    assert!(parts[0].get("features").is_none());
+    // Each body is where it was in the assembly: the second leaf at x 2.5..17.5,
+    // y 85..115 once the hinge's 100 mm move is added.
+    assert_eq!(parts[2]["bbox_min"], json!([2.5, 85.0, -1.0]), "{}", parts[2]);
+    assert_eq!(parts[2]["bbox_max"], json!([17.5, 115.0, 1.0]));
+    assert_eq!(parts[0]["size_mm"], json!([60.0, 40.0, 5.0]));
+
+    // A body is an ordinary part: it can be edited, and then it's reported in full.
+    let report = add(&mut host, "Pin", "Shorter", "part = part & Box(10, 200, 10)").unwrap();
+    assert_eq!(report["ok"], true, "{report}");
+    let project = host.call("get_project", &json!({})).unwrap();
+    assert!(project["parts"][3].get("features").is_some());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn undo_redo_and_delete_part_through_the_tools() {
     // None of these need the worker.
     let (mut host, dir) = project("undo");

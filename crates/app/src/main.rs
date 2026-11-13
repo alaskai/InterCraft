@@ -125,6 +125,7 @@ struct State {
     mesh_pose: HashMap<String, Pose>,
     /// The Motion panel: joint sliders and Play.
     motion: motion::Motion,
+    own_edit: bool,
     hidden: HashSet<String>,
     /// Undo history of the open project, refreshed on every reload.
     history: HistoryInfo,
@@ -194,6 +195,7 @@ impl App {
             poses: HashMap::new(),
             mesh_pose: HashMap::new(),
             motion: motion::Motion::default(),
+            own_edit: false,
             hidden: HashSet::new(),
             history: HistoryInfo::default(),
             param_drag: None,
@@ -449,7 +451,10 @@ impl State {
         let mut loaded = LoadedProject::load(&self.project_dir)?;
         let result = change(&mut loaded);
         drop(lock);
+        // The status bar already says what changed; the caption is for changes from elsewhere.
+        self.own_edit = true;
         self.reload_project();
+        self.own_edit = false;
         result
     }
 
@@ -1225,7 +1230,7 @@ impl State {
                 let newest = history.entries.iter().find(|e| Some(e.number) == history.head);
                 // Not on the first load, and not for history that was already there.
                 let reloading = self.project.is_some();
-                let fresh = reloading && newest.is_some_and(|e| self.history.head.is_none_or(|old| e.number > old));
+                let fresh = reloading && !self.own_edit && newest.is_some_and(|e| self.history.head.is_none_or(|old| e.number > old));
                 if let (true, false, Some(entry)) = (fresh, self.chat.busy(), newest) {
                     self.outside_caption.set(entry.label.clone());
                     self.outside_caption.finish();

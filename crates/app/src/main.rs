@@ -945,7 +945,8 @@ impl State {
         let width = room.clamp(260.0, 380.0).min(rect.width() - 16.0);
         let Some(check) = &mut self.print_check else { return None };
         let painter = ui.painter_at(rect);
-        for (number, at, kind) in check.markers() {
+        let markers = if self.viewport.hide_overlays { Vec::new() } else { check.markers() };
+        for (number, at, kind) in markers {
             let Some(spot) = self.viewport.project(at) else { continue };
             let colour = match kind.as_str() {
                 "thin wall" => egui::Color32::from_rgb(235, 80, 80),
@@ -995,7 +996,10 @@ impl State {
                 Some((part.name.clone(), mat4(&built.inverse().then(&project.shown_pose(part)))))
             })
             .collect();
+        let previewing = self.motion.preview(&project).is_some();
         drop(project);
+        // Clash volumes and print markers belong to where the parts were checked.
+        self.viewport.hide_overlays = previewing;
         for (name, motion) in moves {
             self.viewport.set_motion(&name, motion);
         }
@@ -1150,7 +1154,7 @@ impl State {
                 hovered = fit.panel_ui(ui);
             });
         });
-        if let Some((a, b)) = hovered {
+        if let Some((a, b)) = hovered.filter(|_| !self.viewport.hide_overlays) {
             if let (Some(sa), Some(sb)) = (self.viewport.project(a), self.viewport.project(b)) {
                 let painter = ui.painter_at(rect);
                 painter.line_segment([sa, sb], egui::Stroke::new(2.0, egui::Color32::WHITE));

@@ -206,6 +206,35 @@ impl GpuMesh {
     }
 }
 
+/// A GPU buffer holding `bytes`, or None when the graphics card has no room for it.
+/// The buffer is made unmapped and filled through the queue, because a mapped buffer
+/// that fails to allocate panics inside wgpu instead of reporting an error.
+fn upload(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+    let align = wgpu::COPY_BUFFER_ALIGNMENT as usize;
+    let padded;
+    let bytes = if bytes.len() % align == 0 && !bytes.is_empty() {
+        bytes
+    } else {
+        padded = [bytes, &vec![0; align - bytes.len() % align]].concat();
+        &padded[..]
+    };
+    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes.len() as u64,
+        usage: usage | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    // Native wgpu reports errors as they happen, so the scope is already settled.
+    let mut pop = std::pin::pin!(scope.pop());
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    if let std::task::Poll::Ready(Some(_)) = std::future::Future::poll(pop.as_mut(), &mut cx) {
+        return None;
+    }
+    queue.write_buffer(&buffer, 0, bytes);
+    Some(buffer)
+}
+
 fn motion_binding(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, motion: Mat4) -> (wgpu::Buffer, wgpu::BindGroup) {
     let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("intercraft motion"),
@@ -572,10 +601,12 @@ impl Viewport {
         }
     }
 
-    pub fn set_mesh(&mut self, name: &str, mesh: Mesh, color: [f32; 3]) {
+    /// Show a part's mesh. False when the graphics card had no memory left for it; the
+    /// part's old mesh, if any, stays up.
+    pub fn set_mesh(&mut self, name: &str, mesh: Mesh, color: [f32; 3]) -> bool {
         let Some((lo, hi)) = mesh.bounds() else {
             self.meshes.remove(name);
-            return;
+            return true;
         };
         let vertices: Vec<Vertex> = mesh
             .positions
@@ -590,33 +621,28 @@ impl Viewport {
             .flat_map(|pair| pair.iter().map(|&pos| Vertex { pos, normal: [0.0; 3], color: EDGE_COLOR }))
             .collect();
 
-        let device = &self.rs.device;
+        let (device, queue) = (&self.rs.device, &self.rs.queue);
         let first = self.meshes.is_empty();
         let visible = self.meshes.get(name).is_none_or(|m| m.visible);
-        let edges = (!edge_vertices.is_empty()).then(|| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(name),
-                contents: bytemuck::cast_slice(&edge_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
-        });
+        let vertex_buffer = upload(device, queue, name, bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX);
+        let index_buffer = upload(device, queue, name, bytemuck::cast_slice(&mesh.indices), wgpu::BufferUsages::INDEX);
+        let (Some(vertex_buffer), Some(index_buffer)) = (vertex_buffer, index_buffer) else { return false };
+        // Edges are a nice extra: without room for them the part still shows.
+        let edges = if edge_vertices.is_empty() {
+            None
+        } else {
+            upload(device, queue, name, bytemuck::cast_slice(&edge_vertices), wgpu::BufferUsages::VERTEX)
+        };
+        let edge_vertex_count = if edges.is_some() { edge_vertices.len() as u32 } else { 0 };
         let (motion_buffer, motion_bind) = motion_binding(device, &self.motion_layout, Mat4::IDENTITY);
         self.meshes.insert(
             name.to_owned(),
             GpuMesh {
-                vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(name),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(name),
-                    contents: bytemuck::cast_slice(&mesh.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
+                vertices: vertex_buffer,
+                indices: index_buffer,
                 index_count: mesh.indices.len() as u32,
                 edges,
-                edge_vertex_count: edge_vertices.len() as u32,
+                edge_vertex_count,
                 bounds: (lo.into(), hi.into()),
                 color,
                 visible,
@@ -629,6 +655,7 @@ impl Viewport {
         if first {
             self.fit();
         }
+        true
     }
 
     /// Replace the clash volumes shown in red.

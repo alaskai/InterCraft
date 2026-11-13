@@ -570,7 +570,7 @@ impl State {
         if !drag.apply(&mut part) {
             return;
         }
-        if worker.rebuild(intercraft_tools::request_for(&loaded.dir, &part)).is_ok() {
+        if worker.rebuild(intercraft_tools::request_for(&loaded.dir, &loaded.project, &part)).is_ok() {
             for ((name, _), entry) in self.results.iter_mut() {
                 if *name == part.name {
                     entry.stale = true;
@@ -1027,7 +1027,7 @@ impl State {
         }
         for name in parts {
             let Ok(part) = loaded.part(name) else { continue };
-            let request = intercraft_tools::request_for(&loaded.dir, part);
+            let request = intercraft_tools::rest_request(&loaded.dir, part);
             match worker.request_export(request, format, &dir.join(format!("{}.{ext}", part.name))) {
                 Ok(()) => self.exports_pending += 1,
                 Err(e) => self.worker_status = format!("Export failed: {e:#}"),
@@ -1089,7 +1089,7 @@ impl State {
             entry.stale = true;
         }
         for part in &loaded.project.parts {
-            match worker.rebuild(intercraft_tools::request_for(&loaded.dir, part)) {
+            match worker.rebuild(intercraft_tools::request_for(&loaded.dir, &loaded.project, part)) {
                 Ok(()) => {
                     self.building.insert(part.name.clone());
                 }
@@ -1481,7 +1481,16 @@ impl State {
                     commit = params::placement_rows(ui, part, drag).map(InspectorAction::Param);
                 });
                 ui.weak("X, Y, Z in mm, then degrees about each axis.");
+                if self.project.as_ref().is_some_and(|p| p.project.joint_moving(&part.name).is_some()) {
+                    ui.weak("This is where it sits with its joint at 0.");
+                }
             });
+        if let Some(joint) = self.project.as_ref().and_then(|p| p.project.joint_moving(&part.name)) {
+            let line = ui.label(format!("Moves on {}", joint.summary()));
+            if !joint.why.is_empty() {
+                line.on_hover_text(&joint.why);
+            }
+        }
 
         // Follow the latest step unless one is picked on the timeline.
         let steps = steps(part);

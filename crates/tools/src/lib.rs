@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use intercraft_core::{FeatureEdit, LoadedProject, NewFeature, Params, Part};
+use intercraft_core::{FeatureEdit, Joint, JointEdit, JointKind, LoadedProject, NewFeature, Params, Part, Project};
 use intercraft_geo::{ExportFormat, FeatureInput, FeatureResult, PythonWorker, RebuildRequest};
 use serde_json::{json, Value};
 
@@ -49,6 +49,13 @@ Assemblies:
 - inspect_part answers in the part's own frame. Build reports and measure answer in assembly positions.
 - view_model shows you the model. Look after a change that is easy to get wrong by position or side, and before telling the user it is done.
 - check_fit finds clashes and clearances between parts. Parts that should mate must not overlap.
+
+Joints and motion:
+- add_joint makes a part move against another: a hinge turns about an axis, a slider moves along one. Give the axis in assembly mm with every joint at 0, and the range (degrees or mm).
+- A moving part's placement is where it sits with its joint at 0, usually closed or at the start of its travel. Place it there first, then add the joint.
+- `at` is where a joint is now. Build reports, measure, check_fit and view_model all show the parts at `at`. To check that a lid clears the box when open, edit_joint it to the open angle, run check_fit, then set it back.
+- Joints can chain: a part moved by one joint can be the base of another, and moves everything hanging from it.
+- Moving parts need clearance: about 0.3 mm or more around a printed hinge pin, and a gap where a part swings past another. Say which in the joint's why.
 
 Standard parts and fits:
 - Never size a screw hole, nut trap, insert hole or bearing seat from memory. Call fastener_info for the size (e.g. "M4") and use its numbers.
@@ -527,6 +534,55 @@ pub fn definitions() -> Value {
             },
         },
         {
+            "name": "add_joint",
+            "description": "Let one part move against another. A hinge turns the moving part about an axis (lids, doors, levers); a slider moves it along one (drawers, carriages, plungers). Give the axis in assembly mm with every joint at 0. The moving part's placement is its position at 0. Returns where the moved parts now sit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "A short plain name, e.g. 'Lid hinge'." },
+                    "kind": { "type": "string", "enum": ["hinge", "slider"] },
+                    "base": { "type": "string", "description": "The part the joint is fixed to." },
+                    "part": { "type": "string", "description": "The part that moves. A part can have only one joint that moves it, but it can be the base of others, so joints can chain." },
+                    "origin": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "A point on the axis, e.g. the centre of the hinge pin, in assembly mm." },
+                    "axis": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "Axis direction. A hinge turns right-handed about it: thumb along the axis, fingers show positive angles." },
+                    "min": { "type": "number", "description": "Lower end of the range: degrees for a hinge, mm for a slider." },
+                    "max": { "type": "number", "description": "Upper end of the range." },
+                    "at": { "type": "number", "description": "Where to set it now. Default 0, or the nearest end of the range." },
+                    "why": { "type": "string", "description": "One plain sentence on what the motion is for." },
+                },
+                "required": ["name", "kind", "base", "part", "origin", "axis", "min", "max"],
+            },
+        },
+        {
+            "name": "edit_joint",
+            "description": "Change a joint. Most often used to move it: set `at` to open a hinge or slide a slider, then check_fit or view_model to see that pose. Pass only the fields to change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The joint to change." },
+                    "at": { "type": "number", "description": "New position within the range: degrees or mm." },
+                    "kind": { "type": "string", "enum": ["hinge", "slider"] },
+                    "base": { "type": "string" },
+                    "part": { "type": "string" },
+                    "origin": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "axis": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+                    "min": { "type": "number" },
+                    "max": { "type": "number" },
+                    "why": { "type": "string" },
+                },
+                "required": ["name"],
+            },
+        },
+        {
+            "name": "delete_joint",
+            "description": "Remove a joint. The parts stay where its value 0 puts them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"],
+            },
+        },
+        {
             "name": "export_part",
             "description": "Write the finished part to the project's exports folder. STEP is exact and editable, STL is for printing. Omit `format` to write both.",
             "inputSchema": {
@@ -591,7 +647,7 @@ impl ToolHost {
             "get_project" => {
                 let mut parts = Vec::new();
                 for part in &project.project.parts {
-                    parts.push(self.build_report(part, true)?);
+                    parts.push(self.build_report(&project, part, true)?);
                 }
                 Ok(json!({
                     "name": project.project.name,
@@ -599,6 +655,7 @@ impl ToolHost {
                     "folder": project.dir,
                     "brief": project.brief,
                     "parts": parts,
+                    "joints": project.project.joints,
                 }))
             }
             "add_part" => {
@@ -622,7 +679,7 @@ impl ToolHost {
                     },
                 )?;
                 project.save()?;
-                let mut report = self.build_report(project.part(part)?, false)?;
+                let mut report = self.build_report(&project, project.part(part)?, false)?;
                 report["added_feature"] = id.into();
                 Ok(report)
             }
@@ -641,26 +698,26 @@ impl ToolHost {
                     },
                 )?;
                 project.save()?;
-                self.build_report(project.part(part)?, false)
+                self.build_report(&project, project.part(part)?, false)
             }
             "set_param" => {
                 let part = text(args, "part")?;
                 let value = args.get("value").cloned().context("missing 'value'")?;
                 project.set_param(part, text(args, "feature_id")?, text(args, "name")?, value)?;
                 project.save()?;
-                self.build_report(project.part(part)?, false)
+                self.build_report(&project, project.part(part)?, false)
             }
             "move_feature" => {
                 let part = text(args, "part")?;
                 project.move_feature(part, text(args, "feature_id")?, optional_text(args, "after"))?;
                 project.save()?;
-                self.build_report(project.part(part)?, false)
+                self.build_report(&project, project.part(part)?, false)
             }
             "delete_feature" => {
                 let part = text(args, "part")?;
                 project.delete_feature(part, text(args, "feature_id")?)?;
                 project.save()?;
-                self.build_report(project.part(part)?, false)
+                self.build_report(&project, project.part(part)?, false)
             }
             "update_brief" => {
                 project.update_brief_section(text(args, "section")?, text(args, "text")?)?;
@@ -677,7 +734,7 @@ impl ToolHost {
             "duplicate_part" => {
                 let name = project.duplicate_part(text(args, "part")?, optional_text(args, "new_name"))?;
                 project.save()?;
-                let mut report = self.build_report(project.part(&name)?, false)?;
+                let mut report = self.build_report(&project, project.part(&name)?, false)?;
                 report["duplicated_as"] = name.into();
                 Ok(report)
             }
@@ -689,7 +746,7 @@ impl ToolHost {
                 let rotation = optional_triple(args, "rotation")?.unwrap_or(part.rotation);
                 project.set_placement(name, position, rotation)?;
                 project.save()?;
-                self.build_report(project.part(name)?, false)
+                self.build_report(&project, project.part(name)?, false)
             }
             "delete_part" => {
                 let name = text(args, "part")?;
@@ -703,7 +760,7 @@ impl ToolHost {
             "inspect_part" => {
                 let part = project.part(text(args, "part")?)?.clone();
                 // In the part's own frame: that is where its features work.
-                let key = self.built_key(&project.dir, &part, optional_text(args, "feature_id"), false)?;
+                let key = self.built_key(&project, &part, optional_text(args, "feature_id"), false)?;
                 let mut data = self.with_worker(|w| w.inspect_blocking(&key))?;
                 if part.placement().is_some() {
                     data["frame"] = format!(
@@ -717,11 +774,9 @@ impl ToolHost {
             }
             "measure" => {
                 let default_part = optional_text(args, "part").map(str::to_owned);
-                let dir = project.dir.clone();
-                let parts = project.project.parts.clone();
                 let mut key_for = |name: &str| -> Result<String> {
-                    let part = parts.iter().find(|p| p.name == name).with_context(|| format!("no part named '{name}'"))?;
-                    self.built_key(&dir, part, None, true)
+                    let part = project.part(name)?;
+                    self.built_key(&project, part, None, true)
                 };
                 let a = selection(&mut key_for, default_part.as_deref(), args.get("a").context("missing 'a'")?)?;
                 let b = match args.get("b") {
@@ -765,7 +820,7 @@ impl ToolHost {
                 if up.iter().all(|v| *v == 0.0) {
                     bail!("'up' must point somewhere, like [0, 0, 1]");
                 }
-                let key = self.built_key(&project.dir, &part, None, false)?;
+                let key = self.built_key(&project, &part, None, false)?;
                 let mut data = self.with_worker(|w| w.print_check_blocking(&key, min_wall, up))?;
                 data["part"] = part.name.into();
                 Ok(data)
@@ -812,7 +867,7 @@ impl ToolHost {
                 let rotation = optional_triple(args, "rotation")?.unwrap_or([0.0; 3]);
                 project.set_placement(&name, position, rotation)?;
                 project.save()?;
-                let mut report = self.build_report(project.part(&name)?, false)?;
+                let mut report = self.build_report(&project, project.part(&name)?, false)?;
                 report["added_part"] = name.into();
                 Ok(report)
             }
@@ -834,7 +889,7 @@ impl ToolHost {
                 }
                 let mut keys = Vec::new();
                 for part in &parts {
-                    keys.push((part.name.clone(), self.built_key(&project.dir, part, None, true)?));
+                    keys.push((part.name.clone(), self.built_key(&project, part, None, true)?));
                 }
                 let mut data = self.with_worker(|w| w.fit_blocking(&keys))?;
                 // The mesh files are for the viewer.
@@ -843,7 +898,60 @@ impl ToolHost {
                         pair.remove("mesh");
                     }
                 }
+                let moved: Vec<String> = project.project.joints.iter().filter(|j| j.at != 0.0).map(Joint::summary).collect();
+                if !moved.is_empty() {
+                    data["joints"] = json!(moved);
+                }
                 Ok(data)
+            }
+            "add_joint" => {
+                let (min, max) = (number(args, "min")?, number(args, "max")?);
+                let at = match optional_number(args, "at")? {
+                    Some(at) => at,
+                    // 0 when the range allows it, otherwise its nearest end.
+                    None if min <= max => 0f64.clamp(min, max),
+                    None => 0.0,
+                };
+                let joint = Joint {
+                    name: text(args, "name")?.trim().to_owned(),
+                    kind: joint_kind(text(args, "kind")?)?,
+                    base: text(args, "base")?.to_owned(),
+                    part: text(args, "part")?.to_owned(),
+                    origin: optional_triple(args, "origin")?.context("missing 'origin'")?,
+                    axis: optional_triple(args, "axis")?.context("missing 'axis'")?,
+                    min,
+                    max,
+                    at,
+                    why: optional_text(args, "why").unwrap_or_default().to_owned(),
+                };
+                let name = joint.name.clone();
+                project.add_joint(joint)?;
+                project.save()?;
+                self.joint_report(&project, &name)
+            }
+            "edit_joint" => {
+                let name = text(args, "name")?;
+                let edit = JointEdit {
+                    kind: optional_text(args, "kind").map(joint_kind).transpose()?,
+                    base: optional_text(args, "base").map(str::to_owned),
+                    part: optional_text(args, "part").map(str::to_owned),
+                    origin: optional_triple(args, "origin")?,
+                    axis: optional_triple(args, "axis")?,
+                    min: optional_number(args, "min")?,
+                    max: optional_number(args, "max")?,
+                    at: optional_number(args, "at")?,
+                    why: optional_text(args, "why").map(str::to_owned),
+                };
+                project.edit_joint(name, edit)?;
+                project.save()?;
+                self.joint_report(&project, name)
+            }
+            "delete_joint" => {
+                let name = text(args, "name")?;
+                let moved = project.project.moved_by(name);
+                project.delete_joint(name)?;
+                project.save()?;
+                Ok(json!({ "deleted_joint": name, "back_at_rest": moved }))
             }
             "export_part" => {
                 let part = project.part(text(args, "part")?)?;
@@ -857,7 +965,7 @@ impl ToolHost {
                 for format in formats {
                     let ext = if format == ExportFormat::Step { "step" } else { "stl" };
                     let path = project.dir.join("exports").join(format!("{}.{ext}", part.name));
-                    let request = request_for(&project.dir, part);
+                    let request = rest_request(&project.dir, part);
                     files.push(self.with_worker(|w| w.export_blocking(request, format, &path))?);
                 }
                 Ok(json!({ "exported": files }))
@@ -905,8 +1013,9 @@ impl ToolHost {
 
     /// Builds a part and describes each feature's outcome in numbers.
     /// Build a part and return the cache key of its final shape (or of `feature_id`).
-    fn built_key(&mut self, dir: &Path, part: &Part, feature_id: Option<&str>, placed: bool) -> Result<String> {
-        let request = if placed { request_for(dir, part) } else { local_request(dir, part) };
+    fn built_key(&mut self, loaded: &LoadedProject, part: &Part, feature_id: Option<&str>, placed: bool) -> Result<String> {
+        let dir = &loaded.dir;
+        let request = if placed { request_for(dir, &loaded.project, part) } else { local_request(dir, part) };
         let results = self.with_worker(|w| w.build_blocking(request))?;
         let wanted = match feature_id {
             Some(id) => results.iter().find(|r| r.feature_id == id).with_context(|| format!("no step '{id}' in '{}'", part.name))?,
@@ -918,9 +1027,31 @@ impl ToolHost {
         wanted.mesh.as_deref().and_then(intercraft_geo::Mesh::key_of).context("the worker gave no shape")
     }
 
-    fn build_report(&mut self, part: &Part, with_source: bool) -> Result<Value> {
-        let dir = self.project_dir()?;
-        let request = request_for(&dir, part);
+    /// Where a joint has put the parts it moves.
+    fn joint_report(&mut self, loaded: &LoadedProject, name: &str) -> Result<Value> {
+        let joint = loaded.project.joint(name).with_context(|| format!("no joint called '{name}'"))?.clone();
+        let mut moved = Vec::new();
+        for part_name in loaded.project.moved_by(&joint.name) {
+            let part = loaded.part(&part_name)?;
+            let request = request_for(&loaded.dir, &loaded.project, part);
+            let results = self.with_worker(|w| w.build_blocking(request))?;
+            let mut entry = json!({ "part": part_name });
+            if let Some(r) = results.last().and_then(|r| r.report.as_ref()) {
+                entry["bbox_min"] = json!(r.bbox_min.map(round));
+                entry["bbox_max"] = json!(r.bbox_max.map(round));
+            }
+            moved.push(entry);
+        }
+        Ok(json!({
+            "joint": joint,
+            "summary": joint.summary(),
+            "moved_parts": moved,
+            "note": "Positions are in the assembly with the joint where it is now.",
+        }))
+    }
+
+    fn build_report(&mut self, loaded: &LoadedProject, part: &Part, with_source: bool) -> Result<Value> {
+        let request = request_for(&loaded.dir, &loaded.project, part);
         let results = self.with_worker(|w| w.build_blocking(request))?;
         let by_id: HashMap<&str, &FeatureResult> =
             results.iter().map(|r| (r.feature_id.as_str(), r)).collect();
@@ -985,6 +1116,10 @@ impl ToolHost {
             report["position_mm"] = json!(part.position);
             report["rotation_deg"] = json!(part.rotation);
         }
+        let chain = loaded.project.joint_chain(&part.name);
+        if !chain.is_empty() {
+            report["moved_by"] = json!(chain.iter().map(|j| j.summary()).collect::<Vec<_>>());
+        }
         if let Some(source) = &part.source {
             report["imported_from"] = source.clone().into();
         }
@@ -997,8 +1132,15 @@ impl ToolHost {
 }
 
 /// Everything the worker needs to build a part: the imported file first, if any,
-/// then each feature. Shared by the viewer and the tools so both build the same thing.
-pub fn request_for(dir: &Path, part: &Part) -> RebuildRequest {
+/// then each feature, placed where the assembly shows it (joints included). Shared
+/// by the viewer and the tools so both build the same thing.
+pub fn request_for(dir: &Path, project: &Project, part: &Part) -> RebuildRequest {
+    RebuildRequest { placement: project.shown_placement(part), ..local_request(dir, part) }
+}
+
+/// The part where its placement puts it, with every joint at 0. Exports use this, so
+/// a part's file doesn't depend on where a hinge was left.
+pub fn rest_request(dir: &Path, part: &Part) -> RebuildRequest {
     RebuildRequest { placement: part.placement(), ..local_request(dir, part) }
 }
 
@@ -1119,6 +1261,25 @@ fn optional_triple(args: &Value, key: &str) -> Result<Option<[f64; 3]>> {
     match numbers.as_deref() {
         Some(&[x, y, z]) if value.as_array().is_some_and(|a| a.len() == 3) => Ok(Some([x, y, z])),
         _ => bail!("'{key}' must be three numbers, like [10, 0, 5]"),
+    }
+}
+
+fn number(args: &Value, key: &str) -> Result<f64> {
+    optional_number(args, key)?.with_context(|| format!("missing '{key}'"))
+}
+
+fn optional_number(args: &Value, key: &str) -> Result<Option<f64>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_f64().map(Some).with_context(|| format!("'{key}' must be a number")),
+    }
+}
+
+fn joint_kind(kind: &str) -> Result<JointKind> {
+    match kind {
+        "hinge" => Ok(JointKind::Hinge),
+        "slider" => Ok(JointKind::Slider),
+        other => bail!("unknown joint kind '{other}', use 'hinge' or 'slider'"),
     }
 }
 

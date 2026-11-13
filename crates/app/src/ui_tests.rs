@@ -969,6 +969,44 @@ fn the_chat_shows_what_replies_cost() {
 }
 
 #[test]
+fn a_part_on_a_joint_is_shown_where_the_joint_puts_it() {
+    let _one = one_at_a_time();
+    let project = example_project("joint");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    // From outside, the way a Claude Code terminal would: a copy turned 90° on a hinge.
+    let mut loaded = intercraft_core::LoadedProject::load(&project).unwrap();
+    loaded.duplicate_part("RodBracket", Some("Arm")).unwrap();
+    loaded.save().unwrap();
+    loaded
+        .add_joint(intercraft_core::Joint {
+            name: "Arm pivot".into(),
+            kind: intercraft_core::JointKind::Hinge,
+            base: "RodBracket".into(),
+            part: "Arm".into(),
+            origin: [0.0, 0.0, 0.0],
+            axis: [0.0, 0.0, 1.0],
+            min: 0.0,
+            max: 90.0,
+            at: 90.0,
+            why: "Swings the arm round.".into(),
+        })
+        .unwrap();
+    loaded.save().unwrap();
+    wait_until(&mut h, "the turned copy", |app| built(app) && app.state.shown.contains_key("Arm"));
+
+    // The bracket is 40 x 30 in X and Y; turned a quarter about Z the copy is 30 x 40.
+    let (lo, hi) = h.state().state.viewport.visible_bounds().unwrap();
+    assert!((hi[0] - lo[0] - 40.0).abs() < 0.01 && (hi[1] - lo[1] - 40.0).abs() < 0.01, "{lo:?} {hi:?}");
+    h.state_mut().state.selected_part = Some("Arm".into());
+    h.step();
+    h.step();
+    h.get_by_label("Moves on Arm pivot: hinge, 0 to 90°, now 90°");
+    assert_eq!(h.state().state.outside_caption.shown().unwrap().0, "Add joint 'Arm pivot'");
+}
+
+#[test]
 fn several_questions_in_one_reply_are_answered_together() {
     let _one = one_at_a_time();
     let project = example_project("questions");

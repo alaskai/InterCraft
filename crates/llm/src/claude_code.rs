@@ -59,6 +59,11 @@ pub struct ClaudeCodeChat {
     /// Claude Code's running cost estimate for the session at the last reply, so each
     /// reply's own cost is the difference.
     session_cost: f64,
+    /// The session id came from a saved chat and hasn't answered yet. Claude Code may
+    /// no longer have it, in which case a fresh session starts from `recap`.
+    unproven: bool,
+    /// The saved conversation in words, for a fresh session to read.
+    recap: String,
 }
 
 /// `claude --version`, or None when Claude Code isn't installed or isn't on PATH.
@@ -87,7 +92,7 @@ fn hide_console(cmd: &mut Command) {
 
 impl ClaudeCodeChat {
     pub fn new(settings: ClaudeCodeSettings) -> Self {
-        Self { settings, session_id: None, running: None, session_cost: 0.0 }
+        Self { settings, session_id: None, running: None, session_cost: 0.0, unproven: false, recap: String::new() }
     }
 
     pub fn update_settings(&mut self, settings: ClaudeCodeSettings) {
@@ -206,6 +211,61 @@ impl ChatSession for ClaudeCodeChat {
         on_event: &mut dyn FnMut(ChatEvent),
         cancel: &AtomicBool,
     ) -> Result<()> {
+        if !self.unproven {
+            return self.exchange(text, images, on_event, cancel);
+        }
+        // A session saved with the project: resume it if Claude Code still has it.
+        let mut heard = false;
+        let result = self.exchange(text, images, &mut |event| {
+            heard = true;
+            on_event(event)
+        }, cancel);
+        self.unproven = false;
+        match result {
+            Err(e) if !heard && !e.is::<Cancelled>() => {
+                // It's gone (cleared, or another computer). Start again from the recap.
+                self.stop();
+                self.session_id = None;
+                self.session_cost = 0.0;
+                let recap = std::mem::take(&mut self.recap);
+                let text = if recap.is_empty() { text.to_owned() } else { format!("{recap}\n\n{text}") };
+                self.exchange(&text, images, on_event, cancel)
+            }
+            other => other,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.stop();
+        self.session_id = None;
+        self.session_cost = 0.0;
+        self.unproven = false;
+        self.recap.clear();
+    }
+
+    fn state(&self) -> Value {
+        json!({ "session_id": self.session_id })
+    }
+
+    fn restore(&mut self, state: &Value) {
+        // The id becomes a command-line argument, so only the plain form is accepted.
+        let id = state["session_id"].as_str().filter(|id| {
+            (8..=64).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !id.starts_with('-')
+        });
+        self.stop();
+        self.session_id = id.map(str::to_owned);
+        self.unproven = id.is_some();
+        self.session_cost = 0.0;
+        self.recap = state["recap"].as_str().unwrap_or_default().chars().take(MAX_RECAP_CHARS).collect();
+    }
+}
+
+/// Longest recap handed to a fresh session.
+const MAX_RECAP_CHARS: usize = 12_000;
+
+impl ClaudeCodeChat {
+    /// One message out and the reply back.
+    fn exchange(&mut self, text: &str, images: &[String], on_event: &mut dyn FnMut(ChatEvent), cancel: &AtomicBool) -> Result<()> {
         // Plain text stays a plain string. With pictures the content becomes a list of blocks.
         let content = if images.is_empty() {
             Value::from(text)
@@ -333,11 +393,6 @@ impl ChatSession for ClaudeCodeChat {
         }
     }
 
-    fn reset(&mut self) {
-        self.stop();
-        self.session_id = None;
-        self.session_cost = 0.0;
-    }
 }
 
 impl Drop for ClaudeCodeChat {

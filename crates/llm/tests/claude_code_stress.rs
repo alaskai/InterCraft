@@ -249,3 +249,33 @@ fn each_reply_reports_its_own_cost() {
     assert!((costs(&first)[0] - 0.02).abs() < 1e-9);
     assert!((costs(&second)[0] - 0.02).abs() < 1e-9, "{:?}", costs(&second));
 }
+
+#[test]
+fn a_saved_session_is_resumed_or_restarted_from_its_recap() {
+    // Saved with the project and still known to Claude Code: it is resumed.
+    let mut chat = new_chat();
+    chat.restore(&json!({ "session_id": "saved-session-1234", "recap": "echo recap" }));
+    assert_eq!(lockdown(&mut chat)["resumed"], "saved-session-1234");
+    assert_eq!(chat.state()["session_id"], "saved-session-1234");
+
+    // No longer known (cleared, or another computer): a fresh session reads the recap,
+    // and the user's message still gets its answer.
+    let mut chat = new_chat();
+    chat.restore(&json!({ "session_id": "gone-session-0000", "recap": "echo earlier we made a bracket" }));
+    let (result, events) = send(&mut chat, "and now a lid");
+    assert!(result.is_ok(), "{result:?}");
+    let said = text_of(&events);
+    assert!(said.contains("earlier we made a bracket") && said.contains("and now a lid"), "{said}");
+    let id = chat.state()["session_id"].as_str().unwrap().to_owned();
+    assert!(id.starts_with("fake-session-"), "{id}");
+    // The recap is given once, not with every message after.
+    let (_, events) = send(&mut chat, "echo again");
+    assert_eq!(text_of(&events), "echo again");
+
+    // The id ends up on a command line, so anything odd in a saved file is dropped.
+    for bad in ["--dangerously-skip-permissions", "a b", "x;calc", "short", ""] {
+        let mut chat = new_chat();
+        chat.restore(&json!({ "session_id": bad }));
+        assert_eq!(chat.state()["session_id"], Value::Null, "kept {bad:?}");
+    }
+}

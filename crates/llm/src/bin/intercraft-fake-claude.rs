@@ -40,6 +40,11 @@ fn main() {
         return;
     }
     let resumed = arg_after(&args, "--resume").map(str::to_owned);
+    // A session Claude Code no longer has: it says so and exits, as the real one does.
+    if resumed.as_deref() == Some("gone-session-0000") {
+        eprintln!("No conversation found with session ID: gone-session-0000");
+        std::process::exit(1);
+    }
     let session = resumed.clone().unwrap_or_else(|| format!("fake-session-{}", std::process::id()));
     let mcp_ok = arg_after(&args, "--mcp-config")
         .and_then(|c| serde_json::from_str::<Value>(c).ok())

@@ -305,13 +305,17 @@ fn describe(before: &Content, after: &Content) -> String {
         changes.push(format!("Rename project to '{}'", new.name));
     }
     // A whole group arriving, leaving or being renamed is one change, not one per part.
+    // Groups nest, and these look at the outermost one.
+    fn top(group: &str) -> &str {
+        group.split('/').next().unwrap_or(group)
+    }
     let mut whole: HashSet<&str> = HashSet::new();
     let group_of = |parts: &[crate::Part], group: &str| -> Vec<String> {
-        parts.iter().filter(|p| p.group.as_deref() == Some(group)).map(|p| p.name.clone()).collect()
+        parts.iter().filter(|p| crate::in_group(p.group.as_deref(), group)).map(|p| p.name.clone()).collect()
     };
     let group_names = |parts: &[crate::Part]| -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        for g in parts.iter().filter_map(|p| p.group.clone()) {
+        for g in parts.iter().filter_map(|p| p.group.as_deref()).map(|g| top(g).to_owned()) {
             if !names.contains(&g) {
                 names.push(g);
             }
@@ -325,7 +329,7 @@ fn describe(before: &Content, after: &Content) -> String {
         if members.iter().all(|m| !was_there(m)) {
             changes.push(format!("Import '{group}' ({})", parts_count(members.len())));
         } else if !old_groups.contains(group) && members.iter().all(was_there) {
-            match old.parts.iter().find(|p| p.name == members[0]).and_then(|p| p.group.as_deref()) {
+            match old.parts.iter().find(|p| p.name == members[0]).and_then(|p| p.group.as_deref()).map(top) {
                 Some(before) if group_of(&old.parts, before) == members => {
                     changes.push(format!("Rename group '{before}' to '{group}'"))
                 }
@@ -342,13 +346,34 @@ fn describe(before: &Content, after: &Content) -> String {
         } else {
             continue;
         }
-        whole.extend(new.parts.iter().filter(|p| p.group.as_deref() == Some(group.as_str())).map(|p| p.name.as_str()));
+        whole.extend(new.parts.iter().filter(|p| crate::in_group(p.group.as_deref(), group)).map(|p| p.name.as_str()));
     }
     for group in &old_groups {
         let members = group_of(&old.parts, group);
         if members.iter().all(|m| !new.parts.iter().any(|p| p.name == *m)) {
             changes.push(format!("Delete '{group}' ({})", parts_count(members.len())));
-            whole.extend(old.parts.iter().filter(|p| p.group.as_deref() == Some(group.as_str())).map(|p| p.name.as_str()));
+            whole.extend(old.parts.iter().filter(|p| crate::in_group(p.group.as_deref(), group)).map(|p| p.name.as_str()));
+        }
+    }
+    // Parts tidied into, out of or between groups.
+    let regrouped: Vec<&crate::Part> = new
+        .parts
+        .iter()
+        .filter(|p| !whole.contains(p.name.as_str()))
+        .filter(|p| old.parts.iter().any(|w| w.name == p.name && w.group != p.group))
+        .collect();
+    match regrouped.as_slice() {
+        [] => {}
+        [part] => changes.push(match &part.group {
+            Some(group) => format!("Put '{}' in group '{group}'", part.name),
+            None => format!("Take '{}' out of its group", part.name),
+        }),
+        parts => {
+            let first = parts[0].group.as_deref();
+            match first.filter(|_| parts.iter().all(|p| p.group.as_deref() == first)) {
+                Some(group) => changes.push(format!("Group {} as '{group}'", parts_count(parts.len()))),
+                None => changes.push(format!("Regroup {}", parts_count(parts.len()))),
+            }
         }
     }
     for part in &new.parts {

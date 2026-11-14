@@ -9,8 +9,9 @@ use intercraft_core::{SplitImport, MAX_SPLIT_BODIES};
 pub enum Stage {
     /// The worker is reading the file (request id).
     Reading(u64),
-    /// Several bodies were found; waiting for the user to choose.
-    Asking(Vec<String>),
+    /// Several bodies were found (names, and the sub-assemblies each one sits in);
+    /// waiting for the user to choose.
+    Asking(Vec<String>, Vec<Vec<String>>),
     /// The worker is writing each body to its own file (request id, files written so far).
     Splitting(u64, SplitImport, usize),
     Failed(String),
@@ -82,7 +83,7 @@ impl Import {
                             choice = Some(Choice::Cancel);
                         }
                     }
-                    Stage::Asking(bodies) => {
+                    Stage::Asking(bodies, _) => {
                         ui.label(format!("This file holds {} bodies:", bodies.len()));
                         ui.weak(preview(bodies));
                         ui.add_space(6.0);

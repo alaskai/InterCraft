@@ -248,8 +248,8 @@ _step_bodies = (None, [])
 
 
 def step_bodies(path, tick=lambda: None):
-    """Every body in a STEP file as (name, shape), each placed where it sits in the
-    whole assembly. Bodies inside sub-assemblies are found too."""
+    """Every body in a STEP file as (name, shape, sub-assemblies it sits in), each
+    placed where it sits in the whole assembly."""
     global _step_bodies
     if not path.lower().endswith(STEP_EXTENSIONS):
         raise ValueError("only .step and .stp files can be imported")
@@ -261,25 +261,27 @@ def step_bodies(path, tick=lambda: None):
     tick()
     bodies = []
 
-    def walk(node, above):
+    def walk(node, above, inside):
         here = above * node.location
         if node.children:
+            # The top assembly is the import itself; the ones inside it become groups.
+            deeper = inside if node is shape else inside + [node.label or ""]
             for child in node.children:
-                walk(child, here)
+                walk(child, here, deeper)
             return
         if not node.solids():
             return  # a sketch or a surface, nothing to build on
         # A fresh copy with no parent; exporting a node still in the tree fails.
         alone = type(node)(node.wrapped.Moved(above.wrapped))
-        bodies.append((node.label or "", alone))
+        bodies.append((node.label or "", alone, inside))
 
     if shape is not None:
         if not shape.children and len(shape.solids()) > 1:
             # Several bodies with no assembly structure: one per solid.
             for i, solid in enumerate(shape.solids()):
-                bodies.append((f"{shape.label or 'Body'}_{i + 1}", solid))
+                bodies.append((f"{shape.label or 'Body'}_{i + 1}", solid, []))
         else:
-            walk(shape, build123d.Location())
+            walk(shape, build123d.Location(), [])
     _step_bodies = (key, bodies)
     return bodies
 
@@ -289,7 +291,7 @@ def step_contents(req):
         send({"id": req["id"], "event": "progress"})
 
     bodies = step_bodies(req["step"], tick)
-    names = [{"name": name, "solids": len(shape.solids())} for name, shape in bodies]
+    names = [{"name": name, "solids": len(shape.solids()), "path": path} for name, shape, path in bodies]
     send({"id": req["id"], "event": "info", "data": {"bodies": names}})
 
 
@@ -299,7 +301,7 @@ def split_step(req):
     files = req["files"]
     if len(files) != len(bodies):
         raise ValueError(f"{len(files)} file names for {len(bodies)} bodies")
-    for (name, shape), path in zip(bodies, files):
+    for (name, shape, _), path in zip(bodies, files):
         if not str(path).lower().endswith(STEP_EXTENSIONS):
             raise ValueError("bodies are written as .step files")
         shape.label = name

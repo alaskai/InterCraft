@@ -276,6 +276,65 @@ fn imported_part_can_be_inspected_measured_and_edited() {
 }
 
 #[test]
+fn a_big_project_reads_as_an_outline_with_detail_on_request() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    let (mut host, dir) = project("outline");
+    // More parts than get_project gives in full: a frame of rails, posts and a motor.
+    for i in 0..8 {
+        let name = format!("Rail_{i}");
+        host.call("add_part", &json!({ "name": name })).unwrap();
+        add(&mut host, &name, "Bar", "part = Box(200, 20, 20)").unwrap();
+        host.call("place_part", &json!({ "part": name, "position": [0, i * 30, 10] })).unwrap();
+    }
+    for i in 0..5 {
+        let name = format!("Post_{i}");
+        host.call("add_part", &json!({ "name": name })).unwrap();
+        add(&mut host, &name, "Bar", "part = Box(20, 20, 300)").unwrap();
+    }
+    host.call("add_part", &json!({ "name": "Z_Motor" })).unwrap();
+    add(&mut host, "Z_Motor", "Body", "part = Box(42, 42, 34)").unwrap();
+
+    // The model tidies them into nested groups.
+    let rails: Vec<String> = (0..8).map(|i| format!("Rail_{i}")).collect();
+    let grouped = host.call("set_group", &json!({ "parts": rails, "group": "Frame/Rails" })).unwrap();
+    assert_eq!(grouped["groups"], json!(["Frame", "Frame/Rails"]));
+    host.call("set_group", &json!({ "parts": ["Z_Motor"], "group": "Frame/Drive" })).unwrap();
+    assert!(host.call("set_group", &json!({ "parts": ["Nope"], "group": "X" })).is_err());
+    assert!(host.call("set_group", &json!({ "parts": "Rail_0" })).is_err());
+
+    let outline = host.call("get_project", &json!({})).unwrap();
+    let text = outline.to_string();
+    assert!(text.len() < 4000, "the outline should stay small, it is {} characters", text.len());
+    assert!(!text.contains("Box(200"), "no code in an outline");
+    assert_eq!(outline["parts"].as_array().unwrap().len(), 14);
+    assert_eq!(outline["parts"][1], json!({ "part": "Rail_1", "group": "Frame/Rails", "size": [200.0, 20.0, 20.0], "centre": [0.0, 30.0, 10.0], "steps": 1 }));
+    // The outer group counts what's in its sub-groups and gives the box they fill.
+    assert_eq!(outline["groups"][0], json!({ "group": "Frame", "parts": 9, "bbox_min": [-100.0, -21.0, -17.0], "bbox_max": [100.0, 220.0, 20.0] }));
+
+    let found = host.call("find_parts", &json!({ "name": "MOTOR" })).unwrap();
+    assert_eq!((found["found"].as_u64(), found["parts"][0]["part"].as_str()), (Some(1), Some("Z_Motor")));
+    assert_eq!(host.call("find_parts", &json!({ "group": "Frame" })).unwrap()["found"], 9);
+    assert_eq!(host.call("find_parts", &json!({ "group": "Frame/Rails", "name": "_3" })).unwrap()["found"], 1);
+    let none = host.call("find_parts", &json!({ "group": "Frames" })).unwrap();
+    assert_eq!((none["found"].as_u64(), &none["groups"]), (Some(0), &json!(["Frame", "Frame/Rails", "Frame/Drive"])));
+    assert!(host.call("find_parts", &json!({})).is_err());
+
+    let full = host.call("get_part", &json!({ "part": "Z_Motor" })).unwrap();
+    assert_eq!(full["features"][0]["code"].as_str().map(str::trim), Some("part = Box(42, 42, 34)"));
+    assert_eq!(full["group"], "Frame/Drive");
+
+    // Moving a group with a path, then dissolving one.
+    let moved = host.call("rename_group", &json!({ "group": "Frame/Drive", "new_path": "Motion/Z" })).unwrap();
+    assert_eq!(moved["groups"], json!(["Frame", "Frame/Rails", "Motion", "Motion/Z"]));
+    let gone = host.call("rename_group", &json!({ "group": "Frame/Rails" })).unwrap();
+    assert_eq!(gone["groups"], json!(["Frame", "Motion", "Motion/Z"]));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn asking_a_busy_worker_never_blocks_the_caller() {
     let _one = one_at_a_time();
     if !worker_available() {
@@ -313,7 +372,15 @@ fn an_assembly_splits_into_parts_where_they_sat() {
 
     let (mut host, dir) = project("split");
     let mut loaded = intercraft_core::LoadedProject::create(&dir, "Split").unwrap();
-    let split = loaded.plan_split_import(&kit, &bodies).unwrap();
+    // The hinge is a sub-assembly in the file, so its bodies say they sit in it.
+    let nested: Vec<(String, Vec<String>)> = contents["bodies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| (b["name"].as_str().unwrap().to_owned(), b["path"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_owned()).collect()))
+        .collect();
+    let split = loaded.plan_split_import_nested(&kit, &nested).unwrap();
+    assert_eq!(split.groups, ["kit", "kit/Hinge", "kit/Hinge", "kit/Hinge"]);
     std::fs::create_dir_all(&split.folder).unwrap();
     let files: Vec<PathBuf> = split.parts.iter().map(|(_, source)| dir.join(source)).collect();
     assert_eq!(worker.split_step_blocking(&kit, &files).unwrap()["written"], 4);
@@ -325,7 +392,8 @@ fn an_assembly_splits_into_parts_where_they_sat() {
     let parts = project["parts"].as_array().unwrap();
     let names: Vec<&str> = parts.iter().map(|p| p["part"].as_str().unwrap()).collect();
     assert_eq!(names, ["Base", "Leaf", "Leaf_2", "Pin"]);
-    assert!(parts.iter().all(|p| p["group"] == "kit" && p["ok"] == true), "{project}");
+    assert!(parts.iter().all(|p| p["ok"] == true), "{project}");
+    assert_eq!((&parts[0]["group"], &parts[3]["group"]), (&json!("kit"), &json!("kit/Hinge")));
     // Untouched bodies are listed briefly, without code or every step.
     assert!(parts[0].get("features").is_none());
     // Each body is where it was in the assembly: the second leaf at x 2.5..17.5,

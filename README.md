@@ -158,7 +158,17 @@ If the file holds several bodies (an assembly from Fusion, Onshape or SolidWorks
 | Separate parts in a group | One part per body, named from the file, under a folder in the parts list. Each body keeps its place in the assembly and can be moved, put on a joint, fit checked or edited. Their files go in `imports/<group>/`. Up to 500 bodies. |
 | One part | The whole file as a single part, as before. |
 
-A group is one colour, and the eye on its header hides or shows the whole import. Right-click a group to:
+Sub-assemblies in the file become groups inside the import's group, so a printer's extruder stays together. An import is one colour, and the eye on a group's header hides or shows everything in it.
+
+### Groups
+
+Groups are folders in the parts list, and they nest. They only organise the list: grouping a part changes nothing about it.
+
+- Right-click a part and choose **Move to group** to put it in a group. Type a new name, pick an existing group, or type a path such as `Printer/Extruder` to nest it.
+- Right-click a group and choose **Rename or move group** to rename it or, with a path, put it inside another group. **Ungroup** moves its contents up one level and deletes nothing.
+- The model has the same through `set_group` and `rename_group`.
+
+Right-click a group to also:
 
 - **Stand upright (Y up to Z up):** many CAD programs export with Y up, so a model can arrive lying on its back.
 - **Turn 90° about Z**, or **Rest on the floor** (lowest point at Z = 0).
@@ -225,7 +235,7 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 
 | Tool | What it does |
 |---|---|
-| `get_project` | Returns every part, feature, snippet and the current build numbers |
+| `get_project` | A small project in full: every part, feature, snippet and build numbers. A big one (over 12 parts) as an outline: groups, and one line per part with its size and position |
 | `add_part` | Creates an empty design part |
 | `add_feature` | Adds one modelling step and builds it |
 | `edit_feature` | Changes a feature's code, label or parameters |
@@ -235,7 +245,11 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `update_brief` | Replaces one section of the design brief |
 | `delete_part` | Removes a design part (reference parts can only be removed by you) |
 | `place_part` | Moves or turns a design part in the assembly |
-| `move_group` | Moves or turns a whole imported group as one piece |
+| `move_group` | Moves or turns a whole group as one piece |
+| `set_group` | Puts parts in a group (a path such as `Printer/Extruder`), or takes them out |
+| `rename_group` | Renames a group, moves it inside another, or dissolves it |
+| `get_part` | One part in full: steps, code and build numbers |
+| `find_parts` | Lists parts by name or group, with size and position |
 | `duplicate_part`, `rename_part` | Copies or renames a part |
 | `fastener_info` | Real sizes for a metric screw from the ISO tables: clearance holes, tap drill, head, nut and heat-set insert hole |
 | `add_standard_part` | Adds a real screw, nut, washer, heat-set insert or ball bearing as its own part |

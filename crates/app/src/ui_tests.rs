@@ -356,7 +356,7 @@ fn a_worker_that_stops_is_restarted_and_the_rest_still_builds() {
 }
 
 fn asking(app: &App) -> bool {
-    matches!(app.state.import.as_ref().map(|i| &i.stage), Some(import::Stage::Asking(_)))
+    matches!(app.state.import.as_ref().map(|i| &i.stage), Some(import::Stage::Asking(..)))
 }
 
 #[test]
@@ -386,7 +386,28 @@ fn an_assembly_can_be_split_into_a_group_or_kept_whole() {
     h.step();
     h.step();
     assert!(h.get_all_by_label("Pin").count() >= 1, "the group didn't open to show Pin");
+    // The hinge was a sub-assembly in the file, so it's a group inside the import.
+    assert!(h.get_all_by_label_contains("Hinge  (3)").count() >= 1);
+    let pin = h.state().state.project.as_ref().unwrap().part("Pin").unwrap().group.clone();
+    assert_eq!(pin.as_deref(), Some("kit/Hinge"));
+
+    // Any part can be tidied into a group by hand, nested with a path.
+    h.state_mut().state.set_part_group("RodBracket", "Fixtures/Brackets").unwrap();
+    h.step();
+    h.step();
+    assert!(h.get_all_by_label_contains("Fixtures  (1)").count() >= 1);
+    assert_eq!(h.state().state.history.undo_label(), Some("Put 'RodBracket' in group 'Fixtures/Brackets'"));
+    // The Move to group window lists the groups there are.
+    h.state_mut().state.rename = Some((RenameTarget::PartGroup("Base".into()), "kit".into(), None));
+    h.step();
+    h.step();
+    assert!(h.get_all_by_label("kit/Hinge").count() >= 1, "existing groups should be offered");
     shot(&mut h, "import-group");
+    h.state_mut().state.rename = None;
+    h.state_mut().state.rename_group("Fixtures", "").unwrap();
+    h.state_mut().state.rename_group("Brackets", "").unwrap();
+    h.step();
+    assert_eq!(h.state().state.project.as_ref().unwrap().part("RodBracket").unwrap().group, None);
 
     h.state_mut().state.rename_group("kit", "Hinge kit").unwrap();
     h.step();

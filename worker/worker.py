@@ -103,7 +103,10 @@ def write_mesh(shape, path, tick=lambda: None):
         if len(edges) % 2000 == 0:
             tick()
     corners = [tuple(vx) for vx in shape.vertices()]
+    write_icm(path, v, n, t, edges, corners)
 
+
+def write_icm(path, v, n, t, edges, corners):
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "wb") as f:
         f.write(MESH_FORMAT.encode())
@@ -129,6 +132,80 @@ def write_mesh(shape, path, tick=lambda: None):
             raise
 
 
+def read_icm(path):
+    """A mesh file back as arrays: vertices, normals, triangles, edges, corners."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:4] != MESH_FORMAT.encode():
+        raise ValueError(f"{path} is not an {MESH_FORMAT} mesh")
+    nv, nt = struct.unpack_from("<II", data, 4)
+    at = 12
+
+    def take(count, dtype):
+        nonlocal at
+        out = np.frombuffer(data, dtype=dtype, count=count, offset=at)
+        at += out.nbytes
+        return out
+
+    v = take(nv * 3, "<f4").reshape(-1, 3)
+    n = take(nv * 3, "<f4").reshape(-1, 3)
+    t = take(nt * 3, "<u4").reshape(-1, 3)
+    (ne,) = struct.unpack_from("<I", data, at)
+    at += 4
+    edges = []
+    for _ in range(ne):
+        (count,) = struct.unpack_from("<I", data, at)
+        at += 4
+        edges.append(take(count * 3, "<f4").reshape(-1, 3))
+    (nc,) = struct.unpack_from("<I", data, at)
+    at += 4
+    corners = take(nc * 3, "<f4").reshape(-1, 3)
+    return v, n, t, edges, corners
+
+
+def moved_mesh(local_path, path, placement):
+    """The mesh of a part moved to `placement`, made from its mesh in its own frame.
+    Moving a part doesn't change its shape, and meshing a threaded rod again takes
+    minutes, so the points are moved instead."""
+    if os.path.exists(path):
+        return
+    x, y, z, rx, ry, rz = (float(v) for v in placement)
+    trsf = build123d.Location((x, y, z), (rx, ry, rz)).wrapped.Transformation()
+    rot = np.array([[trsf.Value(i, j) for j in (1, 2, 3)] for i in (1, 2, 3)])
+    move = np.array([trsf.Value(i, 4) for i in (1, 2, 3)])
+    v, n, t, edges, corners = read_icm(local_path)
+    place_points = lambda p: (p.astype(np.float64) @ rot.T + move) if len(p) else p
+    write_icm(path, place_points(v), n.astype(np.float64) @ rot.T, t, [place_points(e) for e in edges], place_points(corners))
+
+
+# Shape key -> what doesn't change when the part moves: volume, counts, validity.
+_facts = {}
+
+
+def shape_facts(shape, key, cache_dir):
+    """The slow numbers about a shape (a threaded rod's volume takes seconds), kept
+    in memory and next to its mesh so a reopened project needn't work them out again."""
+    if key in _facts:
+        return _facts[key]
+    path = os.path.join(cache_dir, f"{key}.facts.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            facts = json.load(f)
+    except (OSError, ValueError):
+        facts = {
+            "volume": float(shape.volume),
+            "faces": len(shape.faces()),
+            "edges": len(shape.edges()),
+            "valid": bool(shape.is_valid),
+        }
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(facts, f)
+        os.replace(tmp, path)
+    _facts[key] = facts
+    return facts
+
+
 def edge_points(edge):
     """A polyline that follows the edge closely enough to draw and pick."""
     if edge.geom_type == build123d.GeomType.LINE:
@@ -136,19 +213,6 @@ def edge_points(edge):
     else:
         count = max(8, min(96, int(edge.length / 0.5) + 2))
     return [tuple(edge.position_at(i / (count - 1))) for i in range(count)]
-
-
-def make_report(shape, volume_before):
-    bb = shape.bounding_box()
-    return {
-        "volume": float(shape.volume),
-        "volume_before": volume_before,
-        "bbox_min": [bb.min.X, bb.min.Y, bb.min.Z],
-        "bbox_max": [bb.max.X, bb.max.Y, bb.max.Z],
-        "faces": len(shape.faces()),
-        "edges": len(shape.edges()),
-        "valid": bool(shape.is_valid),
-    }
 
 
 def import_step(path, cache_dir=None):
@@ -322,11 +386,17 @@ def rebuild(req, emit=True):
                     shape = run_feature(shape, feature, cache_dir)
                     _local[key] = shape
                     tick()
-                shown = place(shape, placement)
-                report = make_report(shown, volume)
+                # Meshed once in the part's own frame; a placement moves that mesh.
+                facts = shape_facts(shape, key, cache_dir)
                 tick()
+                local_mesh = os.path.join(cache_dir, key + ".icm")
+                write_mesh(shape, local_mesh, tick)
+                shown = place(shape, placement)
                 mesh_path = os.path.join(cache_dir, placed + ".icm")
-                write_mesh(shown, mesh_path, tick)
+                if mesh_path != local_mesh:
+                    moved_mesh(local_mesh, mesh_path, placement)
+                bb = shown.bounding_box()
+                report = dict(facts, volume_before=volume, bbox_min=[bb.min.X, bb.min.Y, bb.min.Z], bbox_max=[bb.max.X, bb.max.Y, bb.max.Z])
                 _cache[placed] = (shown, report, mesh_path)
             volume = report["volume"]
             event.update(ok=True, cached=cached, mesh=mesh_path, report=report)

@@ -3,7 +3,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -127,7 +127,9 @@ type Wake = Arc<dyn Fn() + Send + Sync>;
 
 pub struct PythonWorker {
     child: Child,
-    stdin: ChildStdin,
+    /// Requests go to a writer thread. Writing to the pipe straight from the UI would
+    /// block it whenever the worker is busy and the pipe is full, freezing the window.
+    requests: std::sync::mpsc::Sender<String>,
     events: Receiver<GeoEvent>,
     cache_dir: PathBuf,
     next_id: u64,
@@ -215,8 +217,19 @@ impl PythonWorker {
             .with_context(|| format!("starting worker with {}", python.display()))?;
         #[cfg(windows)]
         let job = job::Job::limit(&child, MEMORY_LIMIT);
-        let stdin = child.stdin.take().context("worker stdin")?;
+        let mut stdin = child.stdin.take().context("worker stdin")?;
         let stdout = child.stdout.take().context("worker stdout")?;
+
+        // Ends when the worker is dropped (the sender goes) or its pipe breaks; a dead
+        // worker shows up as GeoEvent::Exited from the reader below.
+        let (requests, outgoing) = channel::<String>();
+        std::thread::spawn(move || {
+            for line in outgoing {
+                if writeln!(stdin, "{line}").and_then(|()| stdin.flush()).is_err() {
+                    return;
+                }
+            }
+        });
 
         let (tx, events) = channel();
         let reader_wake = wake.clone();
@@ -239,7 +252,7 @@ impl PythonWorker {
         let cache_dir = std::env::temp_dir().join("intercraft-cache");
         Ok(Self {
             child,
-            stdin,
+            requests,
             events,
             cache_dir,
             next_id: 1,
@@ -306,8 +319,7 @@ impl PythonWorker {
         if imports || msg.get("step").is_some() {
             self.slow = true;
         }
-        writeln!(self.stdin, "{msg}").context("writing to worker")?;
-        self.stdin.flush().context("flushing worker stdin")
+        self.requests.send(msg.to_string()).context("the geometry worker has stopped")
     }
 
     fn recv_blocking(&mut self) -> Result<GeoEvent> {

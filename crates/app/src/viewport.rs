@@ -296,7 +296,7 @@ enum Show<'a> {
     /// What the user has left visible.
     Visible,
     All,
-    Only(&'a str),
+    Only(&'a [String]),
 }
 
 /// Everything one render needs: a camera, the parts to draw and an optional section.
@@ -315,14 +315,23 @@ struct Scene<'a> {
     flat: bool,
 }
 
+/// A snapshot's pixels (RGBA, SHOT_SIZE square) and, when asked for, each part's
+/// marker position in them.
+pub struct Snapshot {
+    pub pixels: Vec<u8>,
+    pub marks: Vec<(String, Option<[f32; 2]>)>,
+}
+
 /// A picture of the model for an LLM to look at (the `view_model` tool).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Shot {
     /// Camera direction as (yaw, pitch) in radians. None uses the user's own view,
     /// with their hidden parts and section.
     pub direction: Option<(f32, f32)>,
-    /// Show just this part.
-    pub only: Option<String>,
+    /// Show just these parts. Empty shows them all.
+    pub only: Vec<String>,
+    /// Work out where each part's numbered marker goes.
+    pub labels: bool,
     pub section: Option<Section>,
     /// Draw without perspective. Right for side views, where perspective makes a
     /// plain bore look like a countersink.
@@ -704,7 +713,7 @@ impl Viewport {
         let wanted = move |name: &str, mesh: &GpuMesh| match show {
             Show::Visible => mesh.visible,
             Show::All => true,
-            Show::Only(only) => name == only,
+            Show::Only(only) => only.iter().any(|o| o == name),
         };
         self.meshes.iter().filter(move |(name, mesh)| wanted(name, mesh)).map(|(_, mesh)| mesh)
     }
@@ -845,11 +854,11 @@ impl Viewport {
 
     /// Render the model to an image of SHOT_SIZE x SHOT_SIZE pixels, as RGBA bytes.
     /// The user's own view is left exactly as it was.
-    pub fn snapshot(&self, shot: &Shot) -> anyhow::Result<Vec<u8>> {
-        let show = match (&shot.only, shot.direction) {
-            (Some(name), _) => Show::Only(name),
-            (None, Some(_)) => Show::All,
-            (None, None) => Show::Visible,
+    pub fn snapshot(&self, shot: &Shot) -> anyhow::Result<Snapshot> {
+        let show = match (shot.only.is_empty(), shot.direction) {
+            (false, _) => Show::Only(&shot.only),
+            (true, Some(_)) => Show::All,
+            (true, None) => Show::Visible,
         };
         let Some((lo, hi)) = self.bounds_of(show) else {
             anyhow::bail!("there is nothing to look at yet: no part has been built");
@@ -884,7 +893,8 @@ impl Viewport {
 
         let device = &self.rs.device;
         let targets = make_targets(device, [SHOT_SIZE; 2], wgpu::TextureUsages::COPY_SRC);
-        self.draw(&targets, &scene);
+        let view_proj = self.draw(&targets, &scene);
+        let marks = if shot.labels { self.marks(show, view_proj, orbit(scene.yaw, scene.pitch)) } else { Vec::new() };
 
         let row = SHOT_SIZE * 4;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -913,7 +923,54 @@ impl Viewport {
         mapped.recv()??;
         let pixels = buffer.slice(..).get_mapped_range()?.to_vec();
         buffer.unmap();
-        Ok(pixels)
+        Ok(Snapshot { pixels, marks })
+    }
+
+    /// Where each shown part's marker goes in the picture: the middle of the part's
+    /// biggest triangle facing the camera (`back` points from the model towards it), so
+    /// the marker sits on a face you can see rather than on a corner shared with the
+    /// next part. None when that is out of the picture.
+    fn marks(&self, show: Show, view_proj: Mat4, back: Vec3) -> Vec<(String, Option<[f32; 2]>)> {
+        let wanted = |name: &str, mesh: &GpuMesh| match show {
+            Show::Visible => mesh.visible,
+            Show::All => true,
+            Show::Only(only) => only.iter().any(|o| o == name),
+        };
+        let size = SHOT_SIZE as f32;
+        self.meshes
+            .iter()
+            .filter(|(name, mesh)| wanted(name, mesh))
+            .map(|(name, mesh)| {
+                let screen = |p: Vec3| {
+                    let clip = view_proj * p.extend(1.0);
+                    let ndc = clip.truncate() / clip.w;
+                    (clip.w > 0.0).then(|| Vec2::new((ndc.x + 1.0) * 0.5 * size, (1.0 - ndc.y) * 0.5 * size))
+                };
+                let cpu = &mesh.cpu;
+                let mut best: Option<(f32, Vec2)> = None;
+                for tri in cpu.indices.chunks_exact(3) {
+                    let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| i as usize);
+                    let normal = [a, b, c].iter().map(|&i| Vec3::from(cpu.normals[i])).sum::<Vec3>();
+                    if mesh.motion.transform_vector3(normal).dot(back) <= 0.0 {
+                        continue;
+                    }
+                    let [Some(pa), Some(pb), Some(pc)] = [a, b, c].map(|i| screen(mesh.at(cpu.positions[i]))) else {
+                        continue;
+                    };
+                    let area = ((pb - pa).perp_dot(pc - pa) * 0.5).abs();
+                    if best.is_none_or(|(most, _)| area > most) {
+                        best = Some((area, (pa + pb + pc) / 3.0));
+                    }
+                }
+                // Nothing faces the camera (seen edge on): the middle of its box will do.
+                let at = best.map(|(_, at)| at).or_else(|| {
+                    let (lo, hi) = mesh.shown_bounds();
+                    screen((lo + hi) * 0.5)
+                });
+                let inside = |p: &Vec2| (size * 0.015..=size * 0.985).contains(&p.x) && (size * 0.015..=size * 0.985).contains(&p.y);
+                (name.clone(), at.filter(inside).map(|p| [p.x, p.y]))
+            })
+            .collect()
     }
 
     /// Draw a scene into `targets`. Returns the view-projection matrix it used.

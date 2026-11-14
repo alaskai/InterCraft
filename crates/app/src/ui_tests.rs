@@ -694,6 +694,11 @@ fn duplicate_rename_and_move_a_part() {
 
 /// Ask for a picture the way the model does, while the app keeps running.
 fn view_through_the_tool(h: &mut Harness<'static, App>, project: &Path, args: serde_json::Value) -> Vec<u8> {
+    view_answer(h, project, args).0
+}
+
+/// The picture and the rest of the tool's answer (markers, notes).
+fn view_answer(h: &mut Harness<'static, App>, project: &Path, args: serde_json::Value) -> (Vec<u8>, serde_json::Value) {
     let dir = project.to_path_buf();
     let call = std::thread::spawn(move || intercraft_tools::ToolHost::new(dir).call("view_model", &args));
     let started = Instant::now();
@@ -712,7 +717,42 @@ fn view_through_the_tool(h: &mut Harness<'static, App>, project: &Path, args: se
         let keep = 3 - chunk.iter().filter(|c| **c == b'=').count();
         bytes.extend_from_slice(&n.to_be_bytes()[1..1 + keep]);
     }
-    bytes
+    (bytes, result)
+}
+
+#[test]
+fn pictures_can_show_a_group_with_numbered_parts() {
+    let _one = one_at_a_time();
+    let project = example_project("view-labels");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let kit = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/tests/fixtures/kit.step");
+    h.state_mut().state.start_import(&kit);
+    wait_until(&mut h, "the file to be read", asking);
+    click(&mut h, "Separate parts in a group");
+    wait_until(&mut h, "the bodies to be built", |app| app.state.import.is_none() && built(app) && app.state.shown.len() == 5);
+
+    let (png, answer) = view_answer(&mut h, &project, serde_json::json!({ "part": "kit/Hinge", "labels": true }));
+    std::fs::write(std::env::temp_dir().join("intercraft-ui/view_labels.png"), &png).unwrap();
+    // The hinge's three parts, numbered; nothing outside the group.
+    let markers = answer["markers"].as_object().expect("markers come back");
+    let mut named: Vec<&str> = markers.values().filter_map(|v| v.as_str()).collect();
+    named.sort();
+    assert_eq!(named, ["Leaf", "Leaf_2", "Pin"], "{answer}");
+    assert_eq!(answer["showing"], "3 of 5 parts");
+
+    // The markers are in the picture: some pixels have the marker colour.
+    let mut reader = png::Decoder::new(std::io::Cursor::new(&png)).read_info().unwrap();
+    let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+    reader.next_frame(&mut pixels).unwrap();
+    let marked = pixels.as_chunks::<4>().0.iter().filter(|p| p[..3] == [255, 214, 64]).count();
+    assert!(marked > 300, "only {marked} marker pixels");
+
+    // Without labels, no markers and no key.
+    let (plain, answer) = view_answer(&mut h, &project, serde_json::json!({ "parts": ["Base", "Pin"] }));
+    assert!(answer.get("markers").is_none());
+    assert_eq!(answer["showing"], "2 of 5 parts");
+    assert_ne!(plain, png);
 }
 
 #[test]

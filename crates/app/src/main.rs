@@ -420,11 +420,12 @@ impl State {
         let Some(current) = self.import.take() else { return };
         match (choice, current.stage) {
             (import::Choice::Whole, _) => self.import_step(&current.file),
-            (import::Choice::Split, import::Stage::Asking(bodies)) => {
+            (import::Choice::Split, import::Stage::Asking(bodies, paths)) => {
                 let file = current.file;
                 let result = (|| {
                     let loaded = self.project.as_ref().ok_or_else(|| anyhow::anyhow!("no project is open"))?;
-                    let split = loaded.plan_split_import(&file, &bodies)?;
+                    let nested: Vec<(String, Vec<String>)> = bodies.into_iter().zip(paths).collect();
+                    let split = loaded.plan_split_import_nested(&file, &nested)?;
                     std::fs::create_dir_all(&split.folder)?;
                     let files: Vec<PathBuf> = split.parts.iter().map(|(_, source)| self.project_dir.join(source)).collect();
                     let worker = self.worker.as_mut().ok_or_else(|| anyhow::anyhow!("the geometry worker isn't running"))?;
@@ -457,8 +458,14 @@ impl State {
                     .flatten()
                     .map(|b| b["name"].as_str().unwrap_or_default().to_owned())
                     .collect();
+                let paths: Vec<Vec<String>> = data["bodies"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|b| b["path"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect())
+                    .collect();
                 if bodies.len() > 1 {
-                    self.import = Some(import::Import { file: current.file, stage: import::Stage::Asking(bodies) });
+                    self.import = Some(import::Import { file: current.file, stage: import::Stage::Asking(bodies, paths) });
                 } else if bodies.is_empty() {
                     let error = "the file has no solid bodies, only surfaces or sketches".to_owned();
                     self.import = Some(import::Import { file: current.file, stage: import::Stage::Failed(error) });
@@ -667,9 +674,15 @@ impl State {
         let Some((target, mut name, mut error)) = self.rename.take() else { return };
         let (title, hint, current) = match &target {
             RenameTarget::Part(part) => ("Rename part", "Letters, digits, _ and -", part.clone()),
-            RenameTarget::Group(group) => ("Rename group", "A name for the whole assembly", group.clone()),
+            RenameTarget::Group(group) => ("Rename or move group", "Name, or a path like Printer/Extruder", group.clone()),
+            RenameTarget::PartGroup(part) => {
+                let now = self.project.as_ref().and_then(|p| p.part(part).ok()).and_then(|p| p.group.clone());
+                ("Move to group", "Group name, or a path like Printer/Extruder. Empty for none", now.unwrap_or_default())
+            }
             RenameTarget::Step { label, .. } => ("Rename step", "A short name for the step", label.clone()),
         };
+        let grouping = matches!(target, RenameTarget::PartGroup(_));
+        let groups: Vec<String> = if grouping { self.project.as_ref().map(|p| p.groups()).unwrap_or_default() } else { Vec::new() };
         let mut open = true;
         let mut done = false;
         egui::Window::new(title)
@@ -678,21 +691,32 @@ impl State {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                let field = ui.add(egui::TextEdit::singleline(&mut name).hint_text(hint));
+                let field = ui.add(egui::TextEdit::singleline(&mut name).hint_text(hint).desired_width(280.0));
                 if !field.has_focus() && !field.lost_focus() {
                     field.request_focus();
+                }
+                // The groups there are, to pick one without typing.
+                if !groups.is_empty() {
+                    egui::ScrollArea::vertical().id_salt("group choices").max_height(140.0).show(ui, |ui| {
+                        for group in &groups {
+                            if ui.selectable_label(name.trim() == group, group).clicked() {
+                                name = group.clone();
+                            }
+                        }
+                    });
                 }
                 if let Some(error) = &error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
                 let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("Rename").clicked() || enter {
+                if ui.button(if grouping { "Move" } else { "Rename" }).clicked() || enter {
                     if name.trim() == current {
                         done = true;
                     } else {
                         let result = match &target {
                             RenameTarget::Part(part) => self.rename_part(part, name.trim()),
                             RenameTarget::Group(group) => self.rename_group(group, name.trim()),
+                            RenameTarget::PartGroup(part) => self.set_part_group(part, name.trim()),
                             RenameTarget::Step { part, feature, .. } => self.rename_step(part, feature, name.trim()),
                         };
                         match result {
@@ -1747,74 +1771,11 @@ impl State {
                 self.part_row(ui, i, part, reveal.as_deref(), &mut action);
                 continue;
             };
-            // A group is drawn where its first part sits, with all its parts inside.
-            if !drawn_groups.insert(group) {
-                continue;
+            // A group is drawn where its first part sits, with everything in it inside.
+            let top = group.split('/').next().unwrap_or(group);
+            if drawn_groups.insert(top) {
+                self.group_rows(ui, parts, top, reveal.as_deref(), &mut action);
             }
-            let members: Vec<(usize, &Part)> =
-                parts.iter().enumerate().filter(|(_, p)| p.group.as_deref() == Some(group)).collect();
-            let all_hidden = members.iter().all(|(_, p)| self.hidden.contains(&p.name));
-            let holds_reveal = reveal.as_deref().is_some_and(|r| members.iter().any(|(_, p)| p.name == r));
-            let names: Vec<String> = members.iter().map(|(_, p)| p.name.clone()).collect();
-            let id = ui.make_persistent_id(("part group", group));
-            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
-            if holds_reveal {
-                state.set_open(true);
-            }
-            let header = state.show_header(ui, |ui| {
-                // The eye hides or shows every part of the import at once.
-                if eye_button(ui, !all_hidden, group).clicked() {
-                    action = Some(PartAction::GroupVisible(names.clone(), all_hidden));
-                }
-                let (first, part) = members[0];
-                let [r, g, b] = part_color(part.kind, first).map(|c| (c * 255.0) as u8);
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                let swatch = egui::Color32::from_rgb(r, g, b);
-                ui.painter().rect_filled(rect, 2.0, if all_hidden { swatch.gamma_multiply(0.35) } else { swatch });
-                let title = egui::RichText::new(format!("{group}  ({})", members.len())).strong();
-                let title = if all_hidden { title.color(ui.visuals().weak_text_color()) } else { title };
-                ui.add(egui::Label::new(title).sense(egui::Sense::click()))
-            });
-            let (_, header, _) = header.body(|ui| {
-                for (i, member) in &members {
-                    self.part_row(ui, *i, member, reveal.as_deref(), &mut action);
-                }
-            });
-            header.inner.on_hover_text("An imported assembly. Right-click for the whole group.").context_menu(|ui| {
-                if ui.button(if all_hidden { "Show group" } else { "Hide group" }).clicked() {
-                    action = Some(PartAction::GroupVisible(names.clone(), all_hidden));
-                    ui.close();
-                }
-                if ui.button("Show only this group").clicked() {
-                    action = Some(PartAction::GroupIsolate(names.clone()));
-                    ui.close();
-                }
-                ui.separator();
-                // Many CAD programs export with Y up; here Z is up.
-                if ui.button("Stand upright (Y up to Z up)").on_hover_text("Turns the whole group 90° about X").clicked() {
-                    action = Some(PartAction::GroupMove(group.to_owned(), [0.0; 3], [90.0, 0.0, 0.0]));
-                    ui.close();
-                }
-                if ui.button("Turn 90° about Z").clicked() {
-                    action = Some(PartAction::GroupMove(group.to_owned(), [0.0; 3], [0.0, 0.0, 90.0]));
-                    ui.close();
-                }
-                let lowest = members.iter().filter_map(|(_, p)| self.latest_report(p)).map(|r| r.bbox_min[2]).reduce(f64::min);
-                let floor = ui.add_enabled(lowest.is_some_and(|z| z.abs() > 1e-6), egui::Button::new("Rest on the floor"));
-                if floor.on_hover_text("Moves the group up or down so its lowest point sits at Z = 0").clicked() {
-                    action = Some(PartAction::GroupMove(group.to_owned(), [0.0, 0.0, -lowest.unwrap_or(0.0)], [0.0; 3]));
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Rename group...").clicked() {
-                    action = Some(PartAction::GroupRename(group.to_owned()));
-                    ui.close();
-                }
-                if ui.button(format!("Delete group ({} parts)", names.len())).clicked() {
-                    action = Some(PartAction::GroupDelete(group.to_owned()));
-                    ui.close();
-                }
-            });
         }
         self.listed_selection = self.selected_part.clone();
         ui.add_space(6.0);
@@ -1848,6 +1809,12 @@ impl State {
             Some(PartAction::GroupIsolate(names)) => self.isolate(&names),
             Some(PartAction::GroupRename(group)) => self.rename = Some((RenameTarget::Group(group.clone()), group, None)),
             Some(PartAction::GroupDelete(group)) => self.delete_group(&group),
+            Some(PartAction::Ungroup(group)) => {
+                if let Err(e) = self.rename_group(&group, "") {
+                    self.worker_status = format!("Couldn't ungroup '{group}': {e:#}");
+                }
+            }
+            Some(PartAction::PartGroup(part, group)) => self.rename = Some((RenameTarget::PartGroup(part), group, None)),
             Some(PartAction::GroupMove(group, position, rotation)) => self.move_group(&group, position, rotation),
             Some(PartAction::ShowAll) => self.show_all(),
             Some(PartAction::Kind(name, kind)) => self.set_part_kind(&name, kind),
@@ -1871,7 +1838,7 @@ impl State {
     }
 
     fn delete_group(&mut self, group: &str) {
-        let names: Vec<String> = self.project.iter().flat_map(|p| &p.project.parts).filter(|p| p.group.as_deref() == Some(group)).map(|p| p.name.clone()).collect();
+        let names: Vec<String> = self.project.iter().flat_map(|p| &p.project.parts).filter(|p| intercraft_core::in_group(p.group.as_deref(), group)).map(|p| p.name.clone()).collect();
         match self.edit_project(|p| p.remove_group(group).and_then(|()| p.save())) {
             Ok(()) => {
                 for name in &names {
@@ -1892,8 +1859,100 @@ impl State {
 
     fn rename_group(&mut self, old: &str, new: &str) -> anyhow::Result<()> {
         self.edit_project(|p| p.rename_group(old, new).and_then(|()| p.save()))?;
-        self.worker_status = format!("Renamed the group '{old}' to '{new}'");
+        self.worker_status = if new.is_empty() { format!("Ungrouped '{old}'. Ctrl+Z undoes it.") } else { format!("Group '{old}' is now '{new}'") };
         Ok(())
+    }
+
+    fn set_part_group(&mut self, part: &str, group: &str) -> anyhow::Result<()> {
+        let parts = [part.to_owned()];
+        self.edit_project(|p| p.set_group(&parts, Some(group).filter(|g| !g.is_empty())).and_then(|()| p.save()))?;
+        self.worker_status = if group.is_empty() { format!("Took '{part}' out of its group") } else { format!("Put '{part}' in the group '{group}'") };
+        Ok(())
+    }
+
+    /// A group in the parts list: a header for the whole group, then its parts and the
+    /// groups inside it, each where its first part sits.
+    fn group_rows(&self, ui: &mut egui::Ui, parts: &[Part], group: &str, reveal: Option<&str>, action: &mut Option<PartAction>) {
+        let members: Vec<(usize, &Part)> =
+            parts.iter().enumerate().filter(|(_, p)| intercraft_core::in_group(p.group.as_deref(), group)).collect();
+        let Some(&(first, first_part)) = members.first() else { return };
+        let all_hidden = members.iter().all(|(_, p)| self.hidden.contains(&p.name));
+        let holds_reveal = reveal.is_some_and(|r| members.iter().any(|(_, p)| p.name == r));
+        let names: Vec<String> = members.iter().map(|(_, p)| p.name.clone()).collect();
+        let label = group.rsplit('/').next().unwrap_or(group);
+        let id = ui.make_persistent_id(("part group", group));
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        if holds_reveal {
+            state.set_open(true);
+        }
+        let header = state.show_header(ui, |ui| {
+            // The eye hides or shows everything in the group at once.
+            if eye_button(ui, !all_hidden, group).clicked() {
+                *action = Some(PartAction::GroupVisible(names.clone(), all_hidden));
+            }
+            let [r, g, b] = part_color(first_part.kind, color_slot(parts, first)).map(|c| (c * 255.0) as u8);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            let swatch = egui::Color32::from_rgb(r, g, b);
+            ui.painter().rect_filled(rect, 2.0, if all_hidden { swatch.gamma_multiply(0.35) } else { swatch });
+            let title = egui::RichText::new(format!("{label}  ({})", members.len())).strong();
+            let title = if all_hidden { title.color(ui.visuals().weak_text_color()) } else { title };
+            ui.add(egui::Label::new(title).sense(egui::Sense::click()))
+        });
+        let (_, header, _) = header.body(|ui| {
+            let mut drawn: HashSet<&str> = HashSet::new();
+            for (i, member) in &members {
+                let inside = member.group.as_deref().unwrap_or(group);
+                if inside == group {
+                    self.part_row(ui, *i, member, reveal, action);
+                    continue;
+                }
+                // One level further down: "A/B/C" seen from "A" is the group "A/B".
+                let next = inside[group.len() + 1..].split('/').next().unwrap_or_default();
+                let child = &inside[..group.len() + 1 + next.len()];
+                if drawn.insert(child) {
+                    self.group_rows(ui, parts, child, reveal, action);
+                }
+            }
+        });
+        header.inner.on_hover_text("A group. Right-click for actions on everything in it.").context_menu(|ui| {
+            if ui.button(if all_hidden { "Show group" } else { "Hide group" }).clicked() {
+                *action = Some(PartAction::GroupVisible(names.clone(), all_hidden));
+                ui.close();
+            }
+            if ui.button("Show only this group").clicked() {
+                *action = Some(PartAction::GroupIsolate(names.clone()));
+                ui.close();
+            }
+            ui.separator();
+            // Many CAD programs export with Y up; here Z is up.
+            if ui.button("Stand upright (Y up to Z up)").on_hover_text("Turns the whole group 90° about X").clicked() {
+                *action = Some(PartAction::GroupMove(group.to_owned(), [0.0; 3], [90.0, 0.0, 0.0]));
+                ui.close();
+            }
+            if ui.button("Turn 90° about Z").clicked() {
+                *action = Some(PartAction::GroupMove(group.to_owned(), [0.0; 3], [0.0, 0.0, 90.0]));
+                ui.close();
+            }
+            let lowest = members.iter().filter_map(|(_, p)| self.latest_report(p)).map(|r| r.bbox_min[2]).reduce(f64::min);
+            let floor = ui.add_enabled(lowest.is_some_and(|z| z.abs() > 1e-6), egui::Button::new("Rest on the floor"));
+            if floor.on_hover_text("Moves the group up or down so its lowest point sits at Z = 0").clicked() {
+                *action = Some(PartAction::GroupMove(group.to_owned(), [0.0, 0.0, -lowest.unwrap_or(0.0)], [0.0; 3]));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Rename or move group...").on_hover_text("Type a path like Printer/Extruder to put it inside another group").clicked() {
+                *action = Some(PartAction::GroupRename(group.to_owned()));
+                ui.close();
+            }
+            if ui.button("Ungroup").on_hover_text("Its parts and groups move up one level. Nothing is deleted").clicked() {
+                *action = Some(PartAction::Ungroup(group.to_owned()));
+                ui.close();
+            }
+            if ui.button(format!("Delete group ({} parts)", names.len())).clicked() {
+                *action = Some(PartAction::GroupDelete(group.to_owned()));
+                ui.close();
+            }
+        });
     }
 
     /// One row of the parts list: eye, colour, name, status, and its right-click menu.
@@ -1981,6 +2040,10 @@ impl State {
                 }
                 if ui.button("Duplicate").clicked() {
                     *action = Some(PartAction::Duplicate(name.clone()));
+                    ui.close();
+                }
+                if ui.button("Move to group...").on_hover_text("Put this part in a group, new or existing, to keep the list tidy").clicked() {
+                    *action = Some(PartAction::PartGroup(name.clone(), part.group.clone().unwrap_or_default()));
                     ui.close();
                 }
                 let (label, kind) = match part.kind {
@@ -2281,6 +2344,8 @@ impl State {
 pub(crate) enum RenameTarget {
     Part(String),
     Group(String),
+    /// Which group a part is in.
+    PartGroup(String),
     Step { part: String, feature: String, label: String },
 }
 
@@ -2397,6 +2462,9 @@ enum PartAction {
     GroupIsolate(Vec<String>),
     GroupRename(String),
     GroupDelete(String),
+    Ungroup(String),
+    /// A part, and the group it is in now, to be typed over.
+    PartGroup(String, String),
     GroupMove(String, [f64; 3], [f64; 3]),
     ShowAll,
     Kind(String, PartKind),
@@ -2542,8 +2610,14 @@ fn mat4(pose: &Pose) -> glam::Mat4 {
 /// The colour slot of a part: its place in the list, or for a part in a group, the
 /// place of the group's first part, so an imported assembly is one colour.
 fn color_slot(parts: &[Part], index: usize) -> usize {
-    match parts[index].group.as_deref() {
-        Some(group) => parts.iter().position(|p| p.group.as_deref() == Some(group)).unwrap_or(index),
+    // Only imports share a colour: design parts tidied into a group keep their own.
+    let part = &parts[index];
+    match part.group.as_deref().filter(|_| part.source.is_some()) {
+        Some(group) => {
+            let top = group.split('/').next().unwrap_or(group);
+            let same = |p: &Part| p.source.is_some() && intercraft_core::in_group(p.group.as_deref(), top);
+            parts.iter().position(same).unwrap_or(index)
+        }
         None => index,
     }
 }

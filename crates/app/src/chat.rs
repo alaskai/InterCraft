@@ -14,7 +14,7 @@ use intercraft_llm::{
     ANTHROPIC_MODELS, CLAUDE_CODE_MODELS, OPENAI_PRESETS,
 };
 use intercraft_tools::ToolHost;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::settings::{self, Explain, KeySource, Provider, Settings, EFFORTS};
 
@@ -22,6 +22,8 @@ enum Command {
     Send { text: String, images: Vec<String> },
     Reset,
     Configure(Config),
+    /// Pick up the conversations saved with the project.
+    Restore(Value),
 }
 
 /// Everything the worker needs to talk to either provider.
@@ -42,6 +44,8 @@ enum Reply {
     Event(ChatEvent),
     Failed(String),
     Stopped,
+    /// Each provider's conversation after a reply, to save with the project.
+    State(Value),
 }
 
 enum Message {
@@ -69,6 +73,110 @@ struct ToolCall {
     /// For ask_user: the "Other" text box and the multi-select ticks.
     other: String,
     picks: Vec<bool>,
+}
+
+/// Most messages kept in a saved chat, newest last.
+const MAX_SAVED_MESSAGES: usize = 300;
+/// Longest tool result kept in a saved chat. The model's own copy is saved separately.
+const MAX_SAVED_OUTPUT: usize = 4000;
+
+impl Message {
+    /// For the saved chat. Notices and errors are about one session, so they're left out.
+    fn to_json(&self) -> Option<Value> {
+        match self {
+            Message::User(text, sketch) => Some(json!({ "user": text, "sketch": sketch })),
+            Message::Assistant { model, items } => {
+                let items: Vec<Value> = items
+                    .iter()
+                    .map(|item| match item {
+                        Item::Text(text) => json!({ "text": text }),
+                        Item::Note(text) => json!({ "note": text }),
+                        Item::Tool(call) => {
+                            let (ok, output) = call.result.as_ref().map_or((false, Value::Null), |(ok, out)| (*ok, out.clone()));
+                            // Big results (pictures, long reports) are cut down: this copy is only for reading back.
+                            let output = match output.to_string() {
+                                text if text.len() > MAX_SAVED_OUTPUT => {
+                                    let cut: String = text.chars().take(MAX_SAVED_OUTPUT).collect();
+                                    Value::String(format!("{cut}… (shortened)"))
+                                }
+                                _ => output,
+                            };
+                            json!({ "tool": call.name, "id": call.id, "input": call.input, "ok": ok, "output": output, "answer": call.answer })
+                        }
+                    })
+                    .collect();
+                Some(json!({ "assistant": items, "model": model }))
+            }
+            Message::Notice(_) | Message::Error(_) => None,
+        }
+    }
+
+    fn from_json(value: &Value) -> Option<Message> {
+        if let Some(text) = value["user"].as_str() {
+            return Some(Message::User(text.to_owned(), value["sketch"] == true));
+        }
+        let items = value["assistant"].as_array()?;
+        let items = items
+            .iter()
+            .filter_map(|item| {
+                if let Some(text) = item["text"].as_str() {
+                    Some(Item::Text(text.to_owned()))
+                } else if let Some(text) = item["note"].as_str() {
+                    Some(Item::Note(text.to_owned()))
+                } else {
+                    Some(Item::Tool(ToolCall {
+                        id: item["id"].as_str()?.to_owned(),
+                        name: item["tool"].as_str()?.to_owned(),
+                        input: item["input"].clone(),
+                        // A call cut off by closing the app reads as failed, never as still running.
+                        result: Some((item["ok"] == true, item["output"].clone())),
+                        answer: item["answer"].as_str().map(str::to_owned),
+                        other: String::new(),
+                        picks: Vec::new(),
+                    }))
+                }
+            })
+            .collect();
+        Some(Message::Assistant { model: value["model"].as_str().unwrap_or_default().to_owned(), items })
+    }
+}
+
+/// The conversation in plain words, newest part kept, for a model that has lost it.
+fn recap(messages: &[Message]) -> String {
+    let mut lines = Vec::new();
+    for message in messages {
+        match message {
+            Message::User(text, _) => lines.push(format!("User: {text}")),
+            Message::Assistant { items, .. } => {
+                let said: Vec<&str> = items.iter().filter_map(|i| if let Item::Text(t) = i { Some(t.as_str()) } else { None }).collect();
+                let tools: Vec<&str> = items.iter().filter_map(|i| if let Item::Tool(c) = i { Some(c.name.as_str()) } else { None }).collect();
+                let mut line = format!("You: {}", said.join(" "));
+                if !tools.is_empty() {
+                    line += &format!(" (tools used: {})", tools.join(", "));
+                }
+                lines.push(line);
+            }
+            _ => {}
+        }
+    }
+    let mut kept = Vec::new();
+    let mut size = 0;
+    for line in lines.iter().rev() {
+        size += line.len();
+        if size > 10_000 {
+            break;
+        }
+        kept.push(line.as_str());
+    }
+    if kept.is_empty() {
+        return String::new();
+    }
+    kept.reverse();
+    format!(
+        "[This project's earlier chat was saved and is given here because the session it ran in is gone. \
+         It is background, not a new request. The project itself is as get_project shows it now.]\n{}\n[End of the earlier chat.]",
+        kept.join("\n")
+    )
 }
 
 pub struct ChatPanel {
@@ -101,6 +209,11 @@ pub struct ChatPanel {
     cost_known: bool,
     /// What the model is doing right now, for the caption over the 3D view.
     caption: crate::caption::Caption,
+    /// Each provider's conversation as last saved, so the model keeps its context when
+    /// the project is opened again.
+    sessions: Value,
+    /// Saved conversations the worker hasn't been given yet (it starts on first use).
+    restore: Option<Value>,
     ctx: egui::Context,
 }
 
@@ -135,9 +248,54 @@ impl ChatPanel {
             chat_cost: 0.0,
             cost_known: false,
             caption: Default::default(),
+            sessions: Value::Null,
+            restore: None,
             ctx,
         };
+        let mut panel = panel;
+        panel.load_saved();
         panel
+    }
+
+    /// Bring back the chat saved with this project. False when there is none.
+    fn load_saved(&mut self) -> bool {
+        let Some(saved) = crate::chat_store::load(&self.project_dir) else { return false };
+        let messages: Vec<Message> = saved["messages"].as_array().into_iter().flatten().filter_map(Message::from_json).collect();
+        if messages.is_empty() {
+            return false;
+        }
+        let mut sessions = saved["sessions"].clone();
+        if !sessions.is_object() {
+            sessions = json!({});
+        }
+        // Claude Code keeps its own sessions and may have dropped this one, so it also
+        // gets the conversation in words to start a fresh session from.
+        if !sessions["claude_code"].is_object() {
+            sessions["claude_code"] = json!({});
+        }
+        sessions["claude_code"]["recap"] = recap(&messages).into();
+        if let Some(cost) = saved["cost_usd"].as_f64().filter(|c| c.is_finite() && *c >= 0.0) {
+            (self.chat_cost, self.cost_known) = (cost, true);
+        }
+        let count = messages.iter().filter(|m| matches!(m, Message::User(..) | Message::Assistant { .. })).count();
+        self.messages = messages;
+        self.messages.push(Message::Notice(format!("Picked up this project's chat ({count} messages). New chat starts over.")));
+        self.sessions = sessions.clone();
+        self.restore = Some(sessions);
+        true
+    }
+
+    /// Save the chat with the project. A failure is shown once, not on every reply.
+    fn save(&mut self) {
+        let kept = self.messages.len().saturating_sub(MAX_SAVED_MESSAGES);
+        let messages: Vec<Value> = self.messages[kept..].iter().filter_map(Message::to_json).collect();
+        let cost = self.cost_known.then_some(self.chat_cost);
+        if let Err(e) = crate::chat_store::save(&self.project_dir, json!(messages), &self.sessions, cost) {
+            let note = format!("Couldn't save this chat with the project: {e}");
+            if !self.messages.iter().any(|m| matches!(m, Message::Error(text) if *text == note)) {
+                self.messages.push(Message::Error(note));
+            }
+        }
     }
 
     /// Whether the chosen provider can take a message right now.
@@ -224,6 +382,9 @@ impl ChatPanel {
             let config = self.config();
             let dir = self.project_dir.clone();
             std::thread::spawn(move || run_worker(dir, config, cmd_rx, reply_tx, cancel, ctx));
+            if let Some(saved) = self.restore.take() {
+                let _ = cmd_tx.send(Command::Restore(saved));
+            }
             self.worker = Some((cmd_tx, reply_rx));
         }
         &self.worker.as_ref().expect("worker was just started").0
@@ -264,7 +425,45 @@ impl ChatPanel {
         self.usage = Usage::default();
         (self.reply_cost, self.chat_cost, self.cost_known) = (0.0, 0.0, false);
         self.caption = Default::default();
-        self.messages.push(Message::Notice(format!("Opened {name}. This is a new conversation.")));
+        (self.sessions, self.restore) = (Value::Null, None);
+        if !self.load_saved() {
+            self.messages.push(Message::Notice(format!("Opened {name}. This is a new conversation.")));
+        }
+    }
+
+    /// As if the user had typed `text` and a reply had ended with these provider states.
+    #[cfg(test)]
+    pub fn finish_turn(&mut self, text: &str, sessions: Value) {
+        let at = self.messages.iter().rposition(|m| matches!(m, Message::Assistant { .. })).unwrap_or(self.messages.len());
+        self.messages.insert(at, Message::User(text.to_owned(), false));
+        self.sessions = sessions;
+        self.save();
+    }
+
+    /// The conversation as plain lines, and what the worker will be given to restore.
+    #[cfg(test)]
+    pub fn transcript(&self) -> (Vec<String>, Option<&Value>) {
+        let lines = self
+            .messages
+            .iter()
+            .map(|m| match m {
+                Message::User(text, _) => format!("user: {text}"),
+                Message::Assistant { items, .. } => {
+                    let parts: Vec<String> = items
+                        .iter()
+                        .map(|i| match i {
+                            Item::Text(t) => t.clone(),
+                            Item::Note(t) => format!("({t})"),
+                            Item::Tool(c) => format!("[{} {}]", c.name, c.result.as_ref().is_some_and(|r| r.0)),
+                        })
+                        .collect();
+                    format!("assistant: {}", parts.join(" "))
+                }
+                Message::Notice(text) => format!("notice: {text}"),
+                Message::Error(text) => format!("error: {text}"),
+            })
+            .collect();
+        (lines, self.restore.as_ref())
     }
 
     #[cfg(test)]
@@ -435,6 +634,10 @@ impl ChatPanel {
                     self.busy = false;
                     self.caption.finish();
                 }
+                Reply::State(sessions) => {
+                    self.sessions = sessions;
+                    self.save();
+                }
             }
         }
         focus
@@ -558,6 +761,8 @@ impl ChatPanel {
                     self.messages.clear();
                     self.usage = Usage::default();
                     (self.reply_cost, self.chat_cost, self.cost_known) = (0.0, 0.0, false);
+                    (self.sessions, self.restore) = (Value::Null, None);
+                    crate::chat_store::clear(&self.project_dir);
                     if self.worker.is_some() {
                         let _ = self.worker().send(Command::Reset);
                     }
@@ -1237,12 +1442,20 @@ fn run_worker(
                 if let Some(reply) = reply {
                     let _ = replies.send(reply);
                 }
+                // After every reply, finished or not, so a crash loses at most one turn.
+                let state = json!({ "anthropic": anthropic.state(), "claude_code": claude_code.state(), "openai": openai.state() });
+                let _ = replies.send(Reply::State(state));
                 ctx.request_repaint();
             }
             Command::Reset => {
                 anthropic.reset();
                 claude_code.reset();
                 openai.reset();
+            }
+            Command::Restore(saved) => {
+                anthropic.restore(&saved["anthropic"]);
+                claude_code.restore(&saved["claude_code"]);
+                openai.restore(&saved["openai"]);
             }
             Command::Configure(config) => {
                 provider = config.provider;

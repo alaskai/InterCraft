@@ -276,6 +276,27 @@ fn imported_part_can_be_inspected_measured_and_edited() {
 }
 
 #[test]
+fn asking_a_busy_worker_never_blocks_the_caller() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    use intercraft_geo::{FeatureInput, GeometryBackend, RebuildRequest};
+    // A whole assembly moving sends a rebuild per part. The viewer sends them from
+    // its UI thread, so sending must not wait for the worker to catch up, or the
+    // window freezes. This is far more than a pipe holds.
+    let mut worker = intercraft_geo::PythonWorker::spawn(|| {}).unwrap();
+    let code = "part = Box(10, 10, 10)";
+    let started = Instant::now();
+    for i in 0..3000 {
+        let feature = FeatureInput::snippet("f010", code, &serde_json::Map::new());
+        let req = RebuildRequest { part: format!("P{i}"), features: vec![feature], placement: Some([i as f64, 0.0, 0.0, 0.0, 0.0, 0.0]) };
+        worker.rebuild(req).unwrap();
+    }
+    assert!(started.elapsed() < Duration::from_secs(2), "sending took {:?}", started.elapsed());
+}
+
+#[test]
 fn an_assembly_splits_into_parts_where_they_sat() {
     let _one = one_at_a_time();
     if !worker_available() {

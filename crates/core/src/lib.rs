@@ -131,6 +131,27 @@ pub struct SplitImport {
     pub folder: PathBuf,
     /// Part name and file (relative to the project) for each body, in the file's order.
     pub parts: Vec<(String, String)>,
+    /// Each part's group path: the import's group, then any sub-assemblies it was in.
+    pub groups: Vec<String>,
+}
+
+/// How deep groups can nest, counting the outermost.
+pub const MAX_GROUP_DEPTH: usize = 6;
+
+/// Whether a part's group is `group` itself or somewhere inside it.
+pub fn in_group(part_group: Option<&str>, group: &str) -> bool {
+    part_group.is_some_and(|g| g == group || (g.starts_with(group) && g[group.len()..].starts_with('/')))
+}
+
+/// One level of a group path made from any text, such as a sub-assembly's name.
+fn group_segment(text: &str) -> String {
+    let clean: String = text.chars().map(|c| if c == '/' || c == '\\' || c.is_control() { ' ' } else { c }).collect();
+    clean.trim().chars().take(64).collect::<String>().trim().to_owned()
+}
+
+/// A typed group path with stray spaces and empty levels removed.
+fn clean_group(path: &str) -> String {
+    path.split('/').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -449,6 +470,13 @@ impl LoadedProject {
     /// Plan splitting a STEP file into one part per body. `bodies` are the body names
     /// the worker found, in order. Nothing is written yet.
     pub fn plan_split_import(&self, file: &Path, bodies: &[String]) -> Result<SplitImport> {
+        let flat: Vec<(String, Vec<String>)> = bodies.iter().map(|b| (b.clone(), Vec::new())).collect();
+        self.plan_split_import_nested(file, &flat)
+    }
+
+    /// As `plan_split_import`, with each body's sub-assemblies (outermost first), which
+    /// become groups inside the import's own group.
+    pub fn plan_split_import_nested(&self, file: &Path, bodies: &[(String, Vec<String>)]) -> Result<SplitImport> {
         check_step_file(file)?;
         if bodies.is_empty() {
             bail!("the STEP file has no solid bodies");
@@ -462,7 +490,7 @@ impl LoadedProject {
         let stem = plain_name(&file.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(), "Imported");
         let mut folder = stem.clone();
         let mut n = 2;
-        while self.dir.join("imports").join(&folder).exists() || self.groups().contains(&folder.as_str()) {
+        while self.dir.join("imports").join(&folder).exists() || self.groups().iter().any(|g| *g == folder) {
             folder = format!("{stem}_{n}");
             n += 1;
         }
@@ -470,7 +498,10 @@ impl LoadedProject {
         // Repeated bodies (a box of identical screws) get numbered.
         let mut taken: HashSet<String> = self.project.parts.iter().map(|p| p.name.to_ascii_lowercase()).collect();
         let mut parts = Vec::new();
-        for (i, body) in bodies.iter().enumerate() {
+        let mut groups = Vec::new();
+        for (i, (body, path)) in bodies.iter().enumerate() {
+            let inner = path.iter().map(|s| group_segment(s)).filter(|s| !s.is_empty()).take(MAX_GROUP_DEPTH - 1);
+            groups.push(std::iter::once(folder.clone()).chain(inner).collect::<Vec<_>>().join("/"));
             let base = plain_name(body, &format!("Body_{}", i + 1));
             let mut name = base.clone();
             let mut n = 2;
@@ -482,7 +513,7 @@ impl LoadedProject {
             taken.insert(name.to_ascii_lowercase());
             parts.push((name.clone(), format!("imports/{folder}/{name}.step")));
         }
-        Ok(SplitImport { group: folder.clone(), folder: self.dir.join("imports").join(&folder), parts })
+        Ok(SplitImport { group: folder.clone(), folder: self.dir.join("imports").join(&folder), parts, groups })
     }
 
     /// Add the parts of a split import once the worker has written every body's file.
@@ -499,37 +530,81 @@ impl LoadedProject {
                 bail!("{source} wasn't written");
             }
         }
-        for (name, source) in &split.parts {
+        for group in &split.groups {
+            check_group_name(group)?;
+        }
+        for (i, (name, source)) in split.parts.iter().enumerate() {
             let mut part = Part::new(name, Some(source.clone()));
-            part.group = Some(split.group.clone());
+            part.group = Some(split.groups.get(i).unwrap_or(&split.group).clone());
             self.project.parts.push(part);
         }
         Ok(())
     }
 
-    /// Group names in the order their first part appears.
-    pub fn groups(&self) -> Vec<&str> {
-        let mut groups: Vec<&str> = Vec::new();
+    /// Every group, as a path like "Printer/Extruder", in the order its first part
+    /// appears. A group with only sub-groups in it is listed too.
+    pub fn groups(&self) -> Vec<String> {
+        let mut groups: Vec<String> = Vec::new();
         for group in self.project.parts.iter().filter_map(|p| p.group.as_deref()) {
-            if !groups.contains(&group) {
-                groups.push(group);
+            let mut path = String::new();
+            for segment in group.split('/') {
+                if !path.is_empty() {
+                    path.push('/');
+                }
+                path.push_str(segment);
+                if !groups.contains(&path) {
+                    groups.push(path.clone());
+                }
             }
         }
         groups
     }
 
-    /// Rename a group. Only the label changes; the files stay where they are.
+    /// Put parts in a group (a path like "Printer/Extruder"; it is made if it's new),
+    /// or take them out of any group with None. Grouping only tidies the parts list.
+    pub fn set_group(&mut self, parts: &[String], group: Option<&str>) -> Result<()> {
+        let group = group.map(clean_group).filter(|g| !g.is_empty());
+        if let Some(group) = &group {
+            check_group_name(group)?;
+        }
+        if parts.is_empty() {
+            bail!("name at least one part to group");
+        }
+        for name in parts {
+            self.part(name)?;
+        }
+        for part in self.project.parts.iter_mut().filter(|p| parts.contains(&p.name)) {
+            part.group = group.clone();
+        }
+        Ok(())
+    }
+
+    /// Rename a group, or move it: `new` is the whole new path, so "A/B" to "C/B" puts
+    /// B inside C, and to "B" lifts it out. Everything inside comes along. An empty
+    /// `new` dissolves the group: its parts and sub-groups move up one level.
     pub fn rename_group(&mut self, old: &str, new: &str) -> Result<()> {
-        let new = new.trim();
-        check_group_name(new)?;
-        if !self.groups().contains(&old) {
+        let new = clean_group(new);
+        if !self.groups().iter().any(|g| g == old) {
             bail!("no group named '{old}'");
         }
-        if new != old && self.groups().contains(&new) {
-            bail!("a group named '{new}' already exists");
+        let new = if new.is_empty() { old.rsplit_once('/').map(|(up, _)| up.to_owned()) } else { Some(new) };
+        if let Some(new) = &new {
+            if in_group(Some(new), old) && new != old {
+                bail!("a group can't be moved inside itself");
+            }
         }
-        for part in self.project.parts.iter_mut().filter(|p| p.group.as_deref() == Some(old)) {
-            part.group = Some(new.to_owned());
+        for part in self.project.parts.iter_mut().filter(|p| in_group(p.group.as_deref(), old)) {
+            let rest = part.group.as_deref().unwrap_or_default()[old.len()..].trim_start_matches('/');
+            let path = match (&new, rest.is_empty()) {
+                (Some(new), true) => Some(new.clone()),
+                (Some(new), false) => Some(format!("{new}/{rest}")),
+                (None, true) => None,
+                (None, false) => Some(rest.to_owned()),
+            };
+            if let Some(path) = &path {
+                check_group_name(path)?;
+            }
+            part.group = path;
         }
         Ok(())
     }
@@ -543,7 +618,7 @@ impl LoadedProject {
         }
         let by = Pose::from_placement(position, rotation);
         let mut moved = HashSet::new();
-        for part in self.project.parts.iter_mut().filter(|p| p.group.as_deref() == Some(group)) {
+        for part in self.project.parts.iter_mut().filter(|p| in_group(p.group.as_deref(), group)) {
             let [x, y, z, rx, ry, rz] = Pose::from_placement(part.position, part.rotation).then(&by).to_placement();
             part.position = [x, y, z];
             part.rotation = [rx, ry, rz];
@@ -562,7 +637,7 @@ impl LoadedProject {
     /// Remove every part in a group, as `remove_part` does for each.
     pub fn remove_group(&mut self, group: &str) -> Result<()> {
         let names: Vec<String> =
-            self.project.parts.iter().filter(|p| p.group.as_deref() == Some(group)).map(|p| p.name.clone()).collect();
+            self.project.parts.iter().filter(|p| in_group(p.group.as_deref(), group)).map(|p| p.name.clone()).collect();
         if names.is_empty() {
             bail!("no group named '{group}'");
         }
@@ -921,8 +996,14 @@ fn plain_name(text: &str, fallback: &str) -> String {
 
 /// Group names are only shown, never used as paths, so anything readable will do.
 fn check_group_name(name: &str) -> Result<()> {
-    if name.trim().is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
-        bail!("a group name must be 1 to 64 characters");
+    let levels: Vec<&str> = name.split('/').collect();
+    if levels.len() > MAX_GROUP_DEPTH {
+        bail!("groups can nest up to {MAX_GROUP_DEPTH} deep");
+    }
+    for level in levels {
+        if level.trim().is_empty() || level != level.trim() || level.chars().count() > 64 || level.chars().any(char::is_control) {
+            bail!("each group name must be 1 to 64 characters (use '/' to nest groups)");
+        }
     }
     Ok(())
 }
@@ -1251,6 +1332,38 @@ mod tests {
         assert_eq!(p.part("Bolt_2").unwrap().position, [0.0, 0.0, 5.0]);
         assert_eq!(p.part("Bolt").unwrap().position, [0.0; 3], "parts outside the group stay put");
         assert!(p.move_group("Nothing", [1.0; 3], [0.0; 3]).is_err());
+
+        // Groups nest: tidy the bolts into a group inside the import.
+        let bolts: Vec<String> = ["Bolt_2", "Bolt_3", "Bolt_4"].map(String::from).to_vec();
+        p.set_group(&bolts, Some(" Gear_box__v3 / Fasteners ")).unwrap();
+        p.save().unwrap();
+        assert_eq!(p.history().undo_label(), Some("Group 3 parts as 'Gear_box__v3/Fasteners'"));
+        assert_eq!(p.groups(), ["Gear_box__v3", "Gear_box__v3/Fasteners"]);
+        assert!(p.set_group(&bolts, Some("a/b/c/d/e/f/g")).is_err(), "too deep");
+        assert!(p.set_group(&["Ghost".to_owned()], Some("X")).is_err());
+        // A plain design part can be grouped too, and taken out again.
+        p.set_group(&["Bolt".to_owned()], Some("Spares")).unwrap();
+        p.save().unwrap();
+        assert_eq!(p.history().undo_label(), Some("Put 'Bolt' in group 'Spares'"));
+        p.set_group(&["Bolt".to_owned()], None).unwrap();
+        p.save().unwrap();
+        // Moving the outer group takes the inner one along; a group can't go inside itself.
+        p.move_group("Gear_box__v3", [1.0, 0.0, 0.0], [0.0; 3]).unwrap();
+        assert_eq!(p.part("Bolt_3").unwrap().position, [1.0, 0.0, 5.0]);
+        assert!(p.rename_group("Gear_box__v3", "Gear_box__v3/Fasteners/Deeper").is_err());
+        // Renaming with a path moves a group; an empty name dissolves it into its parent.
+        p.rename_group("Gear_box__v3/Fasteners", "Gear_box__v3/Hardware/Bolts").unwrap();
+        assert_eq!(p.part("Bolt_2").unwrap().group.as_deref(), Some("Gear_box__v3/Hardware/Bolts"));
+        p.rename_group("Gear_box__v3/Hardware", "").unwrap();
+        assert_eq!(p.part("Bolt_2").unwrap().group.as_deref(), Some("Gear_box__v3/Bolts"));
+        p.rename_group("Gear_box__v3/Bolts", "").unwrap();
+        assert_eq!(p.part("Bolt_2").unwrap().group.as_deref(), Some("Gear_box__v3"));
+        p.save().unwrap();
+
+        // Sub-assemblies in the file become groups inside the import's group.
+        let nested = [("Motor".to_owned(), vec!["Extruder/v3".to_owned(), "Main".to_owned()]), ("Frame".to_owned(), vec![])];
+        let plan = p.plan_split_import_nested(&src, &nested).unwrap();
+        assert_eq!(plan.groups, ["Gear_box__v3_2/Extruder v3/Main", "Gear_box__v3_2"]);
 
         p.rename_group("Gear_box__v3", "Gear box").unwrap();
         p.save().unwrap();

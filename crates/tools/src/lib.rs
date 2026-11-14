@@ -44,7 +44,9 @@ Working method:
 Imported parts and measuring:
 - A part can start from an imported STEP file (its first step is "import"). In the first feature after it, `part` is that imported shape, so cuts, holes and fillets work on it like any other.
 - Before editing an imported part, call inspect_part to find its faces, holes and their exact positions instead of guessing.
-- An imported assembly can be split into one part per body, all with the same `group`. get_project lists untouched bodies briefly (where they sit); each is a normal part to place, joint, check or edit.
+- An imported assembly can be split into one part per body. They share a group, with the file's sub-assemblies as groups inside it (a path like `Printer/Extruder`). Each body is a normal part to place, joint, check or edit.
+- In a big project get_project is an outline. Use find_parts to list parts by name or group, and get_part for the full detail of the ones you work on or against. Never guess a part's name.
+- Groups only organise the parts list. Make and tidy them with set_group and rename_group; move_group moves everything in a group as one piece.
 - Use measure to check clearances, hole spacing and wall thickness after a change.
 
 Assemblies:
@@ -297,8 +299,48 @@ pub fn definitions() -> Value {
     json!([
         {
             "name": "get_project",
-            "description": "Read the whole project: every part and feature with its snippet, parameters and current build numbers (volume, size, errors). Call this first.",
+            "description": "Read the project: brief, joints and parts. A small project comes back whole: every part and feature with its snippet, parameters and build numbers (volume, size, errors). A big one comes back as an outline of groups and one line per part (size and centre in assembly mm); use get_part and find_parts for more. Call this first.",
             "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "get_part",
+            "description": "One part in full: every step with its snippet, parameters and build numbers, its placement, group and joints. Use it for the parts you are about to work on or against.",
+            "inputSchema": { "type": "object", "properties": { "part": part }, "required": ["part"] },
+        },
+        {
+            "name": "find_parts",
+            "description": "List parts by name, group or both, one short line each (size and centre in assembly mm). `name` matches any part whose name contains it, ignoring case, so 'motor' finds every motor. `group` takes a group path and includes the groups inside it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Text the part's name contains." },
+                    "group": { "type": "string", "description": "A group path, such as 'Printer' or 'Printer/Extruder'." },
+                },
+            },
+        },
+        {
+            "name": "set_group",
+            "description": "Put parts in a group in the parts list, to keep a big project tidy. `group` is a path, so 'Printer/Extruder' is a group inside 'Printer'; it is made if it doesn't exist. Leave `group` out to take the parts out of any group. Grouping changes nothing about the parts themselves.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "parts": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "group": { "type": "string", "description": "Group path. Omit for no group." },
+                },
+                "required": ["parts"],
+            },
+        },
+        {
+            "name": "rename_group",
+            "description": "Rename a group or move it with everything inside. `new_path` is the whole new path: 'Printer/Extruder' to 'Printer/Sprite' renames it, to 'Extruder' lifts it out of 'Printer', to 'Machine/Extruder' moves it into 'Machine'. Leave `new_path` out to dissolve the group: its parts and groups move up one level.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "group": { "type": "string", "description": "The group's current path." },
+                    "new_path": { "type": "string" },
+                },
+                "required": ["group"],
+            },
         },
         {
             "name": "add_part",
@@ -674,22 +716,98 @@ impl ToolHost {
         let mut project = self.load()?;
         match name {
             "get_project" => {
-                let mut parts = Vec::new();
-                for part in &project.project.parts {
-                    let report = self.build_report(&project, part, true)?;
-                    // A split assembly can be hundreds of untouched bodies; where each
-                    // one sits is what matters until it's edited.
-                    let untouched = part.group.is_some() && part.features.is_empty();
-                    parts.push(if untouched { brief_report(report) } else { report });
-                }
-                Ok(json!({
+                let all = &project.project.parts;
+                let mut result = json!({
                     "name": project.project.name,
                     "units": project.project.units,
                     "folder": project.dir,
                     "brief": project.brief,
-                    "parts": parts,
                     "joints": project.project.joints,
-                }))
+                });
+                if all.len() <= FULL_PROJECT_PARTS {
+                    // Small enough to give everything in one go.
+                    let mut parts = Vec::new();
+                    for part in all {
+                        let report = self.build_report(&project, part, true)?;
+                        let untouched = part.group.is_some() && part.features.is_empty();
+                        parts.push(if untouched { brief_report(report) } else { report });
+                    }
+                    result["parts"] = json!(parts);
+                    return Ok(result);
+                }
+                // A big project: an outline that always fits, with detail on request.
+                let mut lines = Vec::new();
+                for part in all {
+                    lines.push((part, self.build_report(&project, part, false)?));
+                }
+                result["groups"] = json!(group_outline(&project.groups(), &lines));
+                if all.len() <= LISTED_PARTS {
+                    result["parts"] = json!(lines.iter().map(|(p, r)| part_line(p, r)).collect::<Vec<_>>());
+                } else {
+                    let loose: Vec<Value> = lines.iter().filter(|(p, _)| p.group.is_none()).map(|(p, r)| part_line(p, r)).collect();
+                    result["parts_outside_groups"] = json!(loose);
+                }
+                result["note"] = format!(
+                    "{} parts, so this is an outline: each part's size and centre in assembly mm. \
+                     get_part gives one part in full (steps, code, numbers). find_parts lists parts by name or group.",
+                    all.len()
+                )
+                .into();
+                Ok(result)
+            }
+            "get_part" => {
+                let part = project.part(text(args, "part")?)?.clone();
+                self.build_report(&project, &part, true)
+            }
+            "find_parts" => {
+                let name = optional_text(args, "name").map(str::to_ascii_lowercase);
+                let group = optional_text(args, "group");
+                if name.is_none() && group.is_none() {
+                    bail!("give a name to look for, a group, or both");
+                }
+                let mut found = Vec::new();
+                let mut more = 0;
+                for part in &project.project.parts {
+                    let named = name.as_ref().is_none_or(|n| part.name.to_ascii_lowercase().contains(n.as_str()));
+                    let grouped = group.is_none_or(|g| intercraft_core::in_group(part.group.as_deref(), g));
+                    if !(named && grouped) {
+                        continue;
+                    }
+                    if found.len() == LISTED_PARTS {
+                        more += 1;
+                        continue;
+                    }
+                    let report = self.build_report(&project, part, false)?;
+                    found.push(part_line(part, &report));
+                }
+                let mut result = json!({ "found": found.len() + more, "parts": found });
+                if more > 0 {
+                    result["note"] = format!("{more} more not shown. Narrow the name or group.").into();
+                }
+                // A near miss on a group name is the usual reason for nothing found.
+                if found.is_empty() {
+                    result["groups"] = json!(project.groups());
+                }
+                Ok(result)
+            }
+            "set_group" => {
+                let parts: Vec<String> = args["parts"]
+                    .as_array()
+                    .context("`parts` must be a list of part names")?
+                    .iter()
+                    .map(|p| p.as_str().map(str::to_owned).context("`parts` must be a list of part names"))
+                    .collect::<Result<_>>()?;
+                let group = optional_text(args, "group").filter(|g| !g.trim().is_empty());
+                project.set_group(&parts, group)?;
+                project.save()?;
+                Ok(json!({ "grouped": parts.len(), "group": group, "groups": project.groups() }))
+            }
+            "rename_group" => {
+                let group = text(args, "group")?;
+                let new = optional_text(args, "new_path").unwrap_or_default();
+                project.rename_group(group, new)?;
+                project.save()?;
+                Ok(json!({ "was": group, "now": new, "groups": project.groups() }))
             }
             "add_part" => {
                 let name = text(args, "name")?;
@@ -787,7 +905,7 @@ impl ToolHost {
                 let rotation = optional_triple(args, "rotation")?.unwrap_or([0.0; 3]);
                 project.move_group(group, position, rotation)?;
                 project.save()?;
-                let moved = project.project.parts.iter().filter(|p| p.group.as_deref() == Some(group)).count();
+                let moved = project.project.parts.iter().filter(|p| intercraft_core::in_group(p.group.as_deref(), group)).count();
                 Ok(json!({ "moved_group": group, "parts": moved, "note": "Call get_project to see where each part sits now." }))
             }
             "delete_part" => {
@@ -1197,6 +1315,67 @@ impl ToolHost {
         }
         Ok(report)
     }
+}
+
+/// Up to this many parts, get_project gives every part in full.
+const FULL_PROJECT_PARTS: usize = 12;
+/// Up to this many parts are listed one line each; beyond it, only groups are.
+const LISTED_PARTS: usize = 150;
+
+/// One short line about a part for an outline: where it is and how big, and only
+/// what differs from the usual (steps on an import, a lock, a failed build).
+fn part_line(part: &Part, report: &Value) -> Value {
+    let mut line = json!({ "part": part.name });
+    if let Some(group) = &part.group {
+        line["group"] = group.clone().into();
+    }
+    let last = report["features"].as_array().and_then(|f| f.last());
+    let tenth = |v: f64| (v * 10.0).round() / 10.0;
+    if let Some((lo, hi)) = last.and_then(|s| Some((triple(&s["bbox_min"])?, triple(&s["bbox_max"])?))) {
+        line["size"] = json!([tenth(hi[0] - lo[0]), tenth(hi[1] - lo[1]), tenth(hi[2] - lo[2])]);
+        line["centre"] = json!([tenth((lo[0] + hi[0]) / 2.0), tenth((lo[1] + hi[1]) / 2.0), tenth((lo[2] + hi[2]) / 2.0)]);
+    }
+    if !part.features.is_empty() {
+        line["steps"] = part.features.len().into();
+    }
+    if part.kind == intercraft_core::PartKind::Reference {
+        line["locked"] = true.into();
+    }
+    if report["ok"] == false {
+        line["ok"] = false.into();
+    }
+    line
+}
+
+fn triple(value: &Value) -> Option<[f64; 3]> {
+    let v = value.as_array()?;
+    Some([v.first()?.as_f64()?, v.get(1)?.as_f64()?, v.get(2)?.as_f64()?])
+}
+
+/// Each group with how many parts it holds (sub-groups included) and the box they fill.
+fn group_outline(groups: &[String], parts: &[(&Part, Value)]) -> Vec<Value> {
+    groups
+        .iter()
+        .map(|group| {
+            let (mut count, mut lo, mut hi) = (0, [f64::MAX; 3], [f64::MIN; 3]);
+            for (_, report) in parts.iter().filter(|(p, _)| intercraft_core::in_group(p.group.as_deref(), group)) {
+                count += 1;
+                let last = report["features"].as_array().and_then(|f| f.last());
+                if let Some((a, b)) = last.and_then(|s| Some((triple(&s["bbox_min"])?, triple(&s["bbox_max"])?))) {
+                    for i in 0..3 {
+                        lo[i] = lo[i].min(a[i]);
+                        hi[i] = hi[i].max(b[i]);
+                    }
+                }
+            }
+            let mut entry = json!({ "group": group, "parts": count });
+            if lo[0] <= hi[0] {
+                entry["bbox_min"] = json!(lo.map(round));
+                entry["bbox_max"] = json!(hi.map(round));
+            }
+            entry
+        })
+        .collect()
 }
 
 /// A build report cut down to the part's name, group, state and where it sits.

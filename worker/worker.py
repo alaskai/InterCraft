@@ -580,6 +580,50 @@ def fit(req):
     send({"id": req["id"], "event": "fitted", "data": {"pairs": pairs}})
 
 
+# (target names, part keys, within) -> answer, so asking twice costs nothing.
+_nearby = {}
+
+
+def nearby(req):
+    """Which parts come within `within` mm of the targets, or, with no targets, every
+    pair of parts that close (a map of what touches what). Boxes are compared first
+    and the exact distance is only worked out where they come close."""
+    within = float(req["within"])
+    parts = [(p["name"], p["mesh"]) for p in req["parts"]]
+    targets = set(req.get("targets") or [])
+    key = json.dumps([sorted(targets), sorted(parts), within])
+    if key in _nearby:
+        send({"id": req["id"], "event": "info", "data": _nearby[key]})
+        return
+    shapes = {name: cached_shape(mesh) for name, mesh in parts}
+    boxes = {name: shape.bounding_box() for name, shape in shapes.items()}
+
+    def close(a, b):
+        return all(
+            getattr(boxes[a].min, axis) - within <= getattr(boxes[b].max, axis)
+            and getattr(boxes[b].min, axis) - within <= getattr(boxes[a].max, axis)
+            for axis in "XYZ"
+        )
+
+    names = [name for name, _ in parts]
+    if targets:
+        pairs = [(t, other) for t in names if t in targets for other in names if other not in targets]
+    else:
+        pairs = [(a, b) for i, a in enumerate(names) for b in names[i + 1 :]]
+    candidates = [(a, b) for a, b in pairs if close(a, b)]
+    found = []
+    for n, (a, b) in enumerate(candidates):
+        distance, pa, pb = shapes[a].distance_to_with_closest_points(shapes[b])
+        if distance <= within:
+            found.append({"a": a, "b": b, "clearance": round(distance, 4), "a_point": vec(pa), "b_point": vec(pb)})
+        if n % 10 == 9:
+            send({"id": req["id"], "event": "progress"})
+    found.sort(key=lambda f: f["clearance"])
+    data = {"pairs": found, "checked": len(candidates), "skipped_by_box": len(pairs) - len(candidates)}
+    _nearby[key] = data
+    send({"id": req["id"], "event": "info", "data": data})
+
+
 def boxes_meet(a, b):
     """Whether two bounding boxes share any space, one inside the other included."""
     return all(
@@ -647,6 +691,8 @@ def main():
                 min_wall = float(req.get("min_wall") or 1.2)
                 up = req.get("up") or [0, 0, 1]
                 send({"id": req["id"], "event": "info", "data": print_check.check(shape, min_wall, up)})
+            elif req.get("cmd") == "nearby":
+                nearby(req)
             elif req.get("cmd") == "step_contents":
                 step_contents(req)
             elif req.get("cmd") == "split_step":

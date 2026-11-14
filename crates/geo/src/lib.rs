@@ -412,6 +412,16 @@ impl PythonWorker {
         self.wait_for(id)
     }
 
+    /// Pairs of built shapes that come within `within` mm of each other: each target
+    /// against every other part, or with no targets, every pair. `parts` are (name,
+    /// mesh key). Answers `{"pairs": [{a, b, clearance, a_point, b_point}], ...}`.
+    pub fn nearby_blocking(&mut self, parts: &[(String, String)], targets: &[String], within: f64) -> Result<serde_json::Value> {
+        let id = self.next_id;
+        let parts: Vec<_> = parts.iter().map(|(name, mesh)| serde_json::json!({ "name": name, "mesh": mesh })).collect();
+        self.send(serde_json::json!({ "cmd": "nearby", "parts": parts, "targets": targets, "within": within }))?;
+        self.wait_for(id)
+    }
+
     /// List the bodies in a STEP file, without waiting. The answer arrives as
     /// `GeoEvent::Info` with `{"bodies": [{"name", "solids"}]}`, in file order.
     pub fn request_step_contents(&mut self, step: &Path) -> Result<u64> {

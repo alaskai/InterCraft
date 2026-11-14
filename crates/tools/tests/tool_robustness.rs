@@ -335,6 +335,55 @@ fn a_big_project_reads_as_an_outline_with_detail_on_request() {
 }
 
 #[test]
+fn nearby_finds_neighbours_and_what_touches_what() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    let (mut host, dir) = project("nearby");
+    // A plate, a bracket sitting on it, a bolt 3 mm above the bracket, and a lamp far off.
+    for (name, code, at) in [
+        ("Plate", "part = Box(100, 60, 5)", [0, 0, 0]),
+        ("Bracket", "part = Box(20, 20, 30) - Pos(0, 0, 5) * Cylinder(2.1, 40)", [30, 0, 17.5 as i32]),
+        ("Bolt", "part = Cylinder(2, 10)", [30, 0, 40]),
+        ("Lamp", "part = Box(10, 10, 10)", [400, 0, 0]),
+    ] {
+        host.call("add_part", &json!({ "name": name })).unwrap();
+        add(&mut host, name, "Body", code).unwrap();
+        host.call("place_part", &json!({ "part": name, "position": at })).unwrap();
+    }
+    host.call("place_part", &json!({ "part": "Bracket", "position": [30, 0, 17.5] })).unwrap();
+
+    let near = host.call("nearby", &json!({ "part": "Bracket" })).unwrap();
+    let found: Vec<(&str, f64)> =
+        near["near"].as_array().unwrap().iter().map(|n| (n["part"].as_str().unwrap(), n["clearance_mm"].as_f64().unwrap())).collect();
+    // Nearest first; the lamp is far beyond 5 mm. The bolt sits over the 4.2 mm bore, so
+    // its nearest point is the bore's rim: 2.5 mm up and 0.1 mm across.
+    assert_eq!(found, [("Plate", 0.0), ("Bolt", 2.502)], "{near}");
+    let wide = host.call("nearby", &json!({ "part": "Bracket", "within": 200 })).unwrap();
+    assert_eq!(wide["near"].as_array().unwrap().len(), 2, "the lamp is over 300 mm away");
+
+    // With no part: what touches what.
+    let map = host.call("nearby", &json!({})).unwrap();
+    assert_eq!(map["touching"], json!([{ "a": "Plate", "b": "Bracket", "clearance_mm": 0.0 }]), "{map}");
+    // A group stands for its parts; the bolt is in it, so only outside parts are listed.
+    host.call("set_group", &json!({ "parts": ["Bracket", "Bolt"], "group": "Mount" })).unwrap();
+    let group = host.call("nearby", &json!({ "part": "Mount" })).unwrap();
+    assert_eq!(group["near"][0]["part"], "Plate");
+    assert_eq!(group["near"].as_array().unwrap().len(), 1, "{group}");
+    assert!(host.call("nearby", &json!({ "part": "Nothing" })).is_err());
+    assert!(host.call("nearby", &json!({ "part": "Plate", "within": 900 })).is_err());
+
+    // The bracket's bore where it sits in the assembly, ready to line a new part up with.
+    let own = host.call("inspect_part", &json!({ "part": "Bracket" })).unwrap();
+    let placed = host.call("inspect_part", &json!({ "part": "Bracket", "in_assembly": true })).unwrap();
+    let centre = |info: &Value| info["cylindrical_faces"][0]["centre"].as_array().unwrap()[0].as_f64().unwrap();
+    assert!((centre(&placed) - centre(&own) - 30.0).abs() < 1e-6, "{placed}");
+    assert!(placed["frame"].as_str().unwrap().contains("assembly"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn asking_a_busy_worker_never_blocks_the_caller() {
     let _one = one_at_a_time();
     if !worker_available() {

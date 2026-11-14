@@ -63,6 +63,7 @@ pub fn tool_purpose(name: &str) -> &'static str {
         "place_part" => "Moves or turns a part in the assembly without changing its shape.",
         "move_group" => "Moves or turns a whole imported assembly as one piece.",
         "get_part" => "Reads one part in full: its steps, code and numbers.",
+        "nearby" => "Finds what is close to a part, or what touches what, with exact gaps.",
         "find_parts" => "Looks up parts by name or group, with where each one sits.",
         "set_group" => "Tidies parts into a group in the parts list. The parts themselves don't change.",
         "rename_group" => "Renames a group, or moves it inside another one.",
@@ -120,6 +121,10 @@ pub fn caption(name: &str, input: &Value, level: Explain) -> Option<String> {
         "place_part" => format!("Moving {}", part.unwrap_or("a part")),
         "move_group" => format!("Moving the whole of {}", text("group").unwrap_or("a group")),
         "get_part" => format!("Reading {}", part.unwrap_or("a part")),
+        "nearby" => match part {
+            Some(part) => format!("Finding what is near {part}"),
+            None => "Mapping what touches what".to_owned(),
+        },
         "find_parts" => format!("Finding parts: {}", text("name").or(text("group")).unwrap_or("all")),
         "set_group" => format!("Grouping parts as {}", text("group").unwrap_or("ungrouped")),
         "rename_group" => format!("Tidying the group {}", text("group").unwrap_or("")),

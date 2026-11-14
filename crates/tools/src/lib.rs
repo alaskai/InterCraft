@@ -2,6 +2,9 @@
 // Shared by the MCP server and the built-in chat panel, so both behave the same.
 // serde_json 1, anyhow 1, dirs 7
 
+// The tool list is one big json! literal, deeper than the macro's default limit.
+#![recursion_limit = "256"]
+
 pub mod motion;
 
 use std::collections::HashMap;
@@ -46,6 +49,7 @@ Imported parts and measuring:
 - Before editing an imported part, call inspect_part to find its faces, holes and their exact positions instead of guessing.
 - An imported assembly can be split into one part per body. They share a group, with the file's sub-assemblies as groups inside it (a path like `Printer/Extruder`). Each body is a normal part to place, joint, check or edit.
 - In a big project get_project is an outline. Use find_parts to list parts by name or group, and get_part for the full detail of the ones you work on or against. Never guess a part's name.
+- To design against what is already there: nearby lists what is within a few mm of a part (or, with no part, what touches what), inspect_part with in_assembly gives a part's holes and faces where they sit in the assembly, and view_model with labels numbers each part in the picture. Prefer these numbers to reading positions off a picture.
 - Groups only organise the parts list. Make and tidy them with set_group and rename_group; move_group moves everything in a group as one piece.
 - Use measure to check clearances, hole spacing and wall thickness after a change.
 
@@ -88,7 +92,10 @@ pub struct ViewRequest {
     pub id: String,
     /// iso, front, back, left, right, top, bottom or current.
     pub view: String,
-    pub part: Option<String>,
+    /// Show only these parts. Empty shows them all.
+    pub parts: Vec<String>,
+    /// Put a numbered marker on each part, and answer with which number is which.
+    pub labels: bool,
     /// Cut the model open: (axis 0 to 2, position in mm, flip).
     pub section: Option<(usize, f64, bool)>,
     /// How long it has been waiting.
@@ -113,7 +120,7 @@ pub fn view_requests(project: &Path) -> Vec<ViewRequest> {
             if id.is_empty() || id.len() > 40 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
                 return None;
             }
-            if entry.metadata().ok()?.len() > 4096 {
+            if entry.metadata().ok()?.len() > 65_536 {
                 return None;
             }
             let value: Value = serde_json::from_str(&std::fs::read_to_string(entry.path()).ok()?).ok()?;
@@ -127,7 +134,13 @@ pub fn view_requests(project: &Path) -> Vec<ViewRequest> {
                 )),
             };
             let age = entry.metadata().ok()?.modified().ok()?.elapsed().unwrap_or_default();
-            Some(ViewRequest { id: id.to_owned(), view, part: value["part"].as_str().map(str::to_owned), section, age })
+            let names = value["parts"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>());
+            let parts = names.unwrap_or_else(|| value["part"].as_str().map(str::to_owned).into_iter().collect());
+            if parts.len() > 2000 || parts.iter().any(|p| p.len() > 64) {
+                return None;
+            }
+            let labels = value["labels"] == true;
+            Some(ViewRequest { id: id.to_owned(), view, parts, labels, section, age })
         })();
         match parsed {
             Some(request) => requests.push(request),
@@ -140,9 +153,14 @@ pub fn view_requests(project: &Path) -> Vec<ViewRequest> {
     requests
 }
 
-/// The viewer's answer: PNG bytes, or why it couldn't draw the picture.
-pub fn answer_view(project: &Path, id: &str, answer: std::result::Result<&[u8], &str>) {
+/// The viewer's answer: PNG bytes, or why it couldn't draw the picture. With markers,
+/// `legend` says which part each number is on.
+pub fn answer_view(project: &Path, id: &str, answer: std::result::Result<&[u8], &str>, legend: Option<&Value>) {
     let dir = view_dir(project);
+    // Before the picture, which is what the waiting tool looks for.
+    if let (Ok(_), Some(legend)) = (&answer, legend) {
+        let _ = std::fs::write(dir.join(format!("{id}.legend.json")), legend.to_string());
+    }
     let (ext, bytes) = match answer {
         Ok(png) => ("png", png),
         Err(error) => ("err", error.as_bytes()),
@@ -506,8 +524,20 @@ pub fn definitions() -> Value {
                 "properties": {
                     "part": part,
                     "feature_id": { "type": "string", "description": "Inspect the shape as it was after this step. Omit for the latest." },
+                    "in_assembly": { "type": "boolean", "description": "Give positions where the part sits in the assembly instead of in its own frame. Use it to line up a new part with this one's holes and faces." },
                 },
                 "required": ["part"],
+            },
+        },
+        {
+            "name": "nearby",
+            "description": "What is close to what, worked out exactly. With `part` (a part or a group): every other part within `within` mm of it (default 5), nearest first, with the clearance and the two closest points. Without `part`: every pair of parts that touch (within 0.05 mm by default), which shows what is mounted to what. Overlapping parts show a clearance of 0; check_fit says by how much.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "part": { "type": "string", "description": "A part or group. Omit for every touching pair." },
+                    "within": { "type": "number", "description": "Distance in mm, 0 to 200." },
+                },
             },
         },
         {
@@ -530,7 +560,9 @@ pub fn definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "view": { "type": "string", "enum": VIEWS, "description": "Camera direction. The six side views are flat like a drawing, iso has perspective, and 'current' is what the user is looking at. Default iso." },
-                    "part": { "type": "string", "description": "Show only this part. Omit to see the whole assembly." },
+                    "part": { "type": "string", "description": "Show only this part, or this group. Omit to see the whole assembly." },
+                    "parts": { "type": "array", "items": { "type": "string" }, "description": "Show only these parts and groups, e.g. a new mount with the parts it bolts to." },
+                    "labels": { "type": "boolean", "description": "Put a numbered marker on each part shown and list which number is which, so you can tell parts apart by name. Best with 40 parts or fewer in view." },
                     "section": {
                         "type": "object",
                         "description": "Cut the model open with a plane across one axis.",
@@ -919,10 +951,13 @@ impl ToolHost {
             "redo" => Ok(json!({ "redone": project.redo()? })),
             "inspect_part" => {
                 let part = project.part(text(args, "part")?)?.clone();
-                // In the part's own frame: that is where its features work.
-                let key = self.built_key(&project, &part, optional_text(args, "feature_id"), false)?;
+                // In the part's own frame by default: that is where its features work.
+                let in_assembly = args.get("in_assembly") == Some(&Value::Bool(true));
+                let key = self.built_key(&project, &part, optional_text(args, "feature_id"), in_assembly)?;
                 let mut data = self.with_worker(|w| w.inspect_blocking(&key))?;
-                if part.placement().is_some() {
+                if in_assembly {
+                    data["frame"] = "Positions are in the assembly, where the part sits now (joints included). Design another part's matching holes from these; write this part's own features in its own frame.".into();
+                } else if part.placement().is_some() {
                     data["frame"] = format!(
                         "Positions are in the part's own frame, the one its features use. In the assembly the part is moved to {:?} mm and rotated {:?} degrees, and measure works in assembly positions.",
                         part.position, part.rotation
@@ -950,10 +985,17 @@ impl ToolHost {
                 if !VIEWS.contains(&view) {
                     bail!("unknown view '{view}'. Use one of: {}", VIEWS.join(", "));
                 }
-                if let Some(part) = optional_text(args, "part") {
-                    project.part(part)?;
+                let mut parts = match optional_text(args, "part") {
+                    Some(name) => parts_named(&project, name)?,
+                    None => Vec::new(),
+                };
+                for name in args.get("parts").and_then(Value::as_array).into_iter().flatten() {
+                    let name = name.as_str().context("`parts` must be a list of part or group names")?;
+                    parts.extend(parts_named(&project, name)?);
                 }
-                let png = request_view(&project.dir, view, args)?;
+                parts.dedup();
+                let labels = args.get("labels") == Some(&Value::Bool(true));
+                let (png, legend) = request_view(&project.dir, view, &parts, labels, args)?;
                 let facing = match view {
                     "iso" => "From the front right, above. Z is up.",
                     "front" => "From the front (the -Y side), looking along +Y. X runs to the right, Z is up.",
@@ -965,6 +1007,16 @@ impl ToolHost {
                     _ => "The user's own view, with whatever they have hidden or cut.",
                 };
                 let mut result = json!({ "view": view, "facing": facing, IMAGE_KEY: base64(&png) });
+                if let Some(legend) = legend {
+                    result["markers"] = legend["markers"].clone();
+                    if let Some(unmarked) = legend["unmarked"].as_array().filter(|u| !u.is_empty()) {
+                        result["not_marked"] = json!(unmarked);
+                    }
+                    result["markers_note"] = "Each number is drawn on a point of that part. A part hidden behind another can have its number showing on top of the one in front.".into();
+                }
+                if !parts.is_empty() {
+                    result["showing"] = format!("{} of {} parts", parts.len(), project.project.parts.len()).into();
+                }
                 if !matches!(view, "iso" | "current") {
                     result["projection"] = "Flat, without perspective: shapes keep their true proportions and you can't see the walls of a hole that runs straight through.".into();
                 }
@@ -1030,6 +1082,55 @@ impl ToolHost {
                 let mut report = self.build_report(&project, project.part(&name)?, false)?;
                 report["added_part"] = name.into();
                 Ok(report)
+            }
+            "nearby" => {
+                let target = optional_text(args, "part");
+                let within = args.get("within").and_then(Value::as_f64).unwrap_or(if target.is_some() { 5.0 } else { 0.05 });
+                if !(0.0..=200.0).contains(&within) {
+                    bail!("within must be between 0 and 200 mm");
+                }
+                let targets: Vec<String> = match target {
+                    Some(name) => parts_named(&project, name)?,
+                    None => Vec::new(),
+                };
+                let all: Vec<Part> = project.project.parts.clone();
+                if all.len() < 2 {
+                    bail!("there is nothing for it to be near: the project has one part");
+                }
+                let mut keys = Vec::new();
+                for part in &all {
+                    keys.push((part.name.clone(), self.built_key(&project, part, None, true)?));
+                }
+                let data = self.with_worker(|w| w.nearby_blocking(&keys, &targets, within))?;
+                let pairs = data["pairs"].as_array().cloned().unwrap_or_default();
+                let mut result = json!({ "within_mm": within, "checked_exactly": data["checked"] });
+                match target {
+                    Some(name) => {
+                        let near: Vec<Value> = pairs
+                            .iter()
+                            .map(|p| {
+                                let mut entry = json!({ "part": p["b"], "clearance_mm": p["clearance"], "closest_on_other": p["b_point"] });
+                                if targets.len() > 1 {
+                                    entry["near"] = p["a"].clone();
+                                }
+                                entry["closest_on_this"] = p["a_point"].clone();
+                                entry
+                            })
+                            .collect();
+                        result["part"] = name.into();
+                        if near.is_empty() {
+                            result["note"] = format!("Nothing within {within} mm of {name}.").into();
+                        }
+                        result["near"] = json!(near);
+                    }
+                    None => {
+                        let touching: Vec<Value> =
+                            pairs.iter().map(|p| json!({ "a": p["a"], "b": p["b"], "clearance_mm": p["clearance"] })).collect();
+                        result["touching"] = json!(touching);
+                        result["note"] = "Pairs within the distance, which for a small distance means mounted to or resting on each other. Clearance 0 can also mean overlapping; check_fit tells which.".into();
+                    }
+                }
+                Ok(result)
             }
             "check_fit" => {
                 let wanted: Option<Vec<&str>> =
@@ -1317,6 +1418,25 @@ impl ToolHost {
     }
 }
 
+/// The parts a name refers to: one part, or every part in a group of that name. A
+/// part wins when both exist.
+fn parts_named(project: &LoadedProject, name: &str) -> Result<Vec<String>> {
+    if let Ok(part) = project.part(name) {
+        return Ok(vec![part.name.clone()]);
+    }
+    let members: Vec<String> = project
+        .project
+        .parts
+        .iter()
+        .filter(|p| intercraft_core::in_group(p.group.as_deref(), name))
+        .map(|p| p.name.clone())
+        .collect();
+    if members.is_empty() {
+        bail!("no part or group named '{name}'. find_parts lists them by name");
+    }
+    Ok(members)
+}
+
 /// Up to this many parts, get_project gives every part in full.
 const FULL_PROJECT_PARTS: usize = 12;
 /// Up to this many parts are listed one line each; beyond it, only groups are.
@@ -1453,7 +1573,7 @@ fn optional_text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 /// Ask the viewer for a picture and wait for it. The viewer watches the project's
 /// `.intercraft/view` folder, so this works from another process (an MCP server) too.
-fn request_view(project: &Path, view: &str, args: &Value) -> Result<Vec<u8>> {
+fn request_view(project: &Path, view: &str, parts: &[String], labels: bool, args: &Value) -> Result<(Vec<u8>, Option<Value>)> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
@@ -1461,7 +1581,7 @@ fn request_view(project: &Path, view: &str, args: &Value) -> Result<Vec<u8>> {
 
     let dir = view_dir(project);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let request = json!({ "view": view, "part": args.get("part"), "section": args.get("section") });
+    let request = json!({ "view": view, "parts": parts, "labels": labels, "section": args.get("section") });
     if let Some(section) = args.get("section").filter(|s| !s.is_null()) {
         let axis_ok = ["x", "y", "z"].iter().any(|a| section["axis"] == *a);
         if !axis_ok || !section["offset"].as_f64().is_some_and(f64::is_finite) {
@@ -1472,10 +1592,12 @@ fn request_view(project: &Path, view: &str, args: &Value) -> Result<Vec<u8>> {
     std::fs::write(&file, request.to_string()).context("writing the view request")?;
 
     let (png, err) = (dir.join(format!("{id}.png")), dir.join(format!("{id}.err")));
+    let legend = dir.join(format!("{id}.legend.json"));
     let started = std::time::Instant::now();
     let result = loop {
         if let Ok(bytes) = std::fs::read(&png) {
-            break Ok(bytes);
+            let key = std::fs::read_to_string(&legend).ok().and_then(|text| serde_json::from_str(&text).ok());
+            break Ok((bytes, key));
         }
         if let Ok(error) = std::fs::read_to_string(&err) {
             break Err(anyhow::anyhow!(error));
@@ -1487,7 +1609,7 @@ fn request_view(project: &Path, view: &str, args: &Value) -> Result<Vec<u8>> {
         }
         std::thread::sleep(std::time::Duration::from_millis(40));
     };
-    for leftover in [&file, &png, &err] {
+    for leftover in [&file, &png, &err, &legend] {
         let _ = std::fs::remove_file(leftover);
     }
     result
@@ -1586,20 +1708,36 @@ mod tests {
 
         // A stand-in for the viewer: answer the first request it sees.
         let project = dir.clone();
-        let viewer = std::thread::spawn(move || loop {
-            if let Some(request) = view_requests(&project).into_iter().next() {
-                answer_view(&project, &request.id, Ok(b"PNG bytes"));
-                return request;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        });
+        let viewer = |project: PathBuf| {
+            std::thread::spawn(move || loop {
+                if let Some(request) = view_requests(&project).into_iter().next() {
+                    let legend = json!({ "markers": { "1": "P" }, "unmarked": [] });
+                    answer_view(&project, &request.id, Ok(b"PNG bytes"), request.labels.then_some(&legend));
+                    return request;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            })
+        };
+        let waiting = viewer(project.clone());
         let args = json!({ "view": "front", "part": "P", "section": { "axis": "z", "offset": 2.5 } });
         let result = host.call("view_model", &args).unwrap();
-        let seen = viewer.join().unwrap();
-        assert_eq!((seen.view.as_str(), seen.part.as_deref(), seen.section), ("front", Some("P"), Some((2, 2.5, false))));
+        let seen = waiting.join().unwrap();
+        assert_eq!((seen.view.as_str(), seen.parts.as_slice(), seen.section), ("front", &["P".to_owned()][..], Some((2, 2.5, false))));
         assert_eq!(result[IMAGE_KEY], base64(b"PNG bytes"));
         assert!(result["facing"].as_str().unwrap().contains("-Y side"));
+        assert!(result.get("markers").is_none());
         assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "nothing is left behind");
+
+        // A group stands for all its parts, and markers come back with their key.
+        host.call("add_part", &json!({ "name": "Q" })).unwrap();
+        host.call("set_group", &json!({ "parts": ["P", "Q"], "group": "Kit" })).unwrap();
+        let waiting = viewer(project);
+        let result = host.call("view_model", &json!({ "part": "Kit", "labels": true })).unwrap();
+        let seen = waiting.join().unwrap();
+        assert_eq!((seen.parts.len(), seen.labels), (2, true));
+        assert_eq!(result["markers"]["1"], "P");
+        assert_eq!(result["showing"], "2 of 2 parts");
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "the legend is cleaned up too");
 
         assert!(host.call("view_model", &json!({ "view": "upside-down" })).is_err());
         assert!(host.call("view_model", &json!({ "part": "Nope" })).is_err());

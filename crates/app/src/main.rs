@@ -8,6 +8,7 @@ mod chat_store;
 mod fit;
 mod glossary;
 mod import;
+mod markers;
 mod measure;
 mod menus;
 mod motion;
@@ -921,20 +922,20 @@ impl State {
             return;
         }
         match self.take_view(&request) {
-            Ok(png) => intercraft_tools::answer_view(&loaded.dir, &request.id, Ok(&png)),
-            Err(e) => intercraft_tools::answer_view(&loaded.dir, &request.id, Err(&format!("{e:#}"))),
+            Ok((png, legend)) => intercraft_tools::answer_view(&loaded.dir, &request.id, Ok(&png), legend.as_ref()),
+            Err(e) => intercraft_tools::answer_view(&loaded.dir, &request.id, Err(&format!("{e:#}")), None),
         }
     }
 
-    fn take_view(&self, request: &intercraft_tools::ViewRequest) -> anyhow::Result<Vec<u8>> {
+    fn take_view(&self, request: &intercraft_tools::ViewRequest) -> anyhow::Result<(Vec<u8>, Option<serde_json::Value>)> {
         let direction = view_direction(&request.view);
         let section = request.section.map(|(axis, offset, flip)| viewport::Section { axis, offset: offset as f32, flip });
         // Side views are drawn flat, like a drawing. The angled ones keep perspective.
         let flat = direction.is_some() && request.view != "iso";
-        let shot = viewport::Shot { direction, only: request.part.clone(), section, flat };
-        let pixels = self.viewport.snapshot(&shot)?;
-
-        encode_png(&pixels, viewport::SHOT_SIZE, viewport::SHOT_SIZE)
+        let shot = viewport::Shot { direction, only: request.parts.clone(), labels: request.labels, section, flat };
+        let mut snapshot = self.viewport.snapshot(&shot)?;
+        let legend = request.labels.then(|| markers::draw(&mut snapshot.pixels, viewport::SHOT_SIZE, &snapshot.marks));
+        Ok((encode_png(&snapshot.pixels, viewport::SHOT_SIZE, viewport::SHOT_SIZE)?, legend))
     }
 
     /// The project's design brief: shown as formatted text, editable on request.
@@ -1012,10 +1013,10 @@ impl State {
             self.sketch.backdrop = None;
             return;
         };
-        let shot = viewport::Shot { direction: view_direction(&view), only: None, section: None, flat: true };
+        let shot = viewport::Shot { direction: view_direction(&view), only: Vec::new(), labels: false, section: None, flat: true };
         match (self.viewport.flat_frame(), self.viewport.snapshot(&shot)) {
             (Some((centre, half)), Ok(pixels)) => {
-                self.sketch.set_backdrop(ctx, &view, &pixels, viewport::SHOT_SIZE, centre, half);
+                self.sketch.set_backdrop(ctx, &view, &pixels.pixels, viewport::SHOT_SIZE, centre, half);
                 self.worker_status = format!("Drawing over the {view} view, at true scale.");
             }
             (_, Err(e)) => self.worker_status = format!("Couldn't draw over the {view} view: {e:#}"),

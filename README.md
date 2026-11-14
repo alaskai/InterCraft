@@ -266,13 +266,22 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `check_fit` | Clashes (with volume) and clearances between parts |
 | `add_joint`, `edit_joint`, `delete_joint` | Hinges and sliders between parts, and moving them to check a pose |
 | `check_motion` | Sweeps a joint through its range and reports where its parts clash, or the closest gap if they don't |
-| `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing one part. The six side views are drawn flat, like a drawing |
+| `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing only some parts or groups. The six side views are drawn flat, like a drawing. With labels, each part gets a numbered marker and the answer says which number is which |
 | `undo`, `redo` | Step back or forward through the project history |
-| `inspect_part` | Faces, holes and circular edges of a part with exact sizes and positions |
+| `inspect_part` | Faces, holes and circular edges of a part with exact sizes and positions, in its own frame or where it sits in the assembly |
+| `nearby` | Exact gaps: every part within a few mm of a part or group, or every pair that touches (what is mounted to what) |
 | `measure` | Exact distance, angle, length or diameter between faces, edges, corners and points |
 | `export_part` | Writes STEP and STL to the project's `exports` folder |
 
 Every edit returns a build report (volume, volume change, size, errors), so the LLM can check its own work with numbers. With `view_model` it can also look at the result, which catches mistakes numbers miss, such as a hole on the wrong face. The picture is drawn by the open viewer without changing your own view, so that tool needs the viewer running. A feature that fails to build stays saved and shows red in the app until it is fixed.
+
+In a big assembly the model works mostly from numbers, which cost far less than pictures and are exact:
+
+1. `get_project` gives an outline: groups, and one line per part with its size and centre.
+2. `find_parts` and `get_part` fetch the parts it needs by name or group.
+3. `nearby` says what is within a few mm of a part, or what touches what.
+4. `inspect_part` with `in_assembly` gives a part's holes and faces where they actually sit, so a new mount can line up with them.
+5. When a picture is needed, `view_model` can show just a group and number each part, so the model can tie what it sees to part names.
 
 Other MCP clients (Codex CLI, Gemini CLI, Cursor) use the same command: `python <repo>/dev/mcp_launcher.py` as a stdio server.
 

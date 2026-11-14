@@ -355,6 +355,68 @@ fn a_worker_that_stops_is_restarted_and_the_rest_still_builds() {
     assert!(s.worker_status.contains("restarted") || s.worker_status.contains("ready"), "{}", s.worker_status);
 }
 
+#[test]
+fn a_projects_chat_comes_back_when_it_is_reopened() {
+    use intercraft_llm::ChatEvent;
+    let _one = one_at_a_time();
+    let project = example_project("chat-kept");
+    let other = example_project("chat-other");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+
+    // One turn: a question, a tool call that's still running, some text.
+    let chat = &mut h.state_mut().state.chat;
+    chat.inject(ChatEvent::ReplyStarted { model: "test-model".into() });
+    chat.inject(ChatEvent::TextDelta("Made the bore 8.2 mm.".into()));
+    chat.inject(ChatEvent::ToolStarted { id: "t1".into(), name: "set_param".into(), input: serde_json::json!({ "part": "RodBracket" }) });
+    chat.inject(ChatEvent::ToolFinished { id: "t1".into(), ok: true, output: serde_json::json!({ "ok": true, "big": "x".repeat(9000) }) });
+    chat.inject(ChatEvent::ToolStarted { id: "t2".into(), name: "view_model".into(), input: serde_json::json!({}) });
+    chat.inject(ChatEvent::Cost(0.5));
+    let sessions = serde_json::json!({
+        "claude_code": { "session_id": "saved-session-1234" },
+        "anthropic": { "messages": [{ "role": "user", "content": "make the bore bigger" }] },
+    });
+    chat.finish_turn("make the bore bigger", sessions);
+    let file = project.join(".intercraft/chat.json");
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(saved.len() < 8000, "long tool results should be shortened, the file is {} bytes", saved.len());
+    assert!(!saved.to_lowercase().contains("api_key") && !saved.contains("sk-"), "no keys in a saved chat");
+
+    // Another project has its own, empty chat.
+    h.state_mut().open(other.clone());
+    h.step();
+    let (lines, restore) = h.state().state.chat.transcript();
+    assert!(lines.len() == 1 && lines[0].contains("new conversation"), "{lines:?}");
+    assert!(restore.is_none());
+
+    // Back again: the conversation is on screen and the model gets its context.
+    h.state_mut().open(project.clone());
+    h.step();
+    let (lines, restore) = h.state().state.chat.transcript();
+    assert_eq!(lines[0], "user: make the bore bigger");
+    // The call that never finished reads as failed, not as still running.
+    assert_eq!(lines[1], "assistant: Made the bore 8.2 mm. [set_param true] [view_model false]");
+    assert!(lines[2].starts_with("notice: Picked up this project's chat (2 messages)"), "{lines:?}");
+    let restore = restore.expect("the saved conversations go to the worker");
+    assert_eq!(restore["claude_code"]["session_id"], "saved-session-1234");
+    let recap = restore["claude_code"]["recap"].as_str().unwrap();
+    assert!(recap.contains("User: make the bore bigger") && recap.contains("Made the bore 8.2 mm."), "{recap}");
+    assert_eq!(restore["anthropic"]["messages"][0]["content"], "make the bore bigger");
+    assert!(h.state().state.chat.cost_line().is_some_and(|(text, _)| text.contains("0.50")), "the running cost comes back");
+
+    // New chat forgets it for good.
+    for _ in 0..4 {
+        h.step();
+    }
+    click(&mut h, "New chat");
+    h.step();
+    assert!(!file.exists(), "{:?}", h.state().state.chat.transcript().0);
+    h.state_mut().open(other);
+    h.state_mut().open(project);
+    h.step();
+    assert!(h.state().state.chat.transcript().0[0].contains("new conversation"));
+}
+
 fn asking(app: &App) -> bool {
     matches!(app.state.import.as_ref().map(|i| &i.stage), Some(import::Stage::Asking(..)))
 }

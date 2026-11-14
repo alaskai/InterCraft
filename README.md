@@ -219,6 +219,15 @@ The Claude Code session is locked down: no built-in tools (no shell or file edit
 
 Each message also tells the model which part you have selected, so "make the bore bigger" refers to the part you are looking at.
 
+The chat is saved with the project, in `.intercraft/chat.json`, after every reply. Close the project or the app and the conversation is there when you open it again, and the model carries on with its context:
+
+| Route | How the model gets its context back |
+|---|---|
+| Anthropic API, OpenAI-compatible server | The saved conversation is sent again. Pictures are left out to keep the file small, and the oldest turns go first if it grows past about 1.5 MB. |
+| Claude Code | The same Claude Code session is resumed. If Claude Code no longer has it (cleared, or another computer), a new session starts with a written recap of the chat. |
+
+The file holds the conversation only, never keys or settings. Long tool results are shortened in the copy you see. New chat deletes it. Each project keeps its own chat.
+
 To test the chat without an API key or any cost, run the mock server in `dev/mock_anthropic.py` and point the app at it with `INTERCRAFT_ANTHROPIC_URL`. The script's header explains how.
 
 ### MCP server (Claude Code and other agent apps)

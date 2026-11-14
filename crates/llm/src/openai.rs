@@ -336,6 +336,16 @@ impl ChatSession for OpenAiChat {
     fn reset(&mut self) {
         self.messages.clear();
     }
+
+    fn state(&self) -> Value {
+        json!({ "messages": crate::saved_messages(&self.messages) })
+    }
+
+    fn restore(&mut self, state: &Value) {
+        if let Some(messages) = crate::restored_messages(state) {
+            self.messages = messages;
+        }
+    }
 }
 
 impl OpenAiChat {

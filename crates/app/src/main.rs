@@ -4,6 +4,7 @@
 
 mod caption;
 mod chat;
+mod chat_store;
 mod fit;
 mod glossary;
 mod import;

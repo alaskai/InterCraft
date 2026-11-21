@@ -569,8 +569,8 @@ fn outside_edits_are_reloaded_recorded_and_captioned() {
     wait_until(&mut h, "the first build", built);
     let volume = |app: &App| app.state.latest_report(app.state.project.as_ref().unwrap().part("RodBracket").unwrap()).map(|r| r.volume);
     let before = volume(h.state()).unwrap();
-    // History only starts with the first change made in InterCraft (bug B-1 in the test plan).
-    h.state_mut().state.edit_project(|p| p.set_brief("A clamp for an 8 mm rod.".into()).and_then(|()| p.save())).unwrap();
+    // A fresh copy with no history: the first thing that happens is a hand edit (bug B-1).
+    assert!(!project.join(".intercraft/history").exists() || h.state().state.history.entries.len() == 1);
 
     // A text editor changes the first step's code: the block gets 10 mm wider.
     let file = project.join("RodBracket/010_base.py");

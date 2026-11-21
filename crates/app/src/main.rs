@@ -2231,6 +2231,11 @@ impl State {
                 ui.label("Valid solid");
                 ui.monospace(if r.valid { "yes" } else { "NO" });
                 ui.end_row();
+                if r.faces_not_drawn > 0 {
+                    ui.label("Not drawn").on_hover_text("Faces that couldn't be turned into triangles for the view. They are still part of the shape, so measuring and export are not affected.");
+                    ui.monospace(format!("{} faces", r.faces_not_drawn));
+                    ui.end_row();
+                }
                 ui.label("Build time");
                 ui.monospace(if result.cached {
                     "cached".to_owned()

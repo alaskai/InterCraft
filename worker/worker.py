@@ -22,6 +22,7 @@ sys.stdout = sys.stderr
 import numpy as np
 import build123d
 
+import meshing
 import parts_library
 import print_check
 import sandbox
@@ -77,15 +78,14 @@ def file_hash(path):
 
 
 def write_mesh(shape, path, tick=lambda: None):
+    """Returns how many faces couldn't be meshed, or None if the file was already there."""
     # Mesh files are named by a hash of everything that shaped them, so an existing
     # file is already right. The viewer and an MCP server each run a worker and can
     # build the same step at the same moment.
     if os.path.exists(path):
-        return
-    verts, tris = shape.tessellate(LINEAR_TOL, ANGULAR_TOL)
+        return None
+    v, t, skipped = meshing.triangles(shape, LINEAR_TOL, ANGULAR_TOL)
     tick()
-    v = np.array([(q.X, q.Y, q.Z) for q in verts], dtype=np.float32).reshape(-1, 3)
-    t = np.array(tris, dtype=np.uint32).reshape(-1, 3)
 
     # Area-weighted vertex normals. Vertices aren't shared between faces,
     # so real edges stay sharp while curved faces shade smoothly.
@@ -104,6 +104,7 @@ def write_mesh(shape, path, tick=lambda: None):
             tick()
     corners = [tuple(vx) for vx in shape.vertices()]
     write_icm(path, v, n, t, edges, corners)
+    return skipped
 
 
 def write_icm(path, v, n, t, edges, corners):
@@ -198,12 +199,16 @@ def shape_facts(shape, key, cache_dir):
             "edges": len(shape.edges()),
             "valid": bool(shape.is_valid),
         }
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(facts, f)
-        os.replace(tmp, path)
+        save_facts(path, facts)
     _facts[key] = facts
     return facts
+
+
+def save_facts(path, facts):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(facts, f)
+    os.replace(tmp, path)
 
 
 def edge_points(edge):
@@ -392,7 +397,11 @@ def rebuild(req, emit=True):
                 facts = shape_facts(shape, key, cache_dir)
                 tick()
                 local_mesh = os.path.join(cache_dir, key + ".icm")
-                write_mesh(shape, local_mesh, tick)
+                skipped = write_mesh(shape, local_mesh, tick)
+                if skipped:
+                    # Kept with the facts, so a reopened project still says so.
+                    facts = _facts[key] = dict(facts, faces_not_drawn=skipped)
+                    save_facts(os.path.join(cache_dir, f"{key}.facts.json"), facts)
                 shown = place(shape, placement)
                 mesh_path = os.path.join(cache_dir, placed + ".icm")
                 if mesh_path != local_mesh:

@@ -1379,6 +1379,9 @@ impl ToolHost {
                         entry["faces"] = r.faces.into();
                         entry["edges"] = r.edges.into();
                         entry["valid_solid"] = r.valid.into();
+                        if r.faces_not_drawn > 0 {
+                            entry["faces_not_drawn"] = r.faces_not_drawn.into();
+                        }
                         all_ok &= r.valid;
                     }
                 }

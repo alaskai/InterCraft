@@ -54,6 +54,9 @@ pub struct Report {
     pub faces: u32,
     pub edges: u32,
     pub valid: bool,
+    /// Faces OpenCascade couldn't mesh, left out of the picture but still in the shape.
+    #[serde(default)]
+    pub faces_not_drawn: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

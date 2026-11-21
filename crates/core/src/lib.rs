@@ -1137,7 +1137,7 @@ mod tests {
 
     #[test]
     fn every_kind_of_change_has_a_readable_undo_label() {
-        let mut p = temp_project("labels");
+        let mut p = temp_project("undo-labels");
         let step = |p: &mut LoadedProject, label: &str, change: &dyn Fn(&mut LoadedProject) -> Result<()>| {
             change(p).unwrap();
             p.save().unwrap();

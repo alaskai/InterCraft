@@ -460,6 +460,10 @@ fn probe_a_big_project() {
                 if !missing.is_empty() {
                     eprintln!("  not shown: {}", missing.join(", "));
                 }
+                // How much of that the worker spent, by its own clock.
+                let worker_ms: f64 = s.results.values().filter(|e| !e.result.cached).map(|e| e.result.ms).sum();
+                let fresh = s.results.values().filter(|e| !e.result.cached).count();
+                eprintln!("  worker time on {fresh} uncached steps: {:.1} s", worker_ms / 1000.0);
                 return;
             }
             std::thread::sleep(Duration::from_millis(15));
@@ -468,10 +472,14 @@ fn probe_a_big_project() {
     run(&mut h, "open", Duration::from_secs(1800));
     let group = h.state().state.project.as_ref().and_then(|p| p.groups().first().cloned());
     if let Some(group) = group {
-        for (i, turn) in [[0.0, 0.0, 90.0], [0.0, 0.0, -90.0], [90.0, 0.0, 0.0]].into_iter().enumerate() {
+        // A turn and back in one go (the second makes the first outdated), then single
+        // turns, each one to a new place or back to where it was built before.
+        h.state_mut().state.move_group(&group, [0.0; 3], [0.0, 0.0, 90.0]);
+        h.state_mut().state.move_group(&group, [0.0; 3], [0.0, 0.0, -90.0]);
+        run(&mut h, "turn and back", Duration::from_secs(600));
+        for (what, turn) in [("turn to a new place", [90.0, 0.0, 0.0]), ("turn back", [-90.0, 0.0, 0.0])] {
             h.state_mut().state.move_group(&group, [0.0; 3], turn);
-            h.state_mut().state.move_group(&group, [0.0; 3], [-turn[0], -turn[1], -turn[2]]);
-            run(&mut h, &format!("move {}", i + 1), Duration::from_secs(600));
+            run(&mut h, what, Duration::from_secs(600));
         }
     }
     shot(&mut h, "probe-big-project");
@@ -597,6 +605,39 @@ fn a_long_chat_saves_and_loads_quickly() {
     // The newest messages are kept, ending with the last question.
     assert_eq!(lines.iter().filter(|l| l.starts_with("user: ") || l.starts_with("assistant: ")).count(), 300);
     assert!(lines.iter().any(|l| l == "user: last question"));
+}
+
+#[test]
+fn a_part_is_building_until_its_last_queued_change_is_done() {
+    let _one = one_at_a_time();
+    let (mut h, _project) = five_part_project("queued-twice");
+    wait_until(&mut h, "the worker's queue to empty", |app| app.state.sent.is_empty());
+    // Two changes in a row, like an assembly turned and turned back (bug B-3), with a
+    // slow build between them so the first ones finish frames before the second.
+    let slow = "part = Box(60, 60, 20)
+for i in range(40):
+    part = part - Pos(i - 20, 0, 0) * Cylinder(0.4, 30)";
+    let slow = intercraft_geo::RebuildRequest {
+        part: "Slow".into(),
+        features: vec![intercraft_geo::FeatureInput::snippet("f010", slow, &serde_json::Map::new())],
+        placement: None,
+    };
+    let s = &mut h.state_mut().state;
+    s.rebuild_all();
+    s.worker.as_mut().unwrap().rebuild(slow).unwrap();
+    s.rebuild_all();
+    let started = Instant::now();
+    while !h.state().state.sent.is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(60), "the rebuilds never finished");
+        h.step();
+        let s = &h.state().state;
+        for part in &s.sent {
+            assert!(s.building.contains(part), "'{part}' still queued but no longer shown as building");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(h.state().state.building.is_empty());
+    assert_eq!(h.state().state.shown.len(), 5);
 }
 
 #[test]

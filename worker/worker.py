@@ -4,12 +4,15 @@
 # Talks JSON lines on stdin/stdout. Each feature is a build123d snippet that
 # reads and reassigns `part`, with its parameters in `p`. All units are mm.
 
+import collections
 import hashlib
 import json
 import math
 import os
+import queue
 import struct
 import sys
+import threading
 import time
 import traceback
 
@@ -687,16 +690,61 @@ def sweep(req):
     send({"id": req["id"], "event": "info", "data": {"steps": steps}})
 
 
-def main():
-    send({"event": "ready", "build123d": build123d.__version__})
+def _read_requests(incoming):
     for line in sys.stdin:
         line = line.strip()
-        if not line:
-            continue
+        if line:
+            try:
+                incoming.put(json.loads(line))
+            except ValueError as e:
+                incoming.put(e)
+    incoming.put(None)
+
+
+def outdated(req, waiting):
+    """A rebuild that a newer rebuild of the same part, already waiting, replaces.
+    Moving a whole assembly twice in a row would otherwise build every part twice.
+    Only rebuilds may sit in between, since anything else could rely on this one."""
+    if req.get("cmd") != "rebuild":
+        return False
+    for later in waiting:
+        if not isinstance(later, dict) or later.get("cmd") != "rebuild":
+            return False
+        if later.get("part") == req.get("part"):
+            return True
+    return False
+
+
+def main():
+    send({"event": "ready", "build123d": build123d.__version__})
+    # Requests are read on their own thread, so the ones waiting can be looked at.
+    incoming = queue.Queue()
+    threading.Thread(target=_read_requests, args=(incoming,), daemon=True).start()
+    waiting, closed = collections.deque(), False
+    while waiting or not closed:
+        if not waiting:
+            item = incoming.get()
+            if item is None:
+                closed = True
+                continue
+            waiting.append(item)
+        while not closed:
+            try:
+                item = incoming.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                closed = True
+            else:
+                waiting.append(item)
         req = None
         try:
-            req = json.loads(line)
-            if req.get("cmd") == "rebuild":
+            req = waiting.popleft()
+            if isinstance(req, Exception):
+                raise req
+            if outdated(req, waiting):
+                send({"id": req["id"], "event": "done", "part": req["part"], "skipped": True})
+            elif req.get("cmd") == "rebuild":
                 rebuild(req)
             elif req.get("cmd") == "export":
                 export(req)

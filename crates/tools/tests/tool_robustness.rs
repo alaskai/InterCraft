@@ -414,6 +414,38 @@ fn asking_a_busy_worker_never_blocks_the_caller() {
 }
 
 #[test]
+fn a_part_moved_again_before_it_was_built_is_only_built_once() {
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    use intercraft_geo::{FeatureInput, GeoEvent, GeometryBackend, RebuildRequest};
+    let mut worker = intercraft_geo::PythonWorker::spawn(|| {}).unwrap();
+    let request = |part: &str, x: f64| {
+        let feature = FeatureInput::snippet("f010", "part = Box(10, 10, 10)", &serde_json::Map::new());
+        RebuildRequest { part: part.to_owned(), features: vec![feature], placement: Some([x, 0.0, 0.0, 0.0, 0.0, 0.0]) }
+    };
+    // The first build keeps the worker busy while the three moves arrive behind it.
+    worker.rebuild(request("Other", 0.0)).unwrap();
+    for x in [0.0, 10.0, 20.0] {
+        worker.rebuild(request("Mover", x)).unwrap();
+    }
+    let (mut built, mut done) = (Vec::new(), 0);
+    let started = Instant::now();
+    while done < 3 {
+        assert!(started.elapsed() < Duration::from_secs(60), "built {built:?}, done {done}");
+        match worker.try_recv() {
+            Some(GeoEvent::Feature(r)) if r.part == "Mover" => built.push(r.report.unwrap().bbox_min[0]),
+            Some(GeoEvent::Done { part }) if part == "Mover" => done += 1,
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    // Every move is answered, but only the last one is built.
+    assert_eq!(built, [15.0], "{built:?}");
+}
+
+#[test]
 fn an_assembly_splits_into_parts_where_they_sat() {
     let _one = one_at_a_time();
     if !worker_available() {

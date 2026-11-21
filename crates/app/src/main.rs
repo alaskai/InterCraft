@@ -1569,7 +1569,10 @@ impl State {
                         self.sent.remove(at);
                     }
                     self.crashed.remove(&part);
-                    self.building.remove(&part);
+                    // Still building if another change to it is queued behind this one.
+                    if !self.sent.contains(&part) {
+                        self.building.remove(&part);
+                    }
                     // Anything still stale was removed from the project or sits after a failure.
                     self.results.retain(|(p, _), e| p != &part || !e.stale);
                 }

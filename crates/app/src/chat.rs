@@ -440,6 +440,13 @@ impl ChatPanel {
         self.save();
     }
 
+    /// A question and its reply, as if a turn had happened, without saving.
+    #[cfg(test)]
+    pub fn add_turn_for_test(&mut self, question: &str, reply: &str) {
+        self.messages.push(Message::User(question.to_owned(), false));
+        self.messages.push(Message::Assistant { model: "test-model".into(), items: vec![Item::Text(reply.to_owned())] });
+    }
+
     /// The conversation as plain lines, and what the worker will be given to restore.
     #[cfg(test)]
     pub fn transcript(&self) -> (Vec<String>, Option<&Value>) {

@@ -395,11 +395,135 @@ fn group_eye_colours_and_history_menu() {
 }
 
 #[test]
+fn bad_step_files_say_why_and_the_worker_carries_on() {
+    let _one = one_at_a_time();
+    let project = example_project("bad-step");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let failed = |app: &App| match app.state.import.as_ref().map(|i| &i.stage) {
+        Some(import::Stage::Failed(error)) => Some(error.clone()),
+        _ => None,
+    };
+
+    // A surface with no solid inside.
+    let surface = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/tests/fixtures/surface.step");
+    h.state_mut().state.start_import(&surface);
+    wait_until(&mut h, "the surface file to be read", |app| failed(app).is_some());
+    assert!(failed(h.state()).unwrap().contains("no solid bodies"), "{:?}", failed(h.state()));
+    click(&mut h, "Close");
+
+    // Junk with the right extension.
+    let junk = sandbox_dirs().join("junk.step");
+    std::fs::write(&junk, "ISO-10303-21;\nthis is not really a STEP file\n").unwrap();
+    h.state_mut().state.start_import(&junk);
+    wait_until(&mut h, "the junk file to be refused", |app| failed(app).is_some());
+    h.state_mut().state.import = None;
+
+    // Too big to try: refused before the worker reads it.
+    let huge = sandbox_dirs().join("huge.step");
+    std::fs::File::create(&huge).unwrap().set_len(201 * 1024 * 1024).unwrap();
+    h.state_mut().state.start_import(&huge);
+    h.step();
+    let _ = std::fs::remove_file(&huge);
+    assert!(h.state().state.worker_status.contains("the limit is 200 MB"), "{}", h.state().state.worker_status);
+    assert_eq!(part_names(&h), ["RodBracket"], "nothing was added");
+
+    // The worker is still there and still builds.
+    h.state_mut().state.shown.clear();
+    h.state_mut().state.rebuild_all();
+    wait_until(&mut h, "a rebuild after the bad files", built);
+}
+
+#[test]
+fn the_mcp_server_follows_the_project_the_viewer_opened() {
+    let _one = one_at_a_time();
+    let first = example_project("follow-a");
+    let second = example_project("follow-b");
+    // The harness keeps the config folder in the sandbox, so this never moves the real one.
+    let mut h = harness(&first);
+    wait_until(&mut h, "the first build", built);
+    let mut agent = intercraft_tools::ToolHost::follow_viewer();
+    agent.call("add_part", &serde_json::json!({ "name": "InFirst" })).unwrap();
+    h.state_mut().open(second.clone());
+    h.step();
+    agent.call("add_part", &serde_json::json!({ "name": "InSecond" })).unwrap();
+    let names = |dir: &Path| -> Vec<String> {
+        intercraft_core::LoadedProject::load(dir).unwrap().project.parts.iter().map(|p| p.name.clone()).collect()
+    };
+    assert_eq!(names(&first), ["RodBracket", "InFirst"]);
+    assert_eq!(names(&second), ["RodBracket", "InSecond"]);
+}
+
+#[test]
+fn settings_and_the_simple_layout_survive_a_restart() {
+    let _one = one_at_a_time();
+    let project = example_project("simple");
+    sandbox_dirs();
+    let file = sandbox_dirs().join("config/settings.json");
+    let before = std::fs::read_to_string(&file).unwrap();
+    settings::Settings::update(|s| {
+        s.theme = "light".into();
+        s.explain = settings::Explain::Beginner;
+        s.layout = settings::Layout::Simple;
+    })
+    .unwrap();
+
+    // A fresh start reads them back.
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let restored = settings::Settings::load();
+    std::fs::write(&file, &before).unwrap();
+    assert_eq!((restored.theme.as_str(), restored.explain, restored.layout), ("light", settings::Explain::Beginner, settings::Layout::Simple));
+    assert!(h.state().state.simple);
+
+    // The simple layout leaves out code, file paths and the placement grid.
+    h.state_mut().state.selected_part = Some("RodBracket".into());
+    h.step();
+    h.step();
+    assert!(h.query_all_by_label("Code").count() == 0, "the Code section should be hidden");
+    assert!(h.query_all_by_label_contains("RodBracket/040_fillet.py").count() == 0, "the snippet path should be hidden");
+    assert!(h.query_all_by_label("Move part").count() >= 1 && h.query_all_by_label("Placement").count() == 0);
+    shot(&mut h, "simple-layout");
+}
+
+#[test]
+fn a_long_chat_saves_and_loads_quickly() {
+    let _one = one_at_a_time();
+    let project = example_project("long-chat");
+    let other = example_project("long-chat-other");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    // 400 turns with long replies: past the 300 messages kept.
+    let reply = "The bore is 8.2 mm so the rod slides in. ".repeat(150);
+    for i in 0..400 {
+        h.state_mut().state.chat.add_turn_for_test(&format!("question {i}"), &reply);
+    }
+    let started = Instant::now();
+    h.state_mut().state.chat.finish_turn("last question", serde_json::json!({}));
+    let saving = started.elapsed();
+    let size = std::fs::metadata(project.join(".intercraft/chat.json")).unwrap().len();
+    assert!(size < crate::chat_store::MAX_BYTES, "{size} bytes");
+    assert!(saving < Duration::from_secs(1), "saving took {saving:?}");
+
+    h.state_mut().open(other);
+    let started = Instant::now();
+    h.state_mut().open(project);
+    let loading = started.elapsed();
+    let (lines, _) = h.state().state.chat.transcript();
+    assert!(loading < Duration::from_secs(3), "reopening took {loading:?}");
+    // The newest messages are kept, ending with the last question.
+    assert_eq!(lines.iter().filter(|l| l.starts_with("user: ") || l.starts_with("assistant: ")).count(), 300);
+    assert!(lines.iter().any(|l| l == "user: last question"));
+}
+
+#[test]
 fn a_part_that_stops_the_worker_twice_is_left_out() {
     let _one = one_at_a_time();
     let (mut h, _project) = five_part_project("crash-twice");
     let restarted = |app: &App| app.state.worker_status.contains("restarted");
 
+    // Truly idle first: `building` can empty while a repeat rebuild is still queued (bug B-3).
+    wait_until(&mut h, "the worker's queue to empty", |app| app.state.sent.is_empty());
     // The worker dies before it reads anything, so the first part sent is the one blamed.
     let s = &mut h.state_mut().state;
     s.shown.clear();

@@ -162,6 +162,8 @@ impl PythonWorker {
     /// End the worker process now, as running out of memory would. For tests.
     pub fn kill(&mut self) {
         let _ = self.child.kill();
+        // Ending a process takes a moment; without the wait it can still finish a quick build.
+        let _ = self.child.wait();
     }
 
     /// True when a build has gone longer than `build_timeout()` without any progress.

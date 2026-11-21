@@ -780,3 +780,52 @@ fn print_check_finds_thin_walls_small_holes_and_overhangs() {
     assert!(host.call("print_check", &json!({ "part": "Cube", "up": [0, 0, 0] })).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// Times the model's view of a big project. Not part of the normal run: set
+/// INTERCRAFT_PROBE to a project folder (it works on a copy) and pass --ignored.
+#[test]
+#[ignore]
+fn probe_the_tools_on_a_big_project() {
+    let Some(src) = std::env::var_os("INTERCRAFT_PROBE") else { return };
+    let _one = one_at_a_time();
+    if !worker_available() {
+        return;
+    }
+    // Real imports take longer than the 5 s the other tests allow.
+    std::env::set_var("INTERCRAFT_BUILD_TIMEOUT", "120");
+    let (mut host, dir) = project("probe");
+    copy_dir(std::path::Path::new(&src), &dir);
+    let mut timed = |tool: &str, args: Value| {
+        let started = Instant::now();
+        let result = host.call(tool, &args);
+        let size = result.as_ref().map_or(0, |r| r.to_string().len());
+        eprintln!("{tool} {args}: {:.1} s, {} kB", started.elapsed().as_secs_f32(), size / 1024);
+        result.unwrap_or_else(|e| {
+            eprintln!("  error: {e:#}");
+            Value::Null
+        })
+    };
+    timed("get_project", json!({}));
+    let found = timed("find_parts", json!({ "name": "extruder_motor" }));
+    eprintln!("find_parts found {}", found["found"]);
+    let map = timed("nearby", json!({}));
+    eprintln!("touching pairs: {}, checked exactly: {}", map["touching"].as_array().map_or(0, Vec::len), map["checked_exactly"]);
+    if let Some(part) = found["parts"][0]["part"].as_str() {
+        let near = timed("nearby", json!({ "part": part }));
+        eprintln!("near {part}: {}", near["near"].as_array().map_or(0, Vec::len));
+    }
+    timed("get_project", json!({}));
+    std::fs::remove_dir_all(dir).unwrap();
+}

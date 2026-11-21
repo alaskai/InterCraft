@@ -394,6 +394,89 @@ fn group_eye_colours_and_history_menu() {
     assert_eq!(part(h.state(), "RodBracket").group, None);
 }
 
+/// Opens a copy of a real project (INTERCRAFT_PROBE = its folder) and times it: how
+/// long until every part shows, the slowest frame, worker restarts, then the same for
+/// moving its first group three times. Test plan R-01 to R-03. Run by hand:
+/// cargo test -p intercraft probe_a_big_project -- --ignored --nocapture
+#[test]
+#[ignore]
+fn probe_a_big_project() {
+    let Some(src) = std::env::var_os("INTERCRAFT_PROBE") else { return };
+    let _one = one_at_a_time();
+    let dir = sandbox_dirs().join("projects").join("probe");
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(Path::new(&src), &dir);
+    // The normal harness draws on a software renderer, which has its own, smaller
+    // limits. Timings and memory only mean something on the real graphics card.
+    use eframe::egui_wgpu;
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, _surface| {
+        let hardware = |a: &&egui_wgpu::wgpu::Adapter| a.get_info().device_type != egui_wgpu::wgpu::DeviceType::Cpu;
+        adapters.iter().find(hardware).or(adapters.first()).cloned().ok_or_else(|| "no graphics adapter".to_owned())
+    }));
+    sandbox_dirs();
+    let project = dir.clone();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1400.0, 860.0))
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(move |cc| App::new(cc, project).expect("app starts"));
+    eprintln!("adapter: {}", h.state().state.viewport.adapter_info());
+
+    // Step until the app has been idle for a few seconds; track the slowest frame.
+    // Some parts never show (no solid, or skipped), so waiting for all of them would
+    // only ever end at the limit.
+    let run = |h: &mut Harness<'static, App>, what: &str, limit: Duration| {
+        let started = Instant::now();
+        let (mut slowest, mut restarts, mut last_status) = (Duration::ZERO, 0, String::new());
+        let (mut seen, mut last_change) = ((0, 0, 0), Instant::now());
+        loop {
+            let frame = Instant::now();
+            h.step();
+            slowest = slowest.max(frame.elapsed());
+            let s = &h.state().state;
+            if s.worker_status != last_status {
+                last_status = s.worker_status.clone();
+                if last_status.contains("restarted") {
+                    restarts += 1;
+                }
+            }
+            let now = (s.shown.len(), s.building.len(), s.sent.len());
+            if now != seen {
+                (seen, last_change) = (now, Instant::now());
+            }
+            let idle = s.project.is_some() && s.building.is_empty() && s.sent.is_empty();
+            let settled = idle && last_change.elapsed() > Duration::from_secs(5);
+            if settled || started.elapsed() > limit || s.worker.is_none() {
+                let parts = s.project.as_ref().map(|p| p.project.parts.clone()).unwrap_or_default();
+                let missing: Vec<&str> =
+                    parts.iter().map(|p| p.name.as_str()).filter(|n| !s.shown.contains_key(*n)).collect();
+                eprintln!(
+                    "{what}: {:.1} s, shown {} of {}, slowest frame {:.0} ms, restarts {restarts}, status: {last_status}",
+                    (last_change - started).as_secs_f32(),
+                    s.shown.len(),
+                    parts.len(),
+                    slowest.as_secs_f64() * 1000.0
+                );
+                if !missing.is_empty() {
+                    eprintln!("  not shown: {}", missing.join(", "));
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    run(&mut h, "open", Duration::from_secs(1800));
+    let group = h.state().state.project.as_ref().and_then(|p| p.groups().first().cloned());
+    if let Some(group) = group {
+        for (i, turn) in [[0.0, 0.0, 90.0], [0.0, 0.0, -90.0], [90.0, 0.0, 0.0]].into_iter().enumerate() {
+            h.state_mut().state.move_group(&group, [0.0; 3], turn);
+            h.state_mut().state.move_group(&group, [0.0; 3], [-turn[0], -turn[1], -turn[2]]);
+            run(&mut h, &format!("move {}", i + 1), Duration::from_secs(600));
+        }
+    }
+    shot(&mut h, "probe-big-project");
+}
+
 #[test]
 fn bad_step_files_say_why_and_the_worker_carries_on() {
     let _one = one_at_a_time();

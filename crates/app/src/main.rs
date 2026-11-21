@@ -345,7 +345,10 @@ impl State {
     /// Load another project, clearing everything from the current one. The current
     /// project stays open if the new one can't be loaded.
     fn open_project(&mut self, dir: PathBuf) -> anyhow::Result<()> {
-        let loaded = LoadedProject::load(&dir)?;
+        let mut loaded = LoadedProject::load(&dir)?;
+        // So a hand edit made before any change in InterCraft can still be undone. A
+        // folder that can't be written to still opens.
+        let _ = loaded.start_history();
         // Results from builds still running for the old project would land on the new one.
         if !self.building.is_empty() {
             if let Some(worker) = self.worker.as_mut() {
@@ -1397,7 +1400,10 @@ impl State {
 
     fn reload_project(&mut self) {
         match LoadedProject::load(&self.project_dir) {
-            Ok(loaded) => {
+            Ok(mut loaded) => {
+                if self.project.is_none() {
+                    let _ = loaded.start_history();
+                }
                 self.last_mtime = loaded.latest_mtime();
                 self.project_error = None;
                 let history = loaded.history();

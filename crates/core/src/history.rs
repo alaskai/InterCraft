@@ -185,6 +185,19 @@ impl LoadedProject {
         Ok(())
     }
 
+    /// Give a project with no history a first snapshot of how it is now. Without it, a
+    /// change made outside InterCraft before any change made inside has nothing to go
+    /// back to. Does nothing once there is any history.
+    pub fn start_history(&mut self) -> Result<()> {
+        let history = History::open(&self.dir);
+        let mut index = history.index();
+        if !index.entries.is_empty() {
+            return Ok(());
+        }
+        let now: Content = serde_json::from_str(&self.baseline)?;
+        history.push(&mut index, "Start".to_owned(), &now)
+    }
+
     pub fn history(&self) -> HistoryInfo {
         let history = History::open(&self.dir);
         let index = history.index();
@@ -551,6 +564,30 @@ mod tests {
         // ...and redo brings the outside edit back.
         reload(&p).redo().unwrap();
         assert_eq!(std::fs::read_to_string(&snippet).unwrap(), "part = Box(2, 2, 2)\n");
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn a_hand_edit_to_a_project_with_no_history_can_be_undone() {
+        let mut p = project("no-history");
+        p.add_part("Bracket").unwrap();
+        p.add_feature("Bracket", feature("Base")).unwrap();
+        p.save().unwrap();
+        // As a copied or shared project arrives: files, but no history.
+        std::fs::remove_dir_all(p.dir.join(".intercraft")).unwrap();
+        let mut opened = reload(&p);
+        assert!(opened.history().entries.is_empty());
+        opened.start_history().unwrap();
+        assert_eq!(opened.history().entries.len(), 1);
+        opened.start_history().unwrap();
+        assert_eq!(opened.history().entries.len(), 1, "only once");
+
+        let snippet = p.dir.join(&p.project.parts[0].features[0].file);
+        std::fs::write(&snippet, "part = Box(2, 2, 2)\n").unwrap();
+        let mut q = reload(&p);
+        assert_eq!(q.history().undo_label(), Some("Edited outside InterCraft"));
+        q.undo().unwrap();
+        assert_eq!(std::fs::read_to_string(&snippet).unwrap(), "part = Box(1, 1, 1)\n");
         std::fs::remove_dir_all(&p.dir).unwrap();
     }
 

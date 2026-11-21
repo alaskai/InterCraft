@@ -24,6 +24,7 @@ import build123d
 
 import meshing
 import parts_library
+import proximity
 import print_check
 import sandbox
 
@@ -595,8 +596,9 @@ _nearby = {}
 
 def nearby(req):
     """Which parts come within `within` mm of the targets, or, with no targets, every
-    pair of parts that close (a map of what touches what). Boxes are compared first
-    and the exact distance is only worked out where they come close."""
+    pair of parts that close (a map of what touches what). Boxes are compared first,
+    then the meshes, and the exact distance is only worked out between the faces that
+    come close (see proximity.py)."""
     within = float(req["within"])
     parts = [(p["name"], p["mesh"]) for p in req["parts"]]
     targets = set(req.get("targets") or [])
@@ -621,12 +623,23 @@ def nearby(req):
         pairs = [(a, b) for i, a in enumerate(names) for b in names[i + 1 :]]
     candidates = [(a, b) for a, b in pairs if close(a, b)]
     found = []
-    for n, (a, b) in enumerate(candidates):
-        distance, pa, pb = shapes[a].distance_to_with_closest_points(shapes[b])
-        if distance <= within:
-            found.append({"a": a, "b": b, "clearance": round(distance, 4), "a_point": vec(pa), "b_point": vec(pb)})
-        if n % 10 == 9:
-            send({"id": req["id"], "event": "progress"})
+    # Meshing a detailed part the first time can take most of a minute, so do each
+    # one on its own and show the app it's alive in between.
+    for name in dict.fromkeys(n for pair in candidates for n in pair):
+        shapes[name].mesh(LINEAR_TOL, ANGULAR_TOL)
+        send({"id": req["id"], "event": "progress"})
+    for a, b in candidates:
+        near = proximity.clearance(shapes[a], shapes[b], within)
+        if near is not None:
+            distance, pa, pb, accuracy = near
+            pair = {"a": a, "b": b, "clearance": round(distance, 4)}
+            if accuracy is None:
+                pair.update(a_point=vec(pa), b_point=vec(pb))
+            else:
+                pair["accuracy"] = round(accuracy, 3)
+            found.append(pair)
+        # Detailed parts can take a while a pair, so show the app it's alive after each.
+        send({"id": req["id"], "event": "progress"})
     found.sort(key=lambda f: f["clearance"])
     data = {"pairs": found, "checked": len(candidates), "skipped_by_box": len(pairs) - len(candidates)}
     _nearby[key] = data

@@ -531,7 +531,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "nearby",
-            "description": "What is close to what, worked out exactly. With `part` (a part or a group): every other part within `within` mm of it (default 5), nearest first, with the clearance and the two closest points. Without `part`: every pair of parts that touch (within 0.05 mm by default), which shows what is mounted to what. Overlapping parts show a clearance of 0; check_fit says by how much.",
+            "description": "What is close to what. With `part` (a part or a group): every other part within `within` mm of it (default 5), nearest first, with the clearance and the two closest points. Without `part`: every pair of parts that touch (within 0.05 mm by default), which shows what is mounted to what. Overlapping parts show a clearance of 0; check_fit says by how much. Clearances are exact, except where a thread, spring or gear tooth comes close: those are measured on the mesh, have `accurate_to_mm` instead of points, and can take a few minutes on a big assembly the first time.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1097,23 +1097,37 @@ impl ToolHost {
                 if all.len() < 2 {
                     bail!("there is nothing for it to be near: the project has one part");
                 }
-                let mut keys = Vec::new();
+                // One broken part shouldn't hide what the rest of the assembly touches.
+                let (mut keys, mut left_out) = (Vec::new(), Vec::new());
                 for part in &all {
-                    keys.push((part.name.clone(), self.built_key(&project, part, None, true)?));
+                    match self.built_key(&project, part, None, true) {
+                        Ok(key) => keys.push((part.name.clone(), key)),
+                        Err(e) if targets.contains(&part.name) => return Err(e),
+                        Err(_) => left_out.push(part.name.clone()),
+                    }
                 }
                 let data = self.with_worker(|w| w.nearby_blocking(&keys, &targets, within))?;
                 let pairs = data["pairs"].as_array().cloned().unwrap_or_default();
                 let mut result = json!({ "within_mm": within, "checked_exactly": data["checked"] });
+                if !left_out.is_empty() {
+                    result["left_out"] = json!(left_out);
+                    result["left_out_note"] = "These parts don't build, so they weren't checked. get_part shows why.".into();
+                }
                 match target {
                     Some(name) => {
                         let near: Vec<Value> = pairs
                             .iter()
                             .map(|p| {
-                                let mut entry = json!({ "part": p["b"], "clearance_mm": p["clearance"], "closest_on_other": p["b_point"] });
+                                let mut entry = json!({ "part": p["b"], "clearance_mm": p["clearance"] });
                                 if targets.len() > 1 {
                                     entry["near"] = p["a"].clone();
                                 }
-                                entry["closest_on_this"] = p["a_point"].clone();
+                                if p["accuracy"].is_number() {
+                                    entry["accurate_to_mm"] = p["accuracy"].clone();
+                                } else {
+                                    entry["closest_on_this"] = p["a_point"].clone();
+                                    entry["closest_on_other"] = p["b_point"].clone();
+                                }
                                 entry
                             })
                             .collect();
@@ -1124,11 +1138,22 @@ impl ToolHost {
                         result["near"] = json!(near);
                     }
                     None => {
-                        let touching: Vec<Value> =
-                            pairs.iter().map(|p| json!({ "a": p["a"], "b": p["b"], "clearance_mm": p["clearance"] })).collect();
+                        let touching: Vec<Value> = pairs
+                            .iter()
+                            .map(|p| {
+                                let mut pair = json!({ "a": p["a"], "b": p["b"], "clearance_mm": p["clearance"] });
+                                if p["accuracy"].is_number() {
+                                    pair["accurate_to_mm"] = p["accuracy"].clone();
+                                }
+                                pair
+                            })
+                            .collect();
                         result["touching"] = json!(touching);
                         result["note"] = "Pairs within the distance, which for a small distance means mounted to or resting on each other. Clearance 0 can also mean overlapping; check_fit tells which.".into();
                     }
+                }
+                if pairs.iter().any(|p| p["accuracy"].is_number()) {
+                    result["accuracy_note"] = "A clearance with accurate_to_mm was measured roughly on the mesh of a freeform face (a thread, spring or gear tooth), because the exact answer can take many minutes. It is within about that many mm. Use measure for an exact figure on one pair.".into();
                 }
                 Ok(result)
             }

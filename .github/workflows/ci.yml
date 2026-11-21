@@ -40,8 +40,8 @@ jobs:
           "INTERCRAFT_PYTHON=$python" >> $env:GITHUB_ENV
       - name: Rust tests
         run: cargo test --workspace --locked
-      - name: Sandbox escape tests
-        run: python -m unittest worker/test_sandbox.py
+      - name: Worker Python tests
+        run: python -m unittest worker/test_sandbox.py worker/test_mesh.py worker/test_proximity.py
       - name: Collect the UI screenshots when a test fails
         if: failure()
         shell: pwsh

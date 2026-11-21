@@ -600,6 +600,39 @@ fn a_long_chat_saves_and_loads_quickly() {
 }
 
 #[test]
+fn a_part_is_building_until_its_last_queued_change_is_done() {
+    let _one = one_at_a_time();
+    let (mut h, _project) = five_part_project("queued-twice");
+    wait_until(&mut h, "the worker's queue to empty", |app| app.state.sent.is_empty());
+    // Two changes in a row, like an assembly turned and turned back (bug B-3), with a
+    // slow build between them so the first ones finish frames before the second.
+    let slow = "part = Box(60, 60, 20)
+for i in range(40):
+    part = part - Pos(i - 20, 0, 0) * Cylinder(0.4, 30)";
+    let slow = intercraft_geo::RebuildRequest {
+        part: "Slow".into(),
+        features: vec![intercraft_geo::FeatureInput::snippet("f010", slow, &serde_json::Map::new())],
+        placement: None,
+    };
+    let s = &mut h.state_mut().state;
+    s.rebuild_all();
+    s.worker.as_mut().unwrap().rebuild(slow).unwrap();
+    s.rebuild_all();
+    let started = Instant::now();
+    while !h.state().state.sent.is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(60), "the rebuilds never finished");
+        h.step();
+        let s = &h.state().state;
+        for part in &s.sent {
+            assert!(s.building.contains(part), "'{part}' still queued but no longer shown as building");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(h.state().state.building.is_empty());
+    assert_eq!(h.state().state.shown.len(), 5);
+}
+
+#[test]
 fn a_part_that_stops_the_worker_twice_is_left_out() {
     let _one = one_at_a_time();
     let (mut h, _project) = five_part_project("crash-twice");

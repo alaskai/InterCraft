@@ -10,7 +10,6 @@ use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use intercraft_geo::Mesh;
-use wgpu::util::DeviceExt;
 
 // Plain Unorm: the shader writes display-space colours and egui shows them as they are.
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -227,35 +226,47 @@ fn upload(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, bytes: &[u8],
         padded = [bytes, &vec![0; align - bytes.len() % align]].concat();
         &padded[..]
     };
-    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    // A buffer that can't be made fails as out of memory, or, when a driver runs short
+    // another way, as a validation or internal error (the software renderer does that).
+    // Either way the part is skipped; using the broken buffer would be an error nobody
+    // catches.
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: bytes.len() as u64,
         usage: usage | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    // Native wgpu reports errors as they happen, so the scope is already settled.
-    let mut pop = std::pin::pin!(scope.pop());
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    if let std::task::Poll::Ready(Some(_)) = std::future::Future::poll(pop.as_mut(), &mut cx) {
+    let failed = [invalid.pop(), internal.pop(), out_of_memory.pop()].into_iter().any(|pop| {
+        // Native wgpu reports errors as they happen, so each scope is already settled.
+        let mut pop = std::pin::pin!(pop);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        matches!(std::future::Future::poll(pop.as_mut(), &mut cx), std::task::Poll::Ready(Some(_)))
+    });
+    if failed {
         return None;
     }
     queue.write_buffer(&buffer, 0, bytes);
     Some(buffer)
 }
 
-fn motion_binding(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, motion: Mat4) -> (wgpu::Buffer, wgpu::BindGroup) {
-    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("intercraft motion"),
-        contents: bytemuck::cast_slice(&motion.to_cols_array()),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
+fn motion_binding(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    motion: Mat4,
+) -> Option<(wgpu::Buffer, wgpu::BindGroup)> {
+    // Through `upload`, like every buffer that can be made while the card is full.
+    let bytes = bytemuck::cast_slice(&motion.to_cols_array()).to_vec();
+    let buffer = upload(device, queue, "intercraft motion", &bytes, wgpu::BufferUsages::UNIFORM)?;
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("intercraft motion"),
         layout,
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
     });
-    (buffer, bind)
+    Some((buffer, bind))
 }
 
 struct Targets {
@@ -428,6 +439,10 @@ pub struct Viewport {
     /// Leave out the clash volumes, which only fit the parts where they were checked.
     pub hide_overlays: bool,
     frame: Option<Frame>,
+    /// The last graphics error nothing else caught, waiting to be shown.
+    gpu_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// The graphics device stopped working; nothing drawn after this will show.
+    gpu_lost: Arc<std::sync::atomic::AtomicBool>,
 
     // Orbit camera
     target: Vec3,
@@ -447,6 +462,20 @@ impl Viewport {
 
     pub fn new(rs: egui_wgpu::RenderState) -> Self {
         let device = &rs.device;
+        // wgpu's default for an error nobody caught is to panic, which closes the whole
+        // app. Keep it instead, so the window stays up and says what happened.
+        let gpu_error = Arc::new(std::sync::Mutex::new(None));
+        let slot = gpu_error.clone();
+        device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            eprintln!("graphics error: {error}");
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+        }));
+        let gpu_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lost = gpu_lost.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            eprintln!("graphics device lost ({reason:?}): {message}");
+            lost.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("intercraft mesh shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -599,7 +628,7 @@ impl Viewport {
             layout: &globals_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() }],
         });
-        let (_, still) = motion_binding(device, &motion_layout, Mat4::IDENTITY);
+        let (_, still) = motion_binding(device, &rs.queue, &motion_layout, Mat4::IDENTITY).expect("a tiny buffer at startup");
 
         Self {
             motion_layout,
@@ -624,7 +653,32 @@ impl Viewport {
             yaw: -0.9,
             pitch: 0.5,
             distance: 150.0,
+            gpu_error,
+            gpu_lost,
         }
+    }
+
+    /// Whether the graphics device has stopped working.
+    pub fn gpu_lost(&self) -> bool {
+        self.gpu_lost.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hooks: a buffer that is invalid when made, and a write nobody checks.
+    #[cfg(test)]
+    pub fn try_invalid_upload(&self) -> bool {
+        // Mapping a vertex buffer for reading needs a feature desktop cards don't turn on.
+        let usage = wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::VERTEX;
+        upload(&self.rs.device, &self.rs.queue, "test-invalid", &[0; 16], usage).is_some()
+    }
+
+    #[cfg(test)]
+    pub fn cause_uncaught_error(&self) {
+        self.rs.queue.write_buffer(&self.globals, 1 << 20, &[0; 16]);
+    }
+
+    /// A graphics error caught since the last call, if any.
+    pub fn take_gpu_error(&self) -> Option<String> {
+        self.gpu_error.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Show a part's mesh. False when the graphics card had no memory left for it; the
@@ -647,9 +701,9 @@ impl Viewport {
             .flat_map(|pair| pair.iter().map(|&pos| Vertex { pos, normal: [0.0; 3], color: EDGE_COLOR }))
             .collect();
 
-        let (device, queue) = (&self.rs.device, &self.rs.queue);
         let first = self.meshes.is_empty();
         let visible = self.meshes.get(name).is_none_or(|m| m.visible);
+        let (device, queue) = (&self.rs.device, &self.rs.queue);
         let vertex_buffer = upload(device, queue, name, bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX);
         let index_buffer = upload(device, queue, name, bytemuck::cast_slice(&mesh.indices), wgpu::BufferUsages::INDEX);
         let (Some(vertex_buffer), Some(index_buffer)) = (vertex_buffer, index_buffer) else { return false };
@@ -660,7 +714,7 @@ impl Viewport {
             upload(device, queue, name, bytemuck::cast_slice(&edge_vertices), wgpu::BufferUsages::VERTEX)
         };
         let edge_vertex_count = if edges.is_some() { edge_vertices.len() as u32 } else { 0 };
-        let (motion_buffer, motion_bind) = motion_binding(device, &self.motion_layout, Mat4::IDENTITY);
+        let Some((motion_buffer, motion_bind)) = motion_binding(device, queue, &self.motion_layout, Mat4::IDENTITY) else { return false };
         self.meshes.insert(
             name.to_owned(),
             GpuMesh {
@@ -686,23 +740,21 @@ impl Viewport {
 
     /// Replace the clash volumes shown in red.
     pub fn set_overlays(&mut self, meshes: &[Mesh]) {
-        let device = &self.rs.device;
+        let (device, queue) = (&self.rs.device, &self.rs.queue);
+        // A clash volume the card has no room for is left out, not drawn broken.
         self.overlays = meshes
             .iter()
-            .map(|mesh| {
+            .filter_map(|mesh| {
                 let vertices: Vec<Vertex> = mesh
                     .positions
                     .iter()
                     .map(|&pos| Vertex { pos, normal: [0.0; 3], color: [0.95, 0.16, 0.14] })
                     .collect();
-                let buffer = |contents: &[u8], usage| {
-                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("overlay"), contents, usage })
-                };
-                (
-                    buffer(bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX),
-                    buffer(bytemuck::cast_slice(&mesh.indices), wgpu::BufferUsages::INDEX),
+                Some((
+                    upload(device, queue, "overlay", bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX)?,
+                    upload(device, queue, "overlay", bytemuck::cast_slice(&mesh.indices), wgpu::BufferUsages::INDEX)?,
                     mesh.indices.len() as u32,
-                )
+                ))
             })
             .collect();
     }
@@ -1117,11 +1169,7 @@ impl Viewport {
         if vertices.is_empty() {
             return None;
         }
-        Some(self.rs.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("intercraft section caps"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        }))
+        upload(&self.rs.device, &self.rs.queue, "intercraft section caps", bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX)
     }
 
     /// Small XYZ triad in the corner so the frame is always visible.

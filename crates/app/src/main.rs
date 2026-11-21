@@ -1654,6 +1654,15 @@ impl State {
 
     /// Work out which mesh each part should show and upload any that changed.
     fn sync_meshes(&mut self) {
+        if let Some(error) = self.viewport.take_gpu_error() {
+            self.worker_status = if self.viewport.gpu_lost() {
+                // Every change is already saved, so restarting loses nothing.
+                "The graphics card stopped responding. Your work is saved; close InterCraft and open it again.".to_owned()
+            } else {
+                let first = error.lines().next().unwrap_or_default().to_owned();
+                format!("The graphics card reported an error and the app carried on ({first}). If parts look wrong, hide some or reopen the project.")
+            };
+        }
         let Some(loaded) = &self.project else { return };
 
         for (i, part) in loaded.project.parts.iter().enumerate() {

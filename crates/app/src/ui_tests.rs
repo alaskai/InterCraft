@@ -410,9 +410,12 @@ fn probe_a_big_project() {
     // limits. Timings and memory only mean something on the real graphics card.
     use eframe::egui_wgpu;
     let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
-    setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, _surface| {
-        let hardware = |a: &&egui_wgpu::wgpu::Adapter| a.get_info().device_type != egui_wgpu::wgpu::DeviceType::Cpu;
-        adapters.iter().find(hardware).or(adapters.first()).cloned().ok_or_else(|| "no graphics adapter".to_owned())
+    // INTERCRAFT_PROBE_SOFTWARE=1 uses the software renderer instead, which runs out
+    // of room on the S1 Pro: the case bug B-4 was found with.
+    let software = std::env::var_os("INTERCRAFT_PROBE_SOFTWARE").is_some();
+    setup.native_adapter_selector = Some(std::sync::Arc::new(move |adapters, _surface| {
+        let wanted = |a: &&egui_wgpu::wgpu::Adapter| (a.get_info().device_type == egui_wgpu::wgpu::DeviceType::Cpu) == software;
+        adapters.iter().find(wanted).or(adapters.first()).cloned().ok_or_else(|| "no graphics adapter".to_owned())
     }));
     sandbox_dirs();
     let project = dir.clone();
@@ -637,6 +640,23 @@ for i in range(40):
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(h.state().state.building.is_empty());
+    assert_eq!(h.state().state.shown.len(), 5);
+}
+
+#[test]
+fn a_graphics_error_is_reported_not_a_crash() {
+    let _one = one_at_a_time();
+    let (mut h, _project) = five_part_project("gpu-error");
+    wait_until(&mut h, "the first build", built);
+    // A buffer the card refuses to make is skipped, like one it has no memory for (B-4).
+    assert!(!h.state().state.viewport.try_invalid_upload(), "an invalid buffer was kept");
+    assert!(h.state().state.viewport.take_gpu_error().is_none(), "the upload check should have caught it");
+    // An error nothing catches used to panic and close the app.
+    h.state().state.viewport.cause_uncaught_error();
+    h.step();
+    h.step();
+    let status = h.state().state.worker_status.clone();
+    assert!(status.contains("graphics card reported an error"), "{status}");
     assert_eq!(h.state().state.shown.len(), 5);
 }
 

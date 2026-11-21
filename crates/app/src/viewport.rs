@@ -209,7 +209,16 @@ impl GpuMesh {
 /// A GPU buffer holding `bytes`, or None when the graphics card has no room for it.
 /// The buffer is made unmapped and filled through the queue, because a mapped buffer
 /// that fails to allocate panics inside wgpu instead of reporting an error.
+/// Tests set this to a part name to make its uploads fail as if the graphics card
+/// were out of memory; a real shortage can't be made on demand.
+#[cfg(test)]
+pub static FAIL_UPLOADS_FOR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 fn upload(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> Option<wgpu::Buffer> {
+    #[cfg(test)]
+    if FAIL_UPLOADS_FOR.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(label) {
+        return None;
+    }
     let align = wgpu::COPY_BUFFER_ALIGNMENT as usize;
     let padded;
     let bytes = if bytes.len() % align == 0 && !bytes.is_empty() {

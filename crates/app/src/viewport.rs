@@ -437,6 +437,14 @@ pub struct Viewport {
 }
 
 impl Viewport {
+    /// Which graphics adapter is in use, for test reports.
+    #[cfg(test)]
+    pub fn adapter_info(&self) -> String {
+        let info = self.rs.adapter.get_info();
+        let limits = self.rs.device.limits();
+        format!("{} ({:?}, {:?}), max buffer {} MB", info.name, info.backend, info.device_type, limits.max_buffer_size >> 20)
+    }
+
     pub fn new(rs: egui_wgpu::RenderState) -> Self {
         let device = &rs.device;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {

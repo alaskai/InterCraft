@@ -332,6 +332,121 @@ fn the_viewer_holds_hundreds_of_parts() {
     }
 }
 
+/// The example project plus kit.step split into a group: five parts.
+fn five_part_project(name: &str) -> (Harness<'static, App>, PathBuf) {
+    let project = example_project(name);
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let kit = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/tests/fixtures/kit.step");
+    h.state_mut().state.start_import(&kit);
+    wait_until(&mut h, "the file to be read", asking);
+    click(&mut h, "Separate parts in a group");
+    wait_until(&mut h, "the bodies to be built", |app| app.state.import.is_none() && built(app) && app.state.shown.len() == 5);
+    (h, project)
+}
+
+#[test]
+fn a_part_that_stops_the_worker_twice_is_left_out() {
+    let _one = one_at_a_time();
+    let (mut h, _project) = five_part_project("crash-twice");
+    let restarted = |app: &App| app.state.worker_status.contains("restarted");
+
+    // The worker dies before it reads anything, so the first part sent is the one blamed.
+    let s = &mut h.state_mut().state;
+    s.shown.clear();
+    s.worker.as_mut().unwrap().kill();
+    s.rebuild_all();
+    wait_until(&mut h, "the first restart", restarted);
+    assert!(h.state().state.worker_status.contains("'RodBracket'"), "{}", h.state().state.worker_status);
+    // Again, straight away: the new worker is still starting, so the same part is at the front.
+    h.state_mut().state.worker.as_mut().unwrap().kill();
+    wait_until(&mut h, "the second restart", |app| app.state.worker_status.contains("stopped twice"));
+
+    // That part is left out with a reason; every other part still builds.
+    wait_until(&mut h, "the rest to build", |app| app.state.building.is_empty() && app.state.shown.len() == 4);
+    let s = &h.state().state;
+    assert!(!s.shown.contains_key("RodBracket"));
+    let failed = s.results.iter().find(|((part, _), _)| part == "RodBracket").map(|(_, e)| e.result.error.clone().unwrap_or_default());
+    assert!(failed.is_some_and(|e| e.contains("out of memory")), "RodBracket should say why it's missing");
+    assert!(s.worker.is_some());
+}
+
+#[test]
+fn a_part_without_graphics_memory_is_skipped_with_a_message() {
+    let _one = one_at_a_time();
+    let (mut h, _project) = five_part_project("gpu-full");
+    *viewport::FAIL_UPLOADS_FOR.lock().unwrap() = Some("Base".into());
+    h.state_mut().state.shown.clear();
+    for _ in 0..6 {
+        h.step();
+    }
+    let status = h.state().state.worker_status.clone();
+    *viewport::FAIL_UPLOADS_FOR.lock().unwrap() = None;
+    assert!(status.contains("Not enough graphics memory to show 'Base'"), "{status}");
+    // Marked as handled, so it isn't tried again every frame, and the others are up.
+    assert_eq!(h.state().state.shown.len(), 5);
+    shot(&mut h, "gpu-full");
+}
+
+#[test]
+fn outside_edits_are_reloaded_recorded_and_captioned() {
+    let _one = one_at_a_time();
+    let project = example_project("outside");
+    let mut h = harness(&project);
+    wait_until(&mut h, "the first build", built);
+    let volume = |app: &App| app.state.latest_report(app.state.project.as_ref().unwrap().part("RodBracket").unwrap()).map(|r| r.volume);
+    let before = volume(h.state()).unwrap();
+    // History only starts with the first change made in InterCraft (bug B-1 in the test plan).
+    h.state_mut().state.edit_project(|p| p.set_brief("A clamp for an 8 mm rod.".into()).and_then(|()| p.save())).unwrap();
+
+    // A text editor changes the first step's code: the block gets 10 mm wider.
+    let file = project.join("RodBracket/010_base.py");
+    let code = std::fs::read_to_string(&file).unwrap();
+    assert!(code.contains("p[\"width\"]"), "{code}");
+    std::fs::write(&file, code.replace("p[\"width\"]", "(p[\"width\"] + 10)")).unwrap();
+    wait_until(&mut h, "the edit to rebuild", |app| built(app) && volume(app).is_some_and(|v| v > before));
+    // It is kept as its own step, so undo takes it back.
+    assert_eq!(h.state().state.history.undo_label(), Some("Edited outside InterCraft"));
+    h.state_mut().state.undo();
+    wait_until(&mut h, "the undo to rebuild", |app| built(app) && volume(app).is_some_and(|v| (v - before).abs() < 1e-6));
+
+    // An edit from another agent (a Claude Code terminal, say) gets a caption over the view.
+    let mut agent = intercraft_tools::ToolHost::new(project.clone());
+    agent.call("add_part", &serde_json::json!({ "name": "Spacer" })).unwrap();
+    wait_until(&mut h, "the new part to appear", |app| app.state.project.as_ref().is_some_and(|p| p.part("Spacer").is_ok()));
+    assert!(h.state().state.outside_caption.shown().is_some_and(|(text, _)| text.contains("Spacer")));
+}
+
+#[test]
+fn opening_a_folder_finds_its_project_or_offers_to_make_one() {
+    let _one = one_at_a_time();
+    let project = example_project("open-folder");
+    let other = example_project("open-folder-other");
+    let mut h = harness(&other);
+    wait_until(&mut h, "the first build", built);
+
+    // A part's snippet folder opens the project it belongs to.
+    h.state_mut().open_folder(project.join("RodBracket"));
+    h.step();
+    assert_eq!(h.state().state.project_dir, project);
+    assert!(h.state().make_project.is_none());
+
+    // A plain folder is offered to become a project.
+    let plain = sandbox_dirs().join("projects").join("just-a-folder");
+    let _ = std::fs::remove_dir_all(&plain);
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("notes.txt"), "keep me").unwrap();
+    h.state_mut().open_folder(plain.clone());
+    h.step();
+    h.step();
+    assert!(h.get_all_by_label_contains("isn't an InterCraft project yet").count() >= 1);
+    click(&mut h, "Make it a project");
+    h.step();
+    assert_eq!(h.state().state.project_dir, plain);
+    assert!(plain.join("project.json").exists() && plain.join("brief.md").exists());
+    assert_eq!(std::fs::read_to_string(plain.join("notes.txt")).unwrap(), "keep me", "other files are left alone");
+}
+
 #[test]
 fn a_worker_that_stops_is_restarted_and_the_rest_still_builds() {
     let _one = one_at_a_time();

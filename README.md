@@ -370,9 +370,20 @@ Done:
 9. Reordering, renaming and editing the code of steps, and CI
 10. OpenAI-compatible chat (OpenAI, OpenRouter, Ollama, LM Studio)
 11. Sketch panel: rough annotated sketches, drawn on a blank grid or over a view of the model, sent to the model with a message
+12. Design brief, a "why" for every step, a glossary, explanation levels and a simple layout
+13. Standard parts, real fastener sizes and a print check
+14. Joints, motion playback and a motion clash check
+15. STEP assemblies split into parts, nested groups, and an outline of big projects for the model
+16. Chat history kept with the project
+17. Tools for finding your way round an assembly: `find_parts`, `nearby` and numbered pictures
+18. A full test plan ([docs/test-plan.md](docs/test-plan.md)), run against a 173-part 3D printer assembly
 
 Next:
 
+- A faster single move of a whole assembly (the worker re-places every part, about 10 s for 173 parts, while the view moves at once)
+- Carrying on after the graphics device is lost (bug B-7 in the test plan)
+- Clearing old files out of the build cache, which only grows
+- The real model scenarios in the test plan (M-01 to M-07)
 - Sketching over any face picked in the 3D view, not only the six standard views
 - OS-level isolation for the geometry worker
 - Memory cap and stuck-build watchdog on macOS and Linux

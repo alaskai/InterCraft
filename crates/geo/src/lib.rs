@@ -54,6 +54,9 @@ pub struct Report {
     pub faces: u32,
     pub edges: u32,
     pub valid: bool,
+    /// Faces OpenCascade couldn't mesh, left out of the picture but still in the shape.
+    #[serde(default)]
+    pub faces_not_drawn: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -318,7 +321,9 @@ impl PythonWorker {
         }
         self.in_flight += 1;
         let imports = msg["features"].as_array().is_some_and(|f| f.iter().any(|f| f.get("import").is_some()));
-        if imports || msg.get("step").is_some() {
+        // `nearby` meshes every part it checks, the first time it sees it, which for
+        // a detailed import takes as long as reading it did.
+        if imports || msg.get("step").is_some() || msg["cmd"] == "nearby" {
             self.slow = true;
         }
         self.requests.send(msg.to_string()).context("the geometry worker has stopped")

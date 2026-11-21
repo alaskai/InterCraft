@@ -22,7 +22,9 @@ sys.stdout = sys.stderr
 import numpy as np
 import build123d
 
+import meshing
 import parts_library
+import proximity
 import print_check
 import sandbox
 
@@ -77,15 +79,14 @@ def file_hash(path):
 
 
 def write_mesh(shape, path, tick=lambda: None):
+    """Returns how many faces couldn't be meshed, or None if the file was already there."""
     # Mesh files are named by a hash of everything that shaped them, so an existing
     # file is already right. The viewer and an MCP server each run a worker and can
     # build the same step at the same moment.
     if os.path.exists(path):
-        return
-    verts, tris = shape.tessellate(LINEAR_TOL, ANGULAR_TOL)
+        return None
+    v, t, skipped = meshing.triangles(shape, LINEAR_TOL, ANGULAR_TOL)
     tick()
-    v = np.array([(q.X, q.Y, q.Z) for q in verts], dtype=np.float32).reshape(-1, 3)
-    t = np.array(tris, dtype=np.uint32).reshape(-1, 3)
 
     # Area-weighted vertex normals. Vertices aren't shared between faces,
     # so real edges stay sharp while curved faces shade smoothly.
@@ -104,6 +105,7 @@ def write_mesh(shape, path, tick=lambda: None):
             tick()
     corners = [tuple(vx) for vx in shape.vertices()]
     write_icm(path, v, n, t, edges, corners)
+    return skipped
 
 
 def write_icm(path, v, n, t, edges, corners):
@@ -198,12 +200,16 @@ def shape_facts(shape, key, cache_dir):
             "edges": len(shape.edges()),
             "valid": bool(shape.is_valid),
         }
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(facts, f)
-        os.replace(tmp, path)
+        save_facts(path, facts)
     _facts[key] = facts
     return facts
+
+
+def save_facts(path, facts):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(facts, f)
+    os.replace(tmp, path)
 
 
 def edge_points(edge):
@@ -392,7 +398,11 @@ def rebuild(req, emit=True):
                 facts = shape_facts(shape, key, cache_dir)
                 tick()
                 local_mesh = os.path.join(cache_dir, key + ".icm")
-                write_mesh(shape, local_mesh, tick)
+                skipped = write_mesh(shape, local_mesh, tick)
+                if skipped:
+                    # Kept with the facts, so a reopened project still says so.
+                    facts = _facts[key] = dict(facts, faces_not_drawn=skipped)
+                    save_facts(os.path.join(cache_dir, f"{key}.facts.json"), facts)
                 shown = place(shape, placement)
                 mesh_path = os.path.join(cache_dir, placed + ".icm")
                 if mesh_path != local_mesh:
@@ -586,8 +596,9 @@ _nearby = {}
 
 def nearby(req):
     """Which parts come within `within` mm of the targets, or, with no targets, every
-    pair of parts that close (a map of what touches what). Boxes are compared first
-    and the exact distance is only worked out where they come close."""
+    pair of parts that close (a map of what touches what). Boxes are compared first,
+    then the meshes, and the exact distance is only worked out between the faces that
+    come close (see proximity.py)."""
     within = float(req["within"])
     parts = [(p["name"], p["mesh"]) for p in req["parts"]]
     targets = set(req.get("targets") or [])
@@ -612,12 +623,23 @@ def nearby(req):
         pairs = [(a, b) for i, a in enumerate(names) for b in names[i + 1 :]]
     candidates = [(a, b) for a, b in pairs if close(a, b)]
     found = []
-    for n, (a, b) in enumerate(candidates):
-        distance, pa, pb = shapes[a].distance_to_with_closest_points(shapes[b])
-        if distance <= within:
-            found.append({"a": a, "b": b, "clearance": round(distance, 4), "a_point": vec(pa), "b_point": vec(pb)})
-        if n % 10 == 9:
-            send({"id": req["id"], "event": "progress"})
+    # Meshing a detailed part the first time can take most of a minute, so do each
+    # one on its own and show the app it's alive in between.
+    for name in dict.fromkeys(n for pair in candidates for n in pair):
+        shapes[name].mesh(LINEAR_TOL, ANGULAR_TOL)
+        send({"id": req["id"], "event": "progress"})
+    for a, b in candidates:
+        near = proximity.clearance(shapes[a], shapes[b], within)
+        if near is not None:
+            distance, pa, pb, accuracy = near
+            pair = {"a": a, "b": b, "clearance": round(distance, 4)}
+            if accuracy is None:
+                pair.update(a_point=vec(pa), b_point=vec(pb))
+            else:
+                pair["accuracy"] = round(accuracy, 3)
+            found.append(pair)
+        # Detailed parts can take a while a pair, so show the app it's alive after each.
+        send({"id": req["id"], "event": "progress"})
     found.sort(key=lambda f: f["clearance"])
     data = {"pairs": found, "checked": len(candidates), "skipped_by_box": len(pairs) - len(candidates)}
     _nearby[key] = data

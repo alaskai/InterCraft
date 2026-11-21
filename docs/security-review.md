@@ -146,7 +146,7 @@ A fake `claude` binary in `claude_code_stress.rs` checks every one of these flag
 
 ```powershell
 cargo test --workspace
-& "$env:LOCALAPPDATA\InterCraft\venv\Scripts\python.exe" -m unittest worker/test_sandbox.py
+& "$env:LOCALAPPDATA\InterCraft\venv\Scripts\python.exe" -m unittest worker/test_sandbox.py worker/test_mesh.py worker/test_proximity.py
 git log -p --all | Select-String "sk-ant-[A-Za-z0-9_-]{20,}"   # should find nothing real
 ```
 

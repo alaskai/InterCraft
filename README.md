@@ -269,7 +269,7 @@ This is the route for a Claude Pro or Max subscription, since subscriptions work
 | `view_model` | A picture of the model from the viewer: iso, front, back, left, right, top, bottom or your current view, optionally cut open or showing only some parts or groups. The six side views are drawn flat, like a drawing. With labels, each part gets a numbered marker and the answer says which number is which |
 | `undo`, `redo` | Step back or forward through the project history |
 | `inspect_part` | Faces, holes and circular edges of a part with exact sizes and positions, in its own frame or where it sits in the assembly |
-| `nearby` | Exact gaps: every part within a few mm of a part or group, or every pair that touches (what is mounted to what) |
+| `nearby` | Gaps: every part within a few mm of a part or group, or every pair that touches (what is mounted to what). Exact, except where a thread, spring or gear tooth is involved: those are measured on the mesh and say how close the figure is |
 | `measure` | Exact distance, angle, length or diameter between faces, edges, corners and points |
 | `export_part` | Writes STEP and STL to the project's `exports` folder |
 
@@ -348,7 +348,7 @@ The worker caches the shape after every feature. Changing one feature only rebui
 
 ```powershell
 cargo test --workspace
-& "$env:LOCALAPPDATA\InterCraft\venv\Scripts\python.exe" -m unittest worker/test_sandbox.py
+& "$env:LOCALAPPDATA\InterCraft\venv\Scripts\python.exe" -m unittest worker/test_sandbox.py worker/test_mesh.py worker/test_proximity.py
 ```
 
 The suites include stress tests for both chat routes (a fake Messages API and a fake `claude`), sandbox escape attempts, and tool tests that use the real geometry worker. Those skip themselves when the Python environment isn't set up.

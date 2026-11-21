@@ -374,6 +374,15 @@ fn nearby_finds_neighbours_and_what_touches_what() {
     assert!(host.call("nearby", &json!({ "part": "Nothing" })).is_err());
     assert!(host.call("nearby", &json!({ "part": "Plate", "within": 900 })).is_err());
 
+    // A part that doesn't build is left out and named, not a failure for the rest.
+    host.call("add_part", &json!({ "name": "Broken" })).unwrap();
+    add(&mut host, "Broken", "Body", "part = Box(p['missing'], 1, 1)").unwrap();
+    let map = host.call("nearby", &json!({})).unwrap();
+    assert_eq!(map["left_out"], json!(["Broken"]), "{map}");
+    assert_eq!(map["touching"][0]["a"], "Plate", "{map}");
+    assert!(host.call("nearby", &json!({ "part": "Broken" })).is_err(), "the part asked about must build");
+    host.call("delete_part", &json!({ "part": "Broken" })).unwrap();
+
     // The bracket's bore where it sits in the assembly, ready to line a new part up with.
     let own = host.call("inspect_part", &json!({ "part": "Bracket" })).unwrap();
     let placed = host.call("inspect_part", &json!({ "part": "Bracket", "in_assembly": true })).unwrap();
@@ -821,7 +830,21 @@ fn probe_the_tools_on_a_big_project() {
     let found = timed("find_parts", json!({ "name": "extruder_motor" }));
     eprintln!("find_parts found {}", found["found"]);
     let map = timed("nearby", json!({}));
-    eprintln!("touching pairs: {}, checked exactly: {}", map["touching"].as_array().map_or(0, Vec::len), map["checked_exactly"]);
+    eprintln!(
+        "touching pairs: {}, checked exactly: {}, left out: {}",
+        map["touching"].as_array().map_or(0, Vec::len),
+        map["checked_exactly"],
+        map["left_out"]
+    );
+    let pairs = map["touching"].as_array().cloned().unwrap_or_default();
+    let rough: Vec<&Value> = pairs.iter().filter(|p| p["accurate_to_mm"].is_number()).collect();
+    eprintln!("measured on the mesh: {}", rough.len());
+    for p in rough.iter().take(8) {
+        eprintln!("  {p}");
+    }
+    if let Some(out) = std::env::var_os("INTERCRAFT_PROBE_OUT") {
+        std::fs::write(out, serde_json::to_string_pretty(&map).unwrap()).unwrap();
+    }
     if let Some(part) = found["parts"][0]["part"].as_str() {
         let near = timed("nearby", json!({ "part": part }));
         eprintln!("near {part}: {}", near["near"].as_array().map_or(0, Vec::len));

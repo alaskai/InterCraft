@@ -16,7 +16,11 @@ def _triangles(shape, tolerance):
     """Every face's triangles, with the index of the face each belongs to."""
     points, faces = [], []
     for index, face in enumerate(shape.faces()):
-        verts, tris = face.tessellate(tolerance, 0.3)
+        try:
+            verts, tris = face.tessellate(tolerance, 0.3)
+        except AttributeError:
+            # OpenCascade gave this face no mesh (see meshing.py); check the rest.
+            continue
         if not tris:
             continue
         v = np.array([(q.X, q.Y, q.Z) for q in verts], dtype=float)

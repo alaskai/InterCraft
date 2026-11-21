@@ -1136,6 +1136,56 @@ mod tests {
     }
 
     #[test]
+    fn every_kind_of_change_has_a_readable_undo_label() {
+        let mut p = temp_project("labels");
+        let step = |p: &mut LoadedProject, label: &str, change: &dyn Fn(&mut LoadedProject) -> Result<()>| {
+            change(p).unwrap();
+            p.save().unwrap();
+            assert_eq!(p.history().undo_label(), Some(label));
+        };
+        step(&mut p, "Add part 'Box'", &|p| p.add_part("Box"));
+        step(&mut p, "Add part 'Lid'", &|p| p.add_part("Lid"));
+        step(&mut p, "Add 'Body' to Box", &|p| p.add_feature("Box", feature("Body", None)).map(|_| ()));
+        step(&mut p, "Set w = 30 on 'Body'", &|p| p.set_param("Box", "f010", "w", 30.into()));
+        step(&mut p, "Edit 'Body'", &|p| {
+            p.edit_feature("Box", "f010", FeatureEdit { code: Some("part = Box(2, 2, 2)".into()), ..Default::default() })
+        });
+        step(&mut p, "Move 'Lid'", &|p| p.set_placement("Lid", [0.0, 0.0, 20.0], [0.0; 3]));
+        step(&mut p, "Lock 'Box'", &|p| p.set_kind("Box", PartKind::Reference));
+        step(&mut p, "Unlock 'Box'", &|p| p.set_kind("Box", PartKind::Design));
+        step(&mut p, "Add joint 'Lid hinge'", &|p| p.add_joint(hinge("Lid hinge", "Box", "Lid")));
+        step(&mut p, "Move 'Lid hinge' to 45°", &|p| p.edit_joint("Lid hinge", JointEdit { at: Some(45.0), ..Default::default() }));
+        step(&mut p, "Group 2 parts as 'Kit'", &|p| p.set_group(&["Box".into(), "Lid".into()], Some("Kit")));
+        // The hinge moves with its group and is counted as a second change (bug B-2).
+        step(&mut p, "Move 'Kit' (2 parts) and 1 more", &|p| p.move_group("Kit", [5.0, 0.0, 0.0], [0.0; 3]));
+        step(&mut p, "Rename group 'Kit' to 'Case'", &|p| p.rename_group("Kit", "Case"));
+        step(&mut p, "Update the brief", &|p| p.set_brief("A small box.".into()));
+        step(&mut p, "Rename 'Lid' to 'Cover'", &|p| p.rename_part("Lid", "Cover"));
+        step(&mut p, "Delete joint 'Lid hinge'", &|p| p.delete_joint("Lid hinge"));
+        step(&mut p, "Delete 'Body' from Box", &|p| p.delete_feature("Box", "f010"));
+        step(&mut p, "Delete 'Case' (2 parts)", &|p| p.remove_group("Case"));
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
+    fn joints_move_with_their_group() {
+        let mut p = temp_project("group-joints");
+        for name in ["Base", "Box", "Lid"] {
+            p.add_part(name).unwrap();
+        }
+        p.add_joint(hinge("Lid hinge", "Box", "Lid")).unwrap();
+        p.set_group(&["Box".into(), "Lid".into()], Some("Case")).unwrap();
+        // Turned 90° about Z, then lifted 10: the hinge axis along X now runs along Y.
+        p.move_group("Case", [0.0, 0.0, 10.0], [0.0, 0.0, 90.0]).unwrap();
+        let joint = p.project.joint("Lid hinge").unwrap();
+        let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9);
+        assert!(close(joint.origin, [0.0, 0.0, 20.0]), "{:?}", joint.origin);
+        assert!(close(joint.axis, [0.0, 1.0, 0.0]), "{:?}", joint.axis);
+        assert_eq!(p.part("Base").unwrap().position, [0.0; 3], "parts outside the group stay put");
+        std::fs::remove_dir_all(&p.dir).unwrap();
+    }
+
+    #[test]
     fn joints_follow_their_parts() {
         let mut p = temp_project("joints");
         for name in ["Box", "Lid", "Latch"] {

@@ -311,6 +311,7 @@ Listed here first and fixed only once Ethan picks them.
 | ID | Found by | Bug | Steps | Severity |
 |---|---|---|---|---|
 | B-1 | P-08 | A hand edit can't be undone in a project with no history yet | Open a project that has never been changed in InterCraft (a fresh copy, a shared project, one made by hand). Edit a snippet in a text editor. The viewer rebuilds, but Undo has nothing to undo, because no snapshot of the state before the edit was ever taken. Once any change is made in InterCraft, later hand edits undo fine. Fix idea: record a "Start" snapshot when a project with no history is opened. | Low |
+| B-2 | H-03 | Moving a group that carries a joint gives a noisy undo label | Put a hinged lid and its box in a group, then move the group. The joint's origin and axis move with it (correct), but the label reads "Move 'Kit' (2 parts) and 1 more" because the joint counts as its own change. Fix idea: when describing a group move, leave out joints whose moving part is in the group. | Cosmetic |
 
 ## Results log
 
@@ -323,3 +324,7 @@ Copy one row per test as it is run.
 | 2026-11-21 | branch test/plan-gaps-a | V-07 | Pass (new test) | `a_part_without_graphics_memory_is_skipped_with_a_message`: forced upload failure; status message, no retry loop, others shown. A test hook stands in for a real shortage |
 | 2026-11-21 | branch test/plan-gaps-a | P-08 | Pass with bug B-1 | `outside_edits_are_reloaded_recorded_and_captioned`: hand edit reloads and rebuilds; undo works once history exists; an agent's edit is captioned |
 | 2026-11-21 | branch test/plan-gaps-a | P-03, P-04 | Pass (new test) | `opening_a_folder_finds_its_project_or_offers_to_make_one`: subfolder opens its project; a plain folder becomes one and other files are left alone |
+| 2026-11-21 | branch test/plan-gaps-b | H-03 | Pass with bug B-2 | `every_kind_of_change_has_a_readable_undo_label`: 18 kinds of change, each with its expected label |
+| 2026-11-21 | branch test/plan-gaps-b | G-05 | Pass (new test) | `joints_move_with_their_group`: hinge origin and axis turned and lifted with the group |
+| 2026-11-21 | branch test/plan-gaps-b | G-04, H-02, H-07 | Pass (new test) | `group_eye_colours_and_history_menu`: eye hides the group and its sub-group; import is one colour; a group delete undoes in one step; Edit > History jumps back to the import |
+| 2026-11-21 | branch test/plan-gaps-b | J-06, E-03 | Pass (extended test) | `a_hinged_lid_opens_and_the_tools_see_it_open`: the lid exported with the hinge at 90° re-imports closed, volume 1600 mm³ |

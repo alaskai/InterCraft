@@ -346,6 +346,55 @@ fn five_part_project(name: &str) -> (Harness<'static, App>, PathBuf) {
 }
 
 #[test]
+fn group_eye_colours_and_history_menu() {
+    let _one = one_at_a_time();
+    let (mut h, _project) = five_part_project("group-history");
+    let part = |app: &App, name: &str| app.state.project.as_ref().unwrap().part(name).unwrap().clone();
+
+    // The eye on the group's header hides and shows everything inside, sub-groups too.
+    click(&mut h, "Hide kit");
+    let hidden = &h.state().state.hidden;
+    assert!(["Base", "Leaf", "Leaf_2", "Pin"].iter().all(|n| hidden.contains(*n)) && !hidden.contains("RodBracket"));
+    click(&mut h, "Show kit");
+    assert!(h.state().state.hidden.is_empty());
+
+    // An import is one colour, sub-groups included; a design part grouped by hand keeps its own.
+    let parts = h.state().state.project.as_ref().unwrap().project.parts.clone();
+    let slots: Vec<usize> = (0..parts.len()).map(|i| color_slot(&parts, i)).collect();
+    assert_eq!(slots, [0, 1, 1, 1, 1], "{:?}", parts.iter().map(|p| (&p.name, &p.group)).collect::<Vec<_>>());
+    h.state_mut().state.set_part_group("RodBracket", "kit").unwrap();
+    let parts = h.state().state.project.as_ref().unwrap().project.parts.clone();
+    assert_eq!(color_slot(&parts, 0), 0);
+
+    // Three changes, then Edit > History jumps back to just after the import.
+    h.state_mut().state.move_group("kit", [0.0; 3], [90.0, 0.0, 0.0]);
+    h.state_mut().state.rename_group("kit", "Hinge kit").unwrap();
+    h.state_mut().state.delete_group("Hinge kit");
+    h.step();
+    assert_eq!(part_names(&h), Vec::<String>::new(), "RodBracket went with the group it was put in");
+    // Undoing the delete brings every part back at once.
+    h.state_mut().state.undo();
+    h.step();
+    assert_eq!(part_names(&h).len(), 5);
+    let labels: Vec<String> = h.state().state.history.entries.iter().map(|e| e.label.clone()).collect();
+    let import = h.state().state.history.entries.iter().find(|e| e.label == "Import 'kit' (4 parts)").map(|e| e.number).expect("the import is in the history");
+    click(&mut h, "Edit");
+    // Submenus open on hover.
+    h.get_by_label_contains("History").hover();
+    for _ in 0..4 {
+        h.step();
+    }
+    assert!(h.get_all_by_label_contains("Rename group 'kit' to 'Hinge kit'").count() >= 1, "{labels:?}");
+    h.get_by_label_contains("Import 'kit' (4 parts)").click();
+    h.step();
+    h.step();
+    assert_eq!(h.state().state.history.head, Some(import));
+    assert_eq!(part(h.state(), "Pin").group.as_deref(), Some("kit/Hinge"));
+    assert_eq!(part(h.state(), "Pin").rotation, [0.0; 3], "back before the group was turned");
+    assert_eq!(part(h.state(), "RodBracket").group, None);
+}
+
+#[test]
 fn a_part_that_stops_the_worker_twice_is_left_out() {
     let _one = one_at_a_time();
     let (mut h, _project) = five_part_project("crash-twice");

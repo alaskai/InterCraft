@@ -614,6 +614,16 @@ fn a_hinged_lid_opens_and_the_tools_see_it_open() {
     // Exports stay at rest, wherever the hinge was left.
     let exported = host.call("export_part", &json!({ "part": "Lid", "format": "step" })).unwrap();
     assert!(exported["exported"][0].as_str().is_some());
+    // Read back in: closed (at rest), and the same solid, not just a file that exists.
+    let (mut reader, reader_dir) = self::project("hinge-reimport");
+    let mut loaded = intercraft_core::LoadedProject::create(&reader_dir, "Reimport").unwrap();
+    let name = loaded.import_step(&dir.join("exports/Lid.step")).unwrap();
+    loaded.save().unwrap();
+    let back = reader.call("get_part", &json!({ "part": name })).unwrap();
+    let step = &back["features"][0];
+    assert_eq!((step["bbox_min"].clone(), step["bbox_max"].clone()), (json!([-20.0, -10.0, 5.0]), json!([20.0, 10.0, 7.0])), "{back}");
+    assert_eq!(step["volume_mm3"], 1600.0);
+    let _ = std::fs::remove_dir_all(&reader_dir);
 
     assert_eq!(host.call("undo", &json!({})).unwrap()["undone"], "Move 'Lid hinge' to 90°");
     let removed = host.call("delete_joint", &json!({ "name": "lid hinge" })).unwrap();
